@@ -1043,6 +1043,7 @@ export const en: Translations = {
     nav: {
       'new-session': 'New session',
       skills: 'Skills & Tools',
+      kanban: 'Kanban',
       messaging: 'Messaging',
       artifacts: 'Artifacts'
     },

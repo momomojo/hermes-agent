@@ -1230,6 +1230,7 @@ export const zh: Translations = {
     nav: {
       'new-session': '新建会话',
       skills: '技能与工具',
+      kanban: '看板',
       messaging: '消息平台',
       artifacts: '产物'
     },

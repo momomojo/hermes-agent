@@ -1905,6 +1905,19 @@ function resolveWebDist() {
   return path.join(APP_ROOT, 'dist')
 }
 
+function resolveDashboardWebDist() {
+  const override = process.env.HERMES_DESKTOP_WEB_DIST
+  if (override && directoryExists(path.resolve(override))) return path.resolve(override)
+
+  const candidates = [
+    !IS_PACKAGED ? path.join(SOURCE_REPO_ROOT, 'web', 'dist') : null,
+    path.join(ACTIVE_HERMES_ROOT, 'web', 'dist'),
+    path.join(ACTIVE_HERMES_ROOT, 'hermes_cli', 'web_dist')
+  ].filter(Boolean)
+
+  return candidates.find(directoryExists) || path.join(ACTIVE_HERMES_ROOT, 'web', 'dist')
+}
+
 function resolveRendererIndex() {
   const candidates = [path.join(APP_ROOT, 'dist', 'index.html'), path.join(resolveWebDist(), 'index.html')]
   return candidates.find(fileExists) || candidates[0]
@@ -4358,7 +4371,7 @@ async function spawnPoolBackend(profile, entry) {
   const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
   const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
   const hermesCwd = resolveHermesCwd()
-  const webDist = resolveWebDist()
+  const webDist = resolveDashboardWebDist()
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
@@ -4493,7 +4506,7 @@ async function startHermes() {
     await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
     const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
     const hermesCwd = resolveHermesCwd()
-    const webDist = resolveWebDist()
+    const webDist = resolveDashboardWebDist()
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
