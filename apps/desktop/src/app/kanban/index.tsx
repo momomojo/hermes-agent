@@ -1,9 +1,10 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
-const KANBAN_PROFILE = 'default'
 const KEEPALIVE_MS = 60_000
 
 type KanbanWebview = HTMLElement & {
@@ -22,6 +23,8 @@ function dashboardPath(baseUrl: string, path: string): string {
 }
 
 export function KanbanView() {
+  const activeProfile = useStore($activeGatewayProfile)
+  const kanbanProfile = normalizeProfileKey(activeProfile)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const webviewRef = useRef<KanbanWebview | null>(null)
   const [targetUrl, setTargetUrl] = useState<string | null>(null)
@@ -34,9 +37,10 @@ export function KanbanView() {
 
     setLoading(true)
     setError(null)
+    setTargetUrl(null)
 
     void window.hermesDesktop
-      .getConnection(KANBAN_PROFILE)
+      .getConnection(kanbanProfile)
       .then(conn => {
         if (cancelled) {
           return
@@ -55,17 +59,17 @@ export function KanbanView() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [kanbanProfile])
 
   useEffect(() => {
-    void window.hermesDesktop?.touchBackend?.(KANBAN_PROFILE).catch(() => undefined)
+    void window.hermesDesktop?.touchBackend?.(kanbanProfile).catch(() => undefined)
 
     const timer = window.setInterval(() => {
-      void window.hermesDesktop?.touchBackend?.(KANBAN_PROFILE).catch(() => undefined)
+      void window.hermesDesktop?.touchBackend?.(kanbanProfile).catch(() => undefined)
     }, KEEPALIVE_MS)
 
     return () => window.clearInterval(timer)
-  }, [])
+  }, [kanbanProfile])
 
   useEffect(() => {
     const host = hostRef.current
@@ -142,7 +146,7 @@ export function KanbanView() {
           <Codicon className="text-(--ui-text-tertiary)" name="project" size="0.875rem" />
           <div className="min-w-0 truncate text-[0.8125rem] font-medium text-(--ui-text-primary)">Kanban</div>
           <div className="hidden min-w-0 truncate text-[0.75rem] text-(--ui-text-tertiary) sm:block">
-            {targetUrl ? openLabel : 'default profile'}
+            {targetUrl ? `${kanbanProfile} - ${openLabel}` : kanbanProfile}
           </div>
         </div>
         <Button disabled={!targetUrl} onClick={reload} size="sm" type="button" variant="ghost">

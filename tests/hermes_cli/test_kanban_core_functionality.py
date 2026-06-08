@@ -2034,6 +2034,49 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
         conn.close()
 
 
+def test_completed_event_records_manual_provenance(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="manual", assignee="worker")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="operator verified",
+            completed_by="operator",
+        )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][0]
+        assert event.payload["completion_source"] == "manual"
+        assert event.payload["completed_by"] == "operator"
+        assert event.payload["run_id"] == event.run_id
+        assert event.payload["evidence_present"] is True
+    finally:
+        conn.close()
+
+
+def test_completed_event_records_worker_run_provenance(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker", assignee="ops")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="worker done",
+            expected_run_id=run_id,
+            completed_by="ops",
+            worker_session_id="sess_123",
+        )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][0]
+        assert event.payload["completion_source"] == "worker"
+        assert event.payload["completed_by"] == "ops"
+        assert event.payload["worker_session_id"] == "sess_123"
+        assert event.payload["expected_run_id"] == run_id
+    finally:
+        conn.close()
+
+
 # -------------------------------------------------------------------------
 # Deep-scan fixes (Apr 2026 second audit)
 # -------------------------------------------------------------------------
@@ -2979,6 +3022,88 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
         assert "'terminal'" in msg
         # Plural noun form when multiple toolsets are flagged.
         assert "are toolset names" in msg
+    finally:
+        conn.close()
+
+
+def test_create_task_rejects_unknown_skill_when_profile_skills_initialized(kanban_home):
+    """Creation catches bad forced skills once the assignee has a skills dir."""
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="unknown skill"):
+            kb.create_task(
+                conn,
+                title="needs missing skill",
+                assignee="ops",
+                skills=["missing-skill"],
+            )
+
+        skill_dir = profile_home / "skills" / "present-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: present-skill\ndescription: test\n---\nUse it.\n",
+            encoding="utf-8",
+        )
+        tid = kb.create_task(
+            conn,
+            title="has skill",
+            assignee="ops",
+            skills=["present-skill"],
+        )
+        assert kb.get_task(conn, tid).skills == ["present-skill"]
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_legacy_task_with_missing_forced_skill(
+    kanban_home, all_assignees_spawnable
+):
+    """A drifted legacy card blocks pre-spawn instead of crashing a worker."""
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy", assignee="ops")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(["ghost-skill"]), tid),
+            )
+
+        res = kb.dispatch_once(conn)
+
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.last_failure_error is None
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
+def test_kanban_preflight_reports_missing_task_skill(kanban_home):
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy", assignee="ops")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(["ghost-skill"]), tid),
+            )
+        report = kb.preflight_skill_references(conn)
+        assert report["ok"] is False
+        assert report["missing"][0]["task_id"] == tid
+        assert report["missing"][0]["name"] == "ghost-skill"
     finally:
         conn.close()
 
