@@ -7,11 +7,13 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1079,6 +1081,64 @@ def _probe_launchd_service_running() -> bool:
     return result.returncode == 0
 
 
+def _parse_launchd_list_pid(output: str | None) -> int | None:
+    match = re.search(r'"PID"\s*=\s*(\d+);', output or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _process_parent_pid(pid: int) -> int | None:
+    try:
+        ps_result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if ps_result.returncode == 0:
+            return int(ps_result.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+def _launchd_managed_pid() -> int | None:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", get_launchd_label()],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    pid = _parse_launchd_list_pid(result.stdout)
+    if pid is None:
+        return None
+    return pid if _process_parent_pid(pid) == 1 else None
+
+
+def _wait_for_launchd_managed_gateway(
+    *, previous_pid: int | None = None, timeout: float = 3.0
+) -> int | None:
+    """Return a launchd-supervised replacement PID if one appears quickly."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pid = _launchd_managed_pid()
+        if pid is not None and (previous_pid is None or pid != previous_pid):
+            return pid
+        time.sleep(0.3)
+    return None
+
+
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
     """Return a unified view of gateway liveness for the current profile."""
     gateway_pids = tuple(find_gateway_pids())
@@ -1157,6 +1217,16 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
     print(f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}")
     print("  This is usually a manual foreground/tmux/nohup run, so `hermes gateway`")
     print("  can refuse to start another copy until this process stops.")
+
+
+def _print_runtime_health() -> None:
+    runtime_lines = _runtime_health_lines()
+    if not runtime_lines:
+        return
+    print()
+    print("Recent gateway health:")
+    for line in runtime_lines:
+        print(f"  {line}")
 
 
 def _print_other_profiles_gateway_status() -> None:
@@ -2971,12 +3041,7 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
     if configured_user:
         print(f"Configured to run as: {configured_user}")
 
-    runtime_lines = _runtime_health_lines()
-    if runtime_lines:
-        print()
-        print("Recent gateway health:")
-        for line in runtime_lines:
-            print(f"  {line}")
+    _print_runtime_health()
 
     unit_props = _read_systemd_unit_properties(system=system)
     active_state = unit_props.get("ActiveState", "")
@@ -3517,8 +3582,17 @@ def launchd_restart():
         if not _launchd_error_indicates_unloaded(e):
             # Not a "job unloaded" code. If the domain is fundamentally
             # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
+            # already drained/terminated above. First probe launchd because
+            # some macOS builds return exit 5 even though a replacement process
+            # is already supervised.
             if _launchctl_domain_unsupported(e.returncode):
+                managed_pid = _wait_for_launchd_managed_gateway(previous_pid=pid)
+                if managed_pid is not None:
+                    print(
+                        "✓ launchctl reported an error, but launchd is "
+                        f"supervising the replacement gateway (PID {managed_pid})"
+                    )
+                    return
                 _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
                 return
             raise
@@ -3556,6 +3630,11 @@ def launchd_status(deep: bool = False):
         loaded = False
         loaded_output = ""
 
+    launchd_pid = _parse_launchd_list_pid(loaded_output)
+    launchd_pid_ppid = (
+        _process_parent_pid(launchd_pid) if launchd_pid is not None else None
+    )
+
     print(f"Launchd plist: {plist_path}")
     if launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
@@ -3564,12 +3643,22 @@ def launchd_status(deep: bool = False):
         print("  Run: hermes gateway start")
 
     if loaded:
-        print("✓ Gateway service is loaded")
+        if launchd_pid is not None and launchd_pid_ppid == 1:
+            print(f"✓ Gateway service is launchd-managed (PID {launchd_pid})")
+        elif launchd_pid is not None:
+            print(
+                f"⚠ Gateway service is loaded but PID {launchd_pid} "
+                f"has parent {launchd_pid_ppid or 'unknown'}"
+            )
+        else:
+            print("⚠ Gateway service is loaded but not supervising a running process")
         print(loaded_output)
     else:
         print("✗ Gateway service is not loaded")
         print("  Service definition exists locally but launchd has not loaded it.")
         print("  Run: hermes gateway start")
+
+    _print_runtime_health()
 
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
@@ -4533,13 +4622,34 @@ def _runtime_health_lines() -> list[str]:
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
 
-    for platform, pdata in platforms.items():
-        if pdata.get("state") == "fatal":
-            message = pdata.get("error_message") or "unknown error"
-            lines.append(f"⚠ {platform}: {message}")
+    for platform in sorted(platforms):
+        pdata = platforms.get(platform) or {}
+        platform_state = str(pdata.get("state") or "unknown")
+        updated_at = _format_runtime_status_timestamp(pdata.get("updated_at"))
+        suffix = f" ({updated_at})" if updated_at else ""
+        error_code = pdata.get("error_code")
+        error_message = pdata.get("error_message")
+        error_detail = ""
+        if error_code and error_message:
+            error_detail = f" — {error_code}: {error_message}"
+        elif error_message:
+            error_detail = f" — {error_message}"
+        elif error_code:
+            error_detail = f" — {error_code}"
+
+        if platform_state == "connected":
+            lines.append(f"✓ {platform}: connected{suffix}")
+        elif platform_state in {"connecting", "retrying"}:
+            lines.append(f"⏳ {platform}: {platform_state}{error_detail}{suffix}")
+        elif platform_state in {"fatal", "paused", "disconnected"}:
+            lines.append(f"⚠ {platform}: {platform_state}{error_detail}{suffix}")
+        else:
+            lines.append(f"• {platform}: {platform_state}{error_detail}{suffix}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
+    elif gateway_state == "degraded":
+        lines.append("⚠ Gateway runtime is degraded; one or more platforms are reconnecting")
     elif gateway_state == "draining":
         action = "restart" if restart_requested else "shutdown"
         count = int(active_agents or 0)
@@ -4548,6 +4658,19 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
 
     return lines
+
+
+def _format_runtime_status_timestamp(value: object) -> str | None:
+    if not value:
+        return None
+    raw = str(value)
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("updated %Y-%m-%d %H:%M:%S %Z").strip()
 
 
 def _setup_standard_platform(platform: dict):
@@ -6671,12 +6794,7 @@ def _gateway_command_inner(args):
             if pids:
                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
                 print("  (Running manually, not as a system service)")
-                runtime_lines = _runtime_health_lines()
-                if runtime_lines:
-                    print()
-                    print("Recent gateway health:")
-                    for line in runtime_lines:
-                        print(f"  {line}")
+                _print_runtime_health()
                 print()
                 if is_termux():
                     print("Termux note:")
@@ -6700,12 +6818,7 @@ def _gateway_command_inner(args):
                     print("  sudo hermes gateway install --system")
             else:
                 print("✗ Gateway is not running")
-                runtime_lines = _runtime_health_lines()
-                if runtime_lines:
-                    print()
-                    print("Recent gateway health:")
-                    for line in runtime_lines:
-                        print(f"  {line}")
+                _print_runtime_health()
                 print()
                 print("To start:")
                 print("  hermes gateway run      # Run in foreground")
