@@ -108,7 +108,7 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="symbol-misc" {...props} />,
     route: SKILLS_ROUTE
   },
-  { id: 'kanban', label: '', icon: props => <Codicon name="project" {...props} />, route: KANBAN_ROUTE },
+  { id: 'kanban', label: 'Kanban', icon: props => <Codicon name="project" {...props} />, route: KANBAN_ROUTE },
   { id: 'messaging', label: '', icon: props => <Codicon name="comment" {...props} />, route: MESSAGING_ROUTE },
   { id: 'artifacts', label: '', icon: props => <Codicon name="files" {...props} />, route: ARTIFACTS_ROUTE }
 ]

@@ -1,6 +1,13 @@
 import { type MutableRefObject, useEffect, useRef } from 'react'
 
-import { isNewChatRoute } from '@/app/routes'
+import {
+  ARTIFACTS_ROUTE,
+  isNewChatRoute,
+  KANBAN_ROUTE,
+  MESSAGING_ROUTE,
+  SETTINGS_ROUTE,
+  SKILLS_ROUTE
+} from '@/app/routes'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -32,11 +39,8 @@ function rawHashLooksLikeSession(): boolean {
     return false
   }
 
-  return (
-    !hash.startsWith('/settings') &&
-    !hash.startsWith('/skills') &&
-    !hash.startsWith('/messaging') &&
-    !hash.startsWith('/artifacts')
+  return ![SETTINGS_ROUTE, SKILLS_ROUTE, KANBAN_ROUTE, MESSAGING_ROUTE, ARTIFACTS_ROUTE].some(route =>
+    hash.startsWith(route)
   )
 }
 
