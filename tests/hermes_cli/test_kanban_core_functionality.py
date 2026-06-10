@@ -366,7 +366,18 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
 # Worker aliveness / crash detection
 # ---------------------------------------------------------------------------
 
-def test_pid_alive_helper():
+def test_pid_alive_helper(monkeypatch):
+    from gateway import status as gateway_status
+
+    real_pid_exists = gateway_status._pid_exists
+
+    def fake_pid_exists(pid):
+        if int(pid) == 2 ** 30:
+            return False
+        return real_pid_exists(pid)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", fake_pid_exists)
+
     # Our own pid is alive.
     assert kb._pid_alive(os.getpid())
     # PID 0 / None / negative.
@@ -4500,8 +4511,10 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         conn.close()
 
 
-def test_detect_crashed_workers_increments_counter(kanban_home):
+def test_detect_crashed_workers_increments_counter(kanban_home, monkeypatch):
     """A single crash increments the consecutive_failures counter."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
@@ -4654,6 +4667,17 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock, **_kwargs: {
+            "prev_pid": int(pid) if pid else None,
+            "host_local": bool(claim_lock),
+            "termination_attempted": False,
+            "terminated": False,
+            "sigkill": False,
+        },
+    )
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
