@@ -511,6 +511,39 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return rendered or fallback
 
 
+def _read_field(obj: Any, key: str) -> Any:
+    """Read *key* from dict-like, pydantic, or simple attribute objects."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    value = getattr(obj, key, None)
+    if value is not None:
+        return value
+    for method in ("to_dict", "model_dump"):
+        converter = getattr(obj, method, None)
+        if callable(converter):
+            try:
+                data = converter()
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data.get(key)
+    return None
+
+
+def _first_nonempty_field(obj: Any, keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string field from *obj*."""
+    for key in keys:
+        value = _read_field(obj, key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -548,6 +581,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_query = ""
+        self._prefetch_turn_message = ""
+        self._prefetch_generation = 0
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -599,6 +635,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._profile_summary = ""
 
     @property
     def name(self) -> str:
@@ -1123,6 +1160,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._thread_id = str(kwargs.get("thread_id") or "").strip()
         self._agent_identity = str(kwargs.get("agent_identity") or "").strip()
         self._agent_workspace = str(kwargs.get("agent_workspace") or "").strip()
+        self._profile_summary = (
+            str(kwargs.get("profile_description") or "").strip()
+            or self._load_profile_summary(kwargs.get("hermes_home"))
+        )
         self._turn_index = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
@@ -1283,6 +1324,113 @@ class HindsightMemoryProvider(MemoryProvider):
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
 
+        self._queue_bank_mission_sync()
+
+    def _load_profile_summary(self, hermes_home: Any = None) -> str:
+        """Return the active profile's short description, if one exists."""
+        try:
+            from pathlib import Path
+            from hermes_cli.profiles import read_profile_meta
+            profile_home = Path(hermes_home) if hermes_home else get_hermes_home()
+            meta = read_profile_meta(profile_home)
+            return str(meta.get("description") or "").strip()
+        except Exception:
+            return ""
+
+    def _queue_bank_mission_sync(self) -> None:
+        """Best-effort bank mission propagation without blocking agent init."""
+        if not str(self._bank_mission or "").strip():
+            return
+
+        def _run() -> None:
+            try:
+                self._sync_bank_mission_if_empty()
+            except Exception as exc:
+                logger.debug("Hindsight bank mission sync failed: %s", exc, exc_info=True)
+
+        threading.Thread(target=_run, daemon=True, name="hindsight-bank-mission-sync").start()
+
+    def _control_request_timeout(self) -> float:
+        """Short timeout for init-time control-plane calls."""
+        try:
+            return min(float(self._timeout or _DEFAULT_TIMEOUT), 5.0)
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _server_bank_mission(self, client) -> str:
+        """Fetch the server's current bank mission, returning empty on unknown."""
+        banks = getattr(client, "banks", None)
+        if banks is not None and hasattr(banks, "get_bank_profile"):
+            try:
+                profile = self._run_sync(
+                    banks.get_bank_profile(
+                        self._bank_id,
+                        _request_timeout=self._control_request_timeout(),
+                    )
+                )
+                mission = _first_nonempty_field(profile, ("mission",))
+                if mission:
+                    return mission
+            except Exception as exc:
+                logger.debug("Hindsight bank profile read failed: %s", exc)
+
+        if hasattr(client, "_aget_bank_config"):
+            try:
+                payload = self._run_sync(client._aget_bank_config(self._bank_id))
+                config = _read_field(payload, "config")
+                overrides = _read_field(payload, "overrides")
+                return (
+                    _first_nonempty_field(overrides, ("mission", "reflect_mission"))
+                    or _first_nonempty_field(config, ("mission", "reflect_mission"))
+                    or _first_nonempty_field(payload, ("mission", "reflect_mission"))
+                )
+            except Exception as exc:
+                logger.debug("Hindsight bank config read failed: %s", exc)
+
+        return ""
+
+    def _patch_bank_mission(self, client, mission: str) -> None:
+        """Patch the server bank mission using the newest available client API."""
+        banks = getattr(client, "banks", None)
+        if banks is not None and hasattr(banks, "update_bank"):
+            try:
+                from hindsight_client_api.models.create_bank_request import CreateBankRequest
+                request = CreateBankRequest(mission=mission)
+                self._run_sync(
+                    banks.update_bank(
+                        self._bank_id,
+                        request,
+                        _request_timeout=self._control_request_timeout(),
+                    )
+                )
+                return
+            except ImportError:
+                pass
+
+        if hasattr(client, "aset_mission"):
+            self._run_sync(client.aset_mission(self._bank_id, mission))
+            return
+        if hasattr(client, "set_mission"):
+            client.set_mission(self._bank_id, mission)
+            return
+        if hasattr(client, "update_bank_config"):
+            client.update_bank_config(self._bank_id, reflect_mission=mission)
+            return
+        raise RuntimeError("Hindsight client has no bank mission update method")
+
+    def _sync_bank_mission_if_empty(self) -> None:
+        """Push configured bank_mission only when the server mission is blank."""
+        mission = str(self._bank_mission or "").strip()
+        if not mission or self._mode == "disabled":
+            return
+        client = self._get_client()
+        current = self._server_bank_mission(client)
+        if current:
+            logger.debug("Hindsight bank mission already set for bank=%s", self._bank_id)
+            return
+        self._patch_bank_mission(client, mission)
+        logger.info("Hindsight bank mission initialized for bank=%s", self._bank_id)
+
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
             return (
@@ -1305,17 +1453,7 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
-            logger.debug("Prefetch: no results available")
-            return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
+    def _format_prefetch_result(self, result: str) -> str:
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
@@ -1323,7 +1461,77 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _normalize_prefetch_query(self, query: str) -> str:
+        query = str(query or "")
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        return query.strip()
+
+    def _build_turn_prefetch_query(self, turn_number: int, message: str) -> str:
+        message = str(message or "").strip()
+        if turn_number != 1:
+            return message
+
+        parts: list[str] = []
+        if self._profile_summary:
+            parts.append(f"Profile summary: {self._profile_summary}")
+        if self._bank_mission:
+            parts.append(f"Bank mission: {self._bank_mission}")
+        if message:
+            parts.append(f"Current user message: {message}")
+        return "\n".join(parts) if parts else message
+
+    def _prefetch_text(self, query: str) -> str:
+        if self._prefetch_method == "reflect":
+            logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+            resp = self._run_hindsight_operation(
+                lambda client: client.areflect(
+                    bank_id=self._bank_id,
+                    query=query,
+                    budget=self._budget,
+                )
+            )
+            return resp.text or ""
+
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query,
+            "budget": self._budget, "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+                     self._bank_id, len(query), self._budget)
+        resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        num_results = len(resp.results) if resp.results else 0
+        logger.debug("Prefetch: recall returned %d results", num_results)
+        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        query = self._build_turn_prefetch_query(turn_number, message)
+        self._queue_prefetch(query, session_id=kwargs.get("session_id", ""), turn_message=message)
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            logger.debug("Prefetch: waiting for background thread to complete")
+            self._prefetch_thread.join(timeout=3.0)
+        with self._prefetch_lock:
+            result = self._prefetch_result
+            self._prefetch_result = ""
+            self._prefetch_query = ""
+            self._prefetch_turn_message = ""
+        if not result:
+            logger.debug("Prefetch: no results available")
+            return ""
+        logger.debug("Prefetch: returning %d chars of context", len(result))
+        return self._format_prefetch_result(result)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        self._queue_prefetch(query, session_id=session_id, turn_message=query)
+
+    def _queue_prefetch(self, query: str, *, session_id: str = "", turn_message: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
             return
@@ -1333,35 +1541,26 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._shutting_down.is_set():
             logger.debug("Prefetch: skipped (shutting down)")
             return
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        query = self._normalize_prefetch_query(query)
+        if not query:
+            logger.debug("Prefetch: skipped (empty query)")
+            return
+        turn_message = self._normalize_prefetch_query(turn_message or query)
+
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            generation = self._prefetch_generation
+            self._prefetch_query = query
+            self._prefetch_turn_message = turn_message
+            self._prefetch_result = ""
 
         def _run():
             try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                text = self._prefetch_text(query)
                 if text:
                     with self._prefetch_lock:
-                        self._prefetch_result = text
+                        if generation == self._prefetch_generation:
+                            self._prefetch_result = text
             except Exception as e:
                 logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
 
@@ -1721,6 +1920,9 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
+            self._prefetch_query = ""
+            self._prefetch_turn_message = ""
+            self._prefetch_generation = getattr(self, "_prefetch_generation", 0) + 1
 
         # 3. Now rotate to the new session.
         if parent_session_id:

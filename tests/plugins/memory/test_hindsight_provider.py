@@ -262,6 +262,40 @@ class TestConfig:
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
 
+    def test_bank_mission_patch_when_server_mission_empty(self):
+        p = HindsightMemoryProvider()
+        banks = SimpleNamespace(
+            get_bank_profile=AsyncMock(return_value=SimpleNamespace(mission="")),
+            update_bank=AsyncMock(return_value=SimpleNamespace(mission="Configured mission")),
+        )
+        p._client = SimpleNamespace(banks=banks)
+        p._bank_id = "test-bank"
+        p._bank_mission = "Configured mission"
+        p._timeout = 1
+
+        p._sync_bank_mission_if_empty()
+
+        banks.get_bank_profile.assert_called_once()
+        banks.update_bank.assert_called_once()
+        assert banks.update_bank.call_args.args[0] == "test-bank"
+        assert banks.update_bank.call_args.args[1].mission == "Configured mission"
+
+    def test_bank_mission_not_overwritten_when_server_has_mission(self):
+        p = HindsightMemoryProvider()
+        banks = SimpleNamespace(
+            get_bank_profile=AsyncMock(return_value=SimpleNamespace(mission="Existing mission")),
+            update_bank=AsyncMock(),
+        )
+        p._client = SimpleNamespace(banks=banks)
+        p._bank_id = "test-bank"
+        p._bank_mission = "Configured mission"
+        p._timeout = 1
+
+        p._sync_bank_mission_if_empty()
+
+        banks.get_bank_profile.assert_called_once()
+        banks.update_bank.assert_not_called()
+
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
         monkeypatch.setattr(
@@ -664,6 +698,61 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_on_turn_start_prefetch_uses_current_message(self, provider):
+        captured = {}
+
+        async def _capture_recall(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(results=[SimpleNamespace(text="fresh current memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_capture_recall)
+
+        provider.on_turn_start(2, "current user question")
+        result = provider.prefetch("current user question")
+
+        assert "fresh current memory" in result
+        assert captured["query"] == "current user question"
+
+    def test_prefetch_replaces_stale_queued_result_with_current_turn(self, provider):
+        provider._prefetch_result = "- stale previous memory"
+        provider._prefetch_query = "previous user question"
+        provider._prefetch_turn_message = "previous user question"
+
+        async def _fresh_recall(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text="fresh current memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_fresh_recall)
+
+        provider.on_turn_start(2, "current user question")
+        result = provider.prefetch("current user question")
+
+        assert "fresh current memory" in result
+        assert "stale previous memory" not in result
+        assert provider._client.arecall.call_args.kwargs["query"] == "current user question"
+
+    def test_first_turn_prefetch_query_includes_profile_summary(
+        self, provider_with_config, tmp_path
+    ):
+        (tmp_path / "profile.yaml").write_text(
+            "description: Coding profile for Hermes runtime maintenance.\n",
+            encoding="utf-8",
+        )
+        p = provider_with_config()
+        captured = {}
+
+        async def _capture_recall(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(results=[SimpleNamespace(text="profile-scoped memory")])
+
+        p._client.arecall = AsyncMock(side_effect=_capture_recall)
+
+        p.on_turn_start(1, "why is recall stale?")
+        result = p.prefetch("why is recall stale?")
+
+        assert "profile-scoped memory" in result
+        assert "Profile summary: Coding profile for Hermes runtime maintenance." in captured["query"]
+        assert "Current user message: why is recall stale?" in captured["query"]
 
 
 # ---------------------------------------------------------------------------
