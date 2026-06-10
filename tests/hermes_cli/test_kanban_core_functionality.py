@@ -3081,8 +3081,58 @@ def test_dispatch_blocks_legacy_task_with_missing_forced_skill(
         assert res.skill_blocked[0]["task_id"] == tid
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
+        assert task.consecutive_failures == 0
         assert task.last_failure_error is None
         events = kb.list_events(conn, tid)
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Every skill destined for --skills is checked before worker spawn.
+
+    This covers injected dispatcher skills, not only the task.skills column.
+    If the dispatcher would pass kanban-worker but the worker profile cannot
+    resolve it, the card must block without claiming or spawning.
+    """
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: True)
+
+    spawn_attempts = []
+
+    def fail_popen(*args, **kwargs):
+        spawn_attempts.append((args, kwargs))
+        raise AssertionError("dispatcher must block before spawning")
+
+    monkeypatch.setattr("subprocess.Popen", fail_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs worker skill", assignee="ops")
+
+        res = kb.dispatch_once(conn)
+
+        assert spawn_attempts == []
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        assert res.skill_blocked[0]["skills"] == ["kanban-worker"]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        events = kb.list_events(conn, tid)
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked
+        assert blocked[-1].payload["reason"].startswith(
+            "missing-skills:kanban-worker"
+        )
         assert any(e.kind == "missing_skills_auto_blocked" for e in events)
     finally:
         conn.close()
