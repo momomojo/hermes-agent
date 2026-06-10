@@ -466,3 +466,66 @@ class TestSessionRetirementOnRunAgent:
         assert agent._codex_session is None
         assert result["completed"] is False
         assert "codex segfaulted" in result["error"]
+
+
+class TestTimeoutConfigPlumbing:
+    """config.yaml `codex_app_server:` knobs must reach run_turn()."""
+
+    def test_config_knobs_reach_run_turn(self, monkeypatch):
+        captured: dict = {}
+
+        def capturing_run_turn(self, user_input, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-cfg-1",
+                thread_id="thread-cfg-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", capturing_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-cfg-1"
+        )
+        import hermes_cli.config as cfg_mod
+        monkeypatch.setattr(
+            cfg_mod,
+            "load_config",
+            lambda *a, **k: {
+                "codex_app_server": {
+                    "idle_timeout_seconds": 1234,
+                    "max_turn_seconds": 7200,
+                    "post_tool_quiet_seconds": 45,
+                }
+            },
+        )
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("plumb me")
+        assert result["error"] is None
+        assert captured["turn_timeout"] == 1234.0
+        assert captured["turn_max_seconds"] == 7200.0
+        assert captured["post_tool_quiet_timeout"] == 45.0
+
+    def test_defaults_when_section_absent(self, monkeypatch):
+        captured: dict = {}
+
+        def capturing_run_turn(self, user_input, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", capturing_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "t"
+        )
+        import hermes_cli.config as cfg_mod
+        monkeypatch.setattr(cfg_mod, "load_config", lambda *a, **k: {})
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("defaults")
+        assert captured["turn_timeout"] == 600.0
+        assert captured["turn_max_seconds"] == 0.0
+        assert captured["post_tool_quiet_timeout"] == 90.0

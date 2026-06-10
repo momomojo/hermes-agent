@@ -369,10 +369,20 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        turn_max_seconds: float = 0.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
+
+        turn_timeout: IDLE timeout, not a wall-clock cap — every codex
+        event (notification or server-initiated request) resets it. A turn
+        only dies on this when codex has emitted nothing at all for this
+        many seconds. Long healthy turns that keep streaming run as long
+        as they need.
+
+        turn_max_seconds: optional hard wall-clock cap on the whole turn
+        regardless of activity. 0 (default) = unbounded.
 
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
@@ -443,7 +453,16 @@ class CodexAppServerSession:
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
-        deadline = time.monotonic() + turn_timeout
+        started_at = time.monotonic()
+        # Liveness-based deadline: any event from codex (notification or
+        # server-initiated request) is proof the turn is alive and extends
+        # the window. turn_timeout therefore bounds *silence*, not total
+        # turn duration — a long healthy turn that streams items for 30
+        # minutes is fine; a turn that goes quiet for turn_timeout is not.
+        # turn_max_seconds (0 = unbounded) is the optional hard wall-clock
+        # cap for callers that need one.
+        last_activity = started_at
+        timeout_reason: Optional[str] = None
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -451,7 +470,20 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while not turn_complete:
+            now = time.monotonic()
+            if now - last_activity >= turn_timeout:
+                timeout_reason = (
+                    f"turn idle-timed out after {turn_timeout:.0f}s "
+                    f"without any codex events"
+                )
+                break
+            if turn_max_seconds > 0 and now - started_at >= turn_max_seconds:
+                timeout_reason = (
+                    f"turn exceeded the hard cap of {turn_max_seconds:.0f}s "
+                    f"(codex_app_server.max_turn_seconds)"
+                )
+                break
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -496,6 +528,7 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                last_activity = time.monotonic()
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -532,6 +565,7 @@ class CodexAppServerSession:
             )
             if note is None:
                 continue
+            last_activity = time.monotonic()
 
             method = note.get("method", "")
             if self._on_event is not None:
@@ -605,15 +639,16 @@ class CodexAppServerSession:
                             )
 
         if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
-            # tell the caller to retire the session — a turn that never
-            # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
+            # Hit a deadline (idle or hard cap). Issue interrupt to stop
+            # wasted compute, and tell the caller to retire the session — a
+            # turn that never finished is a strong sign codex is wedged in a
+            # way the next turn shouldn't inherit.
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
+                    timeout_reason
+                    or f"turn timed out after {turn_timeout}s"
                 )
             result.should_retire = True
 
