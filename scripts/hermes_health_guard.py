@@ -13,10 +13,12 @@ import hmac
 import html
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,12 @@ DEFAULT_EXPECTED_PROFILES = (
     "nas-ops",
 )
 BAD_PLATFORM_STATES = {"fatal", "paused", "retrying", "disconnected"}
+
+# Non-gateway listeners that must stay up; gateway ports are covered via
+# each profile's gateway_state.json instead.
+CRITICAL_LISTENERS = {"delivery-pubsub-push-adapter": 8663}
+BACKUP_LOG = HOME / "logs" / "home-backup.log"
+BACKUP_MAX_AGE_HOURS = float(os.environ.get("HERMES_BACKUP_MAX_AGE_HOURS", "36"))
 
 
 def _now() -> str:
@@ -233,12 +241,69 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     }
 
 
+def _check_listener(name: str, port: int) -> dict[str, Any]:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            return {"name": name, "port": port, "ok": True, "error": None}
+    except OSError as exc:
+        return {"name": name, "port": port, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _check_cron_failures(profiles: list[str]) -> list[str]:
+    """One failure line per enabled, unpaused cron job whose latest run errored.
+
+    This is what catches a daily no_agent script that starts exiting
+    nonzero — previously invisible unless a human read jobs.json.
+    """
+    failures: list[str] = []
+    paths = [(None, HOME / "cron" / "jobs.json")]
+    paths += [(p, HOME / "profiles" / p / "cron" / "jobs.json") for p in profiles]
+    for profile, path in paths:
+        label = profile or "default"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue  # profile without cron jobs is normal
+        jobs = data.get("jobs") if isinstance(data, dict) else data
+        for job in jobs or []:
+            if not isinstance(job, dict):
+                continue
+            if not job.get("enabled", True) or job.get("paused_at"):
+                continue
+            if job.get("last_status") == "error":
+                name = job.get("name") or job.get("id") or "?"
+                detail = job.get("last_error") or "error"
+                failures.append(f"cron job failing for {label}: {name}: {detail}")
+    return failures
+
+
+def _check_backup_freshness() -> list[str]:
+    """Alert when the nightly ~/.hermes -> NAS mirror hasn't succeeded lately."""
+    try:
+        text = BACKUP_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [f"home-backup log missing ({BACKUP_LOG})"]
+    last: str | None = None
+    for m in re.finditer(
+        r"=== finished (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) rsync_rc=0/0 ===", text
+    ):
+        last = m.group(1)
+    if last is None:
+        return ["home-backup has never succeeded (no rsync_rc=0/0 in log)"]
+    age = datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+    if age > timedelta(hours=BACKUP_MAX_AGE_HOURS):
+        hours = age.total_seconds() / 3600
+        return [f"home-backup stale: last success {last} ({hours:.0f}h ago)"]
+    return []
+
+
 def collect_health() -> dict[str, Any]:
     profiles = _profile_names()
     preflight_profiles = [None, *profiles]
     gateway_profiles = [None, *profiles]
     preflights = [_check_kanban_preflight(profile) for profile in preflight_profiles]
     gateways = [_check_gateway_state(profile) for profile in gateway_profiles]
+    listeners = [_check_listener(name, port) for name, port in sorted(CRITICAL_LISTENERS.items())]
     failures: list[str] = []
 
     for item in preflights:
@@ -247,6 +312,11 @@ def collect_health() -> dict[str, Any]:
     for item in gateways:
         if not item["ok"]:
             failures.append(f"gateway unhealthy for {item['profile']}: {'; '.join(item['errors'])}")
+    for item in listeners:
+        if not item["ok"]:
+            failures.append(f"listener down: {item['name']} (127.0.0.1:{item['port']}): {item['error']}")
+    failures.extend(_check_cron_failures(profiles))
+    failures.extend(_check_backup_freshness())
 
     level = "ok" if not failures else "critical"
     return {
@@ -257,6 +327,7 @@ def collect_health() -> dict[str, Any]:
         "failures": failures,
         "preflights": preflights,
         "gateways": gateways,
+        "listeners": listeners,
     }
 
 
