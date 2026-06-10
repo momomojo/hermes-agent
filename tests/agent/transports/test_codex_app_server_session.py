@@ -769,7 +769,9 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        # Values consumed by: started_at, iter1 now, note last_activity,
+        # post-tool stamp, iter2 now, watchdog check (trips: 1000.2-999>0.15).
+        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2])
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -1093,3 +1095,101 @@ class TestClassifyOAuthFailure:
             "[stderr] token has expired, run codex login",
         )
         assert hint is not None
+
+
+# ---- event-driven (liveness-based) deadline ----
+
+def _note(method: str, **params) -> dict:
+    return {"method": method, "params": params}
+
+
+class DrippingClient(FakeClient):
+    """FakeClient whose notifications become available on a wall-clock
+    schedule (seconds since construction), to exercise the liveness-extended
+    idle deadline with realistic inter-event gaps."""
+
+    def __init__(self, schedule: list[tuple[float, dict]]) -> None:
+        super().__init__()
+        self._drip_schedule = sorted(schedule, key=lambda t: t[0])
+        self._drip_t0 = time.monotonic()
+
+    def take_notification(self, timeout: float = 0.0):
+        elapsed = time.monotonic() - self._drip_t0
+        if self._drip_schedule and self._drip_schedule[0][0] <= elapsed:
+            return self._drip_schedule.pop(0)[1]
+        if timeout > 0:
+            time.sleep(min(timeout, 0.005))
+        return None
+
+
+class ChattyClient(FakeClient):
+    """FakeClient that streams a benign delta event on every poll — a turn
+    that is never idle. Used to prove the hard cap fires on activity."""
+
+    def take_notification(self, timeout: float = 0.0):
+        time.sleep(0.01)
+        return _note("item/agentMessage/outputDelta", delta="x")
+
+
+class TestEventDrivenDeadline:
+    def test_streaming_activity_extends_idle_deadline(self):
+        # Idle budget 0.25s; events arrive every ~0.15s until turn/completed
+        # at ~0.6s — total wall clock is >2x the idle budget. The turn must
+        # complete because every codex event resets the idle window. (Under
+        # the old fixed wall-clock deadline this exact schedule timed out.)
+        schedule = [
+            (0.15, _note("item/agentMessage/outputDelta", delta="a")),
+            (0.30, _note("item/agentMessage/outputDelta", delta="b")),
+            (0.45, _note("item/agentMessage/outputDelta", delta="c")),
+            (0.60, _note("turn/completed", threadId="t",
+                         turn={"id": "tu1", "status": "completed"})),
+        ]
+        client = DrippingClient(schedule)
+        s = make_session(client)
+        r = s.run_turn(
+            "long healthy turn",
+            turn_timeout=0.25,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is False
+        assert r.error is None
+        assert r.should_retire is False
+
+    def test_idle_timeout_error_names_idle(self):
+        client = FakeClient()
+        s = make_session(client)
+        r = s.run_turn(
+            "never speaks",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "idle-timed out" in r.error
+
+    def test_hard_cap_fires_despite_constant_activity(self):
+        client = ChattyClient()
+        s = make_session(client)
+        r = s.run_turn(
+            "infinite stream",
+            turn_timeout=10.0,
+            notification_poll_timeout=0.01,
+            turn_max_seconds=0.2,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "hard cap" in r.error
+
+    def test_hard_cap_disabled_by_default(self):
+        # turn_max_seconds defaults to 0 (unbounded): a streaming turn longer
+        # than any historical default must not be killed by a cap it never
+        # configured. Covered implicitly above, asserted explicitly here.
+        schedule = [
+            (0.05, _note("item/agentMessage/outputDelta", delta="a")),
+            (0.10, _note("turn/completed", threadId="t",
+                         turn={"id": "tu1", "status": "completed"})),
+        ]
+        client = DrippingClient(schedule)
+        s = make_session(client)
+        r = s.run_turn("ok", turn_timeout=5.0, notification_poll_timeout=0.01)
+        assert r.error is None
