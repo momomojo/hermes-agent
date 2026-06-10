@@ -8,11 +8,14 @@ operators can tell when drift or adapter trouble returns.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import os
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +29,11 @@ STATE_PATH = BASE / "state.json"
 HISTORY_PATH = BASE / "history.jsonl"
 HTML_PATH = BASE / "index.html"
 LOG_PATH = HOME / "logs" / "hermes_health_guard.log"
+NOTIFY_STATE_PATH = BASE / "notify_state.json"
+NOTIFY_WEBHOOK_URL = os.environ.get(
+    "HERMES_HEALTH_WEBHOOK_URL", "http://127.0.0.1:8648/webhooks/health-guard"
+)
+NOTIFY_WEBHOOK_NAME = NOTIFY_WEBHOOK_URL.rstrip("/").rsplit("/", 1)[-1]
 
 DEFAULT_EXPECTED_PROFILES = (
     "codex-coding",
@@ -150,6 +158,29 @@ def _load_runtime_state(profile: str | None) -> dict[str, Any] | None:
         return None
 
 
+def _disabled_platforms(profile: str | None) -> set[str]:
+    """Platforms explicitly disabled in the profile's config.yaml.
+
+    A gateway may still report a disabled platform (e.g. webhook with
+    enabled: false) as "disconnected"; that is not a failure.
+    """
+    config_path = _profile_home(profile) / "config.yaml"
+    try:
+        import yaml  # available in the hermes venv
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return set()
+    return {
+        name
+        for name, pconf in platforms.items()
+        if isinstance(pconf, dict) and pconf.get("enabled") is False
+    }
+
+
 def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     label = profile or "default"
     state = _load_runtime_state(profile)
@@ -171,9 +202,14 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     if not _pid_alive(pid):
         errors.append(f"pid {pid or 'missing'} is not alive")
 
+    disabled = _disabled_platforms(profile)
+    skipped: list[str] = []
     platforms = state.get("platforms") or {}
     if isinstance(platforms, dict):
         for platform, pdata in sorted(platforms.items()):
+            if platform in disabled:
+                skipped.append(platform)
+                continue
             if not isinstance(pdata, dict):
                 errors.append(f"{platform}: invalid platform state")
                 continue
@@ -191,6 +227,7 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
         "pid": pid,
         "gateway_state": gateway_state,
         "platforms": platforms,
+        "skipped_disabled": skipped,
         "updated_at": state.get("updated_at"),
         "errors": errors,
     }
@@ -284,11 +321,68 @@ code,small{{color:#b9d7ff}}
     HTML_PATH.write_text(doc, encoding="utf-8")
 
 
+def _notify_secret() -> str | None:
+    try:
+        subs = json.loads((HOME / "webhook_subscriptions.json").read_text(encoding="utf-8"))
+        return subs[NOTIFY_WEBHOOK_NAME]["secret"]
+    except Exception:
+        return None
+
+
+def _post_alert(alert_text: str, level: str) -> bool:
+    secret = _notify_secret()
+    if secret is None:
+        return False
+    body = json.dumps({
+        "source": "health-guard",
+        "ts": _now(),
+        "level": level,
+        "alert_text": alert_text,
+    }).encode()
+    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(NOTIFY_WEBHOOK_URL, data=body, headers={
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": sig,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def _notify_if_changed(payload: dict[str, Any]) -> None:
+    """Deliver one alert per state change (deliver-only route, zero LLM).
+
+    Silent while the failure set is unchanged; failed deliveries leave
+    notify_state untouched so the next 300s tick retries.
+    """
+    try:
+        prev = json.loads(NOTIFY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        prev = None
+    current = {"level": payload["level"], "failures": sorted(payload["failures"])}
+    if prev is not None and prev == current:
+        return
+    if payload["ok"]:
+        if prev is None or prev.get("level") == "ok":
+            _write_json(NOTIFY_STATE_PATH, current)
+            return
+        alert_text = "✅ Hermes health guard: all clear (recovered from: " + \
+            "; ".join(prev.get("failures") or ["unknown"]) + ")"
+    else:
+        lines = "\n".join(f"- {f}" for f in current["failures"])
+        alert_text = f"🚨 Hermes health guard: {len(current['failures'])} failure(s)\n{lines}"
+    if _post_alert(alert_text, payload["level"]):
+        _write_json(NOTIFY_STATE_PATH, current)
+
+
 def main() -> int:
     payload = collect_health()
     _write_json(STATE_PATH, payload)
     _append_history(payload)
     _write_html(payload)
+    _notify_if_changed(payload)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(f"{payload['timestamp']} {payload['level']} failures={len(payload['failures'])}\n")
