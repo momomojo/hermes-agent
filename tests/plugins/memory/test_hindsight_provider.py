@@ -1021,6 +1021,68 @@ class TestSyncTurn:
         assert "你好" in raw_json
         assert "👨‍👩‍👧‍👦" in raw_json
 
+    def test_sync_turn_redacts_secret_policy_before_retain(self, provider_with_config):
+        p = provider_with_config(retain_redaction_policy=["secrets"])
+
+        p.sync_turn(
+            "api_key=sk-testsecret1234567890 and password=hunter2",
+            "Use Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456",
+        )
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert "sk-testsecret1234567890" not in raw_json
+        assert "hunter2" not in raw_json
+        assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in raw_json
+        assert raw_json.count("[REDACTED]") >= 3
+        content = json.loads(raw_json)
+        assert content[0][0]["content"] == "User: api_key=[REDACTED] and password=[REDACTED]"
+        assert content[0][1]["content"] == "Assistant: Use Authorization: Bearer [REDACTED]"
+
+    def test_sync_turn_drops_noise_pattern_unless_durable_term_matches(self, provider_with_config):
+        p = provider_with_config(
+            retain_noise_patterns=[r"\bsensor\."],
+            retain_durable_terms=["automation"],
+        )
+
+        p.sync_turn("sensor.kitchen state changed to 71", "noted")
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+        assert p._sync_thread is None
+        p._client.aretain_batch.assert_not_called()
+
+        p.sync_turn("sensor.kitchen automation threshold changed", "saved")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert "sensor.kitchen automation threshold changed" in raw_json
+
+    def test_sync_turn_caps_oversize_payload_to_recent_turns(self, provider_with_config):
+        p = provider_with_config(
+            retain_every_n_turns=3,
+            retain_max_payload_chars=450,
+            retain_oversize_policy="recent_turns",
+        )
+
+        p.sync_turn("old1-user " + ("x" * 350), "old1-asst")
+        p.sync_turn("old2-user " + ("y" * 350), "old2-asst")
+        p.sync_turn("recent-user", "recent-asst")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert len(raw_json) <= 450
+        assert "recent-user" in raw_json
+        assert "recent-asst" in raw_json
+        assert "old1-user" not in raw_json
+        assert "old2-user" not in raw_json
+        assert item["metadata"]["message_count"] == "2"
+        content = json.loads(raw_json)
+        assert len(content) == 1
+
 
 # ---------------------------------------------------------------------------
 # Shutdown / writer tests

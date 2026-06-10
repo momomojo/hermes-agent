@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 
 from datetime import datetime, timezone
@@ -59,6 +60,8 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_REDACTED = "[REDACTED]"
+_VALID_RETAIN_OVERSIZE_POLICIES = {"recent_turns"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -70,6 +73,48 @@ _PROVIDER_DEFAULT_MODELS = {
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
+
+_AUTH_BEARER_RE = re.compile(
+    r"\b(?P<label>Authorization)(?P<sep>\s*[:=]\s*)Bearer\s+[^\s,;]+",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b(?P<label>[\w.-]*?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"token|secret|password|passwd|pwd|client[_-]?secret|credential)[\w.-]*?)"
+    r"(?P<sep>\s*[:=]\s*)(?P<quote>[\"']?)(?P<value>[^\s\"',;{}\]\)]+)(?P=quote)",
+    re.IGNORECASE,
+)
+_COMMON_SECRET_RE = re.compile(
+    r"\b(?:"
+    r"sk-[A-Za-z0-9_-]{16,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"AIza[0-9A-Za-z_-]{20,}|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r")\b"
+)
+_PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+_HOME_CODE_RE = re.compile(
+    r"\b(?P<label>(?:(?:door|alarm|lock|garage|gate|wifi|wi-fi|access)\s+)?"
+    r"(?:code|pin|password|passcode))(?P<sep>\s*[:=]\s*)"
+    r"(?P<quote>[\"']?)(?P<value>[^\s\"',;]+)(?P=quote)",
+    re.IGNORECASE,
+)
+_MEDICAL_LABELED_IDENTIFIER_RE = re.compile(
+    r"\b(?P<label>mrn|medical record(?: number)?|accession(?: number)?|dob|"
+    r"date of birth|patient(?: name)?|pt name)(?P<sep>\s*(?::|=|#|-)\s*)"
+    r"(?P<quote>[\"']?)(?P<value>[A-Za-z0-9][A-Za-z0-9 ._/-]{1,80})(?P=quote)",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_SSN_RE = re.compile(r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b")
+_PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
@@ -376,6 +421,140 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_string_list(value: Any) -> List[str]:
+    """Normalize a config string/list into non-empty strings."""
+    return _normalize_retain_tags(value)
+
+
+def _redact_labeled_value(match: re.Match[str]) -> str:
+    quote = match.groupdict().get("quote") or ""
+    return f"{match.group('label')}{match.group('sep')}{quote}{_REDACTED}{quote}"
+
+
+def _redact_secrets(text: str) -> str:
+    redacted = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, text)
+    redacted = _AUTH_BEARER_RE.sub(
+        lambda m: f"{m.group('label')}{m.group('sep')}Bearer {_REDACTED}",
+        redacted,
+    )
+    redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_labeled_value, redacted)
+    redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", redacted)
+    return _COMMON_SECRET_RE.sub(_REDACTED, redacted)
+
+
+def _redact_home_codes(text: str) -> str:
+    return _HOME_CODE_RE.sub(_redact_labeled_value, text)
+
+
+def _redact_medical_phi(text: str) -> str:
+    redacted = _MEDICAL_LABELED_IDENTIFIER_RE.sub(_redact_labeled_value, text)
+    redacted = _EMAIL_RE.sub(_REDACTED, redacted)
+    redacted = _SSN_RE.sub(_REDACTED, redacted)
+    return _PHONE_RE.sub(_REDACTED, redacted)
+
+
+def _regex_search(pattern: str, text: str) -> bool:
+    try:
+        return re.search(pattern, text, re.IGNORECASE) is not None
+    except re.error as exc:
+        logger.warning("Invalid retain_noise_patterns entry %r: %s", pattern, exc)
+        return False
+
+
+def _payload_for_turns(turns: List[str]) -> str:
+    return "[" + ",".join(turns) + "]"
+
+
+def _truncate_text_with_marker(text: str, keep_chars: int) -> str:
+    if keep_chars <= 0:
+        return ""
+    if len(text) <= keep_chars:
+        return text
+    marker = "...[truncated] "
+    if keep_chars <= len(marker):
+        return text[-keep_chars:]
+    return marker + text[-(keep_chars - len(marker)):]
+
+
+def _turn_with_content_budget(messages: List[Dict[str, Any]], keep_chars: int) -> str:
+    remaining = max(0, keep_chars)
+    copied: List[Dict[str, Any]] = [
+        dict(msg) if isinstance(msg, dict) else {"content": str(msg)}
+        for msg in messages
+    ]
+    content_indexes = [
+        index for index, msg in enumerate(copied)
+        if isinstance(msg.get("content"), str)
+    ]
+    allocations = {index: 0 for index in content_indexes}
+    for index in reversed(content_indexes):
+        original = copied[index].get("content", "")
+        take = min(len(original), remaining)
+        allocations[index] = take
+        remaining -= take
+
+    for index in content_indexes:
+        copied[index]["content"] = _truncate_text_with_marker(
+            copied[index].get("content", ""),
+            allocations[index],
+        )
+    return json.dumps(copied, ensure_ascii=False)
+
+
+def _truncate_turn_to_payload(turn: str, max_payload_chars: int) -> str | None:
+    try:
+        messages = json.loads(turn)
+    except Exception:
+        return None
+    if not isinstance(messages, list):
+        return None
+
+    def payload_with_budget(keep_chars: int) -> str:
+        return _payload_for_turns([_turn_with_content_budget(messages, keep_chars)])
+
+    if len(payload_with_budget(0)) > max_payload_chars:
+        return None
+
+    total_content_chars = sum(
+        len(msg.get("content", ""))
+        for msg in messages
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+    )
+    low = 0
+    high = total_content_chars
+    best = _turn_with_content_budget(messages, 0)
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = _turn_with_content_budget(messages, mid)
+        if len(_payload_for_turns([candidate])) <= max_payload_chars:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _cap_turn_payload(turns: List[str], max_payload_chars: int, oversize_policy: str) -> List[str]:
+    if max_payload_chars <= 0 or len(_payload_for_turns(turns)) <= max_payload_chars:
+        return list(turns)
+    if oversize_policy != "recent_turns":
+        oversize_policy = "recent_turns"
+
+    capped: List[str] = []
+    for turn in reversed(turns):
+        candidate = [turn] + capped
+        if len(_payload_for_turns(candidate)) <= max_payload_chars:
+            capped = candidate
+            continue
+        if capped:
+            break
+        truncated = _truncate_turn_to_payload(turn, max_payload_chars)
+        if truncated is not None:
+            capped = [truncated]
+        break
+    return capped
+
+
 def _utc_timestamp() -> str:
     """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -609,6 +788,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_every_n_turns = 1
         self._retain_async = True
         self._retain_context = "conversation between Hermes Agent and the User"
+        self._retain_redaction_policy: list[str] = []
+        self._retain_max_payload_chars = 0
+        self._retain_oversize_policy = "recent_turns"
+        self._retain_noise_patterns: list[str] = []
+        self._retain_durable_terms: list[str] = []
         self._turn_counter = 0
         self._session_turns: list[str] = []  # accumulates ALL turns for the session
         # How many turns the last append-mode retain already shipped. Used to
@@ -913,6 +1097,11 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
+            {"key": "retain_redaction_policy", "description": "Client-side redaction policies before retain (for example: secrets, medical_no_phi, home_codes)", "default": []},
+            {"key": "retain_max_payload_chars", "description": "Maximum retained payload size in characters; 0 disables client-side capping", "default": 0},
+            {"key": "retain_oversize_policy", "description": "How to cap oversized retain payloads", "default": "recent_turns", "choices": ["recent_turns"]},
+            {"key": "retain_noise_patterns", "description": "Regex patterns for turns that should be dropped before retain", "default": []},
+            {"key": "retain_durable_terms", "description": "Terms that override retain_noise_patterns when present in the same turn", "default": []},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
@@ -1241,6 +1430,29 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_retain = self._config.get("auto_retain", True)
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
+        self._retain_redaction_policy = [
+            policy.strip().lower()
+            for policy in _normalize_string_list(self._config.get("retain_redaction_policy"))
+            if policy.strip()
+        ]
+        self._retain_max_payload_chars = max(
+            0,
+            _parse_int_setting(self._config.get("retain_max_payload_chars"), 0),
+        )
+        oversize_policy = str(
+            self._config.get("retain_oversize_policy") or "recent_turns"
+        ).strip().lower()
+        self._retain_oversize_policy = (
+            oversize_policy
+            if oversize_policy in _VALID_RETAIN_OVERSIZE_POLICIES
+            else "recent_turns"
+        )
+        self._retain_noise_patterns = _normalize_string_list(
+            self._config.get("retain_noise_patterns")
+        )
+        self._retain_durable_terms = _normalize_string_list(
+            self._config.get("retain_durable_terms")
+        )
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
@@ -1588,6 +1800,42 @@ class HindsightMemoryProvider(MemoryProvider):
             },
         ]
 
+    def _turn_matches_retain_noise(self, user_content: str, assistant_content: str) -> bool:
+        if not self._retain_noise_patterns:
+            return False
+        combined = f"{user_content}\n{assistant_content}"
+        if not any(_regex_search(pattern, combined) for pattern in self._retain_noise_patterns):
+            return False
+        folded = combined.casefold()
+        if any(term.casefold() in folded for term in self._retain_durable_terms):
+            return False
+        return True
+
+    def _redact_for_retain(self, text: str) -> str:
+        redacted = text
+        policies = set(self._retain_redaction_policy)
+        if "secrets" in policies:
+            redacted = _redact_secrets(redacted)
+        if "home_codes" in policies:
+            redacted = _redact_home_codes(redacted)
+        if "medical_no_phi" in policies:
+            redacted = _redact_medical_phi(redacted)
+        return redacted
+
+    def _cap_retain_turns(self, turns: List[str]) -> List[str]:
+        capped = _cap_turn_payload(
+            turns,
+            self._retain_max_payload_chars,
+            self._retain_oversize_policy,
+        )
+        if len(capped) < len(turns):
+            logger.info(
+                "sync_turn: capped retain payload from %d to %d turns (max=%d chars, policy=%s)",
+                len(turns), len(capped), self._retain_max_payload_chars,
+                self._retain_oversize_policy,
+            )
+        return capped
+
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
             "retained_at": _utc_timestamp(),
@@ -1663,6 +1911,12 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
+        if self._turn_matches_retain_noise(user_content, assistant_content):
+            logger.debug("sync_turn: skipped turn matching retain_noise_patterns")
+            return
+
+        user_content = self._redact_for_retain(str(user_content))
+        assistant_content = self._redact_for_retain(str(assistant_content))
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
@@ -1686,6 +1940,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
         else:
             turns_to_retain = list(self._session_turns)
+
+        turns_to_retain = self._cap_retain_turns(turns_to_retain)
+        if not turns_to_retain:
+            logger.warning(
+                "sync_turn: skipped retain because retain_max_payload_chars=%d is too small for a valid payload",
+                self._retain_max_payload_chars,
+            )
+            return
 
         logger.debug("sync_turn: retaining %d/%d turns, payload %d chars",
                      len(turns_to_retain), len(self._session_turns),
@@ -1860,7 +2122,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # everything before mutating self._* so metadata + tags + doc_id
         # all reference the old session consistently.
         if self._session_turns:
-            old_turns = list(self._session_turns)
+            old_turns = self._cap_retain_turns(list(self._session_turns))
             old_session_id = self._session_id
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
@@ -1915,7 +2177,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # two threads on aretain_batch against the same document, and
             # keeps shutdown's drain semantics intact. Skip enqueue if
             # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
+            if old_turns and not self._shutting_down.is_set():
                 self._ensure_writer()
                 self._register_atexit()
                 self._retain_queue.put(_flush)
