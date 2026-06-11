@@ -1562,7 +1562,13 @@ class HindsightMemoryProvider(MemoryProvider):
                         if generation == self._prefetch_generation:
                             self._prefetch_result = text
             except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
+                # WARNING, not debug: a silently dying recall path makes every
+                # downstream turn run memory-blind with no operator signal.
+                self._prefetch_failures = getattr(self, "_prefetch_failures", 0) + 1
+                logger.warning(
+                    "Hindsight prefetch failed (%d total this session): %s",
+                    self._prefetch_failures, e, exc_info=True,
+                )
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()

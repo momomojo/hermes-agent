@@ -6157,7 +6157,7 @@ def dispatch_once(
         assignee: Optional[str],
         skills: Optional[Iterable[str]],
     ) -> list[dict[str, Any]]:
-        if spawn_fn is not None:
+        if spawn_fn is not None and spawn_fn is not _default_spawn:
             # Test/custom spawn functions may not invoke the Hermes CLI at all.
             # The production gateway/CLI path uses _default_spawn, which is the
             # path where an unresolved --skills flag is fatal at startup.
@@ -6165,12 +6165,18 @@ def dispatch_once(
         try:
             from tools.skill_reference_guard import validate_task_skills_for_profile
 
-            return validate_task_skills_for_profile(
-                skills,
+            spawn_skills = _default_spawn_skill_names(assignee, skills)
+            missing = validate_task_skills_for_profile(
+                spawn_skills,
                 assignee,
                 allow_uninitialized_home=False,
                 allow_missing_profile=True,
             )
+            for item in missing:
+                item.setdefault("task_id", task_id)
+                item.setdefault("source", "worker.spawn.skills")
+                item.setdefault("spawn_skills", spawn_skills)
+            return missing
         except Exception as exc:
             _log.debug("kanban dispatch skill preflight failed: %s", exc, exc_info=True)
             return []
@@ -6183,9 +6189,10 @@ def dispatch_once(
         review: bool = False,
     ) -> None:
         names = sorted({str(item.get("name")) for item in missing if item.get("name")})
+        names_label = ",".join(names)
         reason = (
-            f"missing-skills: profile {assignee or 'default'!r} cannot load "
-            f"required skill(s): {', '.join(names)}"
+            f"missing-skills:{names_label} profile {assignee or 'default'!r} "
+            "cannot load required skill(s)"
         )
         if not dry_run:
             block_task(conn, task_id, reason=reason)
@@ -6770,25 +6777,61 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
     """
-    from pathlib import Path as _Path
-
     # An unset HERMES_HOME means the worker falls back to the default root
     # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+        from tools.skill_reference_guard import skill_exists_in_home
+
+        base = Path(hermes_home) if hermes_home else (Path.home() / ".hermes")
+        return skill_exists_in_home("kanban-worker", base)
+    except Exception:
+        return False
+
+
+def _worker_hermes_home_for_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Return the HERMES_HOME that ``_default_spawn`` will give the worker."""
+    if not assignee:
+        return os.environ.get("HERMES_HOME")
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        return resolve_profile_env(normalize_profile_name(assignee))
+    except FileNotFoundError:
+        # Matches _default_spawn: synthetic test profiles and stale rows fall
+        # back to the parent env until the CLI profile override rejects them.
+        return os.environ.get("HERMES_HOME")
+    except Exception:
+        return os.environ.get("HERMES_HOME")
+
+
+def _default_spawn_skill_names(
+    assignee: Optional[str],
+    task_skills: Optional[Iterable[Any]],
+    *,
+    hermes_home: Optional[str] = None,
+) -> list[str]:
+    """Return the exact skill names ``_default_spawn`` will pass via --skills."""
+    selected: list[str] = []
+    seen: set[str] = set()
+    worker_home = (
+        hermes_home
+        if hermes_home is not None
+        else _worker_hermes_home_for_assignee(assignee)
+    )
+    if _kanban_worker_skill_available(worker_home):
+        selected.append("kanban-worker")
+        seen.add("kanban-worker")
+    for raw in task_skills or []:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        # Preserve the historic behavior: task-level kanban-worker is a dedupe
+        # request, not an override that forces a missing built-in to load.
+        if name == "kanban-worker":
+            continue
+        selected.append(name)
+        seen.add(name)
+    return selected
 
 
 def _worker_terminal_timeout_env(
@@ -6925,33 +6968,18 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
-    # Auto-load the kanban-worker skill so every dispatched worker
-    # has the pattern library (good summary/metadata shapes, retry
-    # diagnostics, block-reason examples) in its context, even if
-    # the profile hasn't wired it into skills config. The MANDATORY
-    # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
-    # this skill is the deeper reference. Users can point a profile
-    # at a different/additional skill via config if they want —
-    # --skills is additive to the profile's default skill set.
-    #
-    # Only add the flag when the skill actually resolves for the home
-    # the worker runs under: the bundled skill is absent from many
-    # profile-scoped skills dirs, and preloading a missing skill is
-    # fatal at CLI startup. Omitting it is safe — the lifecycle
-    # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
-    if task.skills:
-        for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+    # Force-loaded worker skills. Each name goes in its own `--skills X`
+    # pair rather than a single comma-joined arg: the CLI accepts both forms
+    # (action='append' + comma-split), but per-name pairs are easier to read in
+    # `ps` output and avoid quoting ambiguity if a skill name ever contains
+    # unusual chars. Keep this in lockstep with the dispatch preflight via
+    # _default_spawn_skill_names().
+    for sk in _default_spawn_skill_names(
+        task.assignee,
+        task.skills,
+        hermes_home=env.get("HERMES_HOME"),
+    ):
+        cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([
