@@ -311,7 +311,6 @@ export function CommandPalette() {
             run: go(SKILLS_ROUTE)
           },
           {
-          {
             action: 'nav.kanban',
             icon: Layers3,
             id: 'nav-kanban',
@@ -319,6 +318,7 @@ export function CommandPalette() {
             label: cc.nav.kanban.title,
             run: go(KANBAN_ROUTE)
           },
+          {
             action: 'nav.messaging',
             icon: MessageCircle,
             id: 'nav-messaging',
