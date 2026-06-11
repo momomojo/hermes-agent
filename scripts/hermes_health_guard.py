@@ -52,6 +52,11 @@ CRITICAL_LISTENERS = {"delivery-pubsub-push-adapter": 8663}
 BACKUP_LOG = HOME / "logs" / "home-backup.log"
 BACKUP_MAX_AGE_HOURS = float(os.environ.get("HERMES_BACKUP_MAX_AGE_HOURS", "36"))
 
+# launchd jobs (NOT hermes crons — the cron sweep can't see them) whose
+# nonzero last exit must page: the nightly fork updater failing silently is
+# how the M5 went stale for days before the 2026-06-10 review.
+CRITICAL_LAUNCHD_JOBS = ("com.hermes.nightly-update-guarded",)
+
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -189,6 +194,16 @@ def _disabled_platforms(profile: str | None) -> set[str]:
     }
 
 
+def _launchd_service_pid(profile: str | None) -> int | None:
+    """Live pid from launchd for the profile's gateway service, or None."""
+    label = "ai.hermes.gateway" if not profile or profile == "default" else f"ai.hermes.gateway-{profile}"
+    result = _run(["launchctl", "print", f"gui/501/{label}"], timeout=10)
+    if not result["ok"]:
+        return None
+    m = re.search(r"^\s*pid = (\d+)", result["stdout"], re.MULTILINE)
+    return int(m.group(1)) if m else None
+
+
 def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     label = profile or "default"
     state = _load_runtime_state(profile)
@@ -203,12 +218,23 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
         }
 
     errors: list[str] = []
+    notes: list[str] = []
     pid = state.get("pid")
     gateway_state = state.get("gateway_state")
     if gateway_state not in {"running", "degraded"}:
         errors.append(f"gateway_state={gateway_state or 'unknown'}")
     if not _pid_alive(pid):
-        errors.append(f"pid {pid or 'missing'} is not alive")
+        # gateway_state.json is only rewritten on platform events, so after a
+        # restart it can hold a dead pid for hours (hit twice on 2026-06-10).
+        # launchd is the source of truth: if the service's launchd pid is
+        # alive, the gateway is up and only the state file is stale.
+        launchd_pid = _launchd_service_pid(profile)
+        if launchd_pid and _pid_alive(launchd_pid):
+            notes.append(
+                f"state-file pid {pid} stale; launchd pid {launchd_pid} alive"
+            )
+        else:
+            errors.append(f"pid {pid or 'missing'} is not alive")
 
     disabled = _disabled_platforms(profile)
     skipped: list[str] = []
@@ -236,6 +262,7 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
         "gateway_state": gateway_state,
         "platforms": platforms,
         "skipped_disabled": skipped,
+        "notes": notes,
         "updated_at": state.get("updated_at"),
         "errors": errors,
     }
@@ -277,6 +304,20 @@ def _check_cron_failures(profiles: list[str]) -> list[str]:
     return failures
 
 
+def _check_launchd_jobs() -> list[str]:
+    """One failure line per critical launchd job whose last run exited nonzero."""
+    failures: list[str] = []
+    for job in CRITICAL_LAUNCHD_JOBS:
+        result = _run(["launchctl", "print", f"gui/501/{job}"], timeout=10)
+        if not result["ok"]:
+            failures.append(f"launchd job missing: {job}")
+            continue
+        m = re.search(r"last exit code = (-?\d+)", result["stdout"])
+        if m and m.group(1) not in ("0",):
+            failures.append(f"launchd job failed: {job} (last exit {m.group(1)})")
+    return failures
+
+
 def _check_backup_freshness() -> list[str]:
     """Alert when the nightly ~/.hermes -> NAS mirror hasn't succeeded lately."""
     try:
@@ -295,6 +336,105 @@ def _check_backup_freshness() -> list[str]:
         hours = age.total_seconds() / 3600
         return [f"home-backup stale: last success {last} ({hours:.0f}h ago)"]
     return []
+
+
+def _check_hindsight_config(profile: str | None) -> list[str]:
+    """Validate hindsight config for a single profile.
+
+    Checks (only for profiles with memory.provider=hindsight):
+      1. $HERMES_HOME/hindsight/config.json exists.
+      2. api_url points at the NAS service.
+      3. recall_types includes observation, world, experience.
+      4. The configured bank_id appears in the NAS banks listing.
+
+    Returns a list of failure strings (empty = all good).
+    """
+    from importlib import import_module
+
+    label = profile or "default"
+    home = _profile_home(profile)
+    config_path = home / "config.yaml"
+    failures: list[str] = []
+
+    # --- read config.yaml to determine memory provider ---
+    try:
+        yaml = import_module("yaml")
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        return [f"hindsight [{label}]: cannot read config.yaml: {exc}"]
+
+    memory = config.get("memory", {})
+    if not isinstance(memory, dict) or memory.get("provider") != "hindsight":
+        return []  # not using hindsight; skip
+
+    # --- check 1: config.json exists ---
+    hc_path = home / "hindsight" / "config.json"
+    if not hc_path.exists():
+        return [f"hindsight [{label}]: hindsight/config.json missing"]
+
+    try:
+        hc = json.loads(hc_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"hindsight [{label}]: hindsight/config.json unreadable: {exc}"]
+
+    # --- check 2: api_url points at NAS ---
+    api_url = hc.get("api_url", "")
+    if not isinstance(api_url, str) or not api_url.strip():
+        failures.append(f"hindsight [{label}]: api_url is empty or not a string")
+    elif "truenas-scale.tail1339c4.ts.net:8890" not in api_url and "100.113.37.78:8890" not in api_url:
+        # Check if the host portion looks like the NAS; allow trailing slashes
+        failures.append(f"hindsight [{label}]: api_url={api_url} does not point at NAS service")
+
+    # --- check 3: recall_types ---
+    recall_types = hc.get("recall_types", [])
+    if not isinstance(recall_types, list):
+        failures.append(f"hindsight [{label}]: recall_types is not a list")
+    else:
+        missing = [t for t in ("observation", "world", "experience") if t not in recall_types]
+        if missing:
+            failures.append(f"hindsight [{label}]: recall_types missing {missing}")
+
+    # --- check 4: bank reachability ---
+    bank_id = hc.get("bank_id", "")
+    if not bank_id:
+        failures.append(f"hindsight [{label}]: bank_id is empty in config")
+    elif api_url:
+        base = api_url.rstrip("/")
+        # Try primary hostname, fallback to Tailscale IP if the URL uses hostname
+        hosts_to_try = [base]
+        if "truenas-scale.tail1339c4.ts.net:8890" in base:
+            hosts_to_try.append(base.replace("truenas-scale.tail1339c4.ts.net:8890", "100.113.37.78:8890"))
+
+        bank_found = False
+        last_exc = None
+        for url in hosts_to_try:
+            try:
+                req = urllib.request.Request(f"{url}/v1/default/banks")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                    banks_data = data if isinstance(data, dict) else {"banks": data if isinstance(data, list) else []}
+                    banks_list = banks_data.get("banks") or []
+                    if any(b.get("bank_id") == bank_id for b in banks_list if isinstance(b, dict)):
+                        bank_found = True
+                        break
+                    # bank not found — collect the list for the error message
+                    actual_ids = [b.get("bank_id") for b in banks_list if isinstance(b, dict)]
+                    last_exc = f"bank '{bank_id}' not found in NAS banks: {actual_ids}"
+            except Exception as exc:
+                last_exc = f"bank reachability check failed: {exc}"
+
+        if not bank_found and last_exc:
+            failures.append(f"hindsight [{label}]: {last_exc}")
+
+    return failures
+
+
+def _check_hindsight_configs(profiles: list[str]) -> list[str]:
+    """Aggregate hindsight config failures across all profiles (incl. default)."""
+    failures: list[str] = []
+    for profile in [None, *profiles]:
+        failures.extend(_check_hindsight_config(profile))
+    return failures
 
 
 def collect_health() -> dict[str, Any]:
@@ -317,6 +457,27 @@ def collect_health() -> dict[str, Any]:
             failures.append(f"listener down: {item['name']} (127.0.0.1:{item['port']}): {item['error']}")
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
+    failures.extend(_check_launchd_jobs())
+    hindsight_failures = _check_hindsight_configs(profiles)
+    # Consolidate bank-reachability failures when the root cause is shared
+    # (e.g. NAS service down — don't spam 7 identical lines).
+    bank_conn_failures = [f for f in hindsight_failures if "bank reachability check failed" in f]
+    other_hindsight_failures = [f for f in hindsight_failures if "bank reachability check failed" not in f]
+    failures.extend(other_hindsight_failures)
+    if bank_conn_failures:
+        # Extract unique profile names from failure strings like
+        # "hindsight [codex-coding]: bank reachability check failed: ..."
+        profiles_with_bank_fail: set[str] = set()
+        for f in bank_conn_failures:
+            match = re.search(r"hindsight \[([^\]]+)\]", f)
+            if match:
+                profiles_with_bank_fail.add(match.group(1))
+        sorted_profiles = sorted(profiles_with_bank_fail, key=str)
+        failures.append(
+            f"hindsight bank unreachable for {len(sorted_profiles)} profile(s) "
+            f"({', '.join(sorted_profiles)}): "
+            f"NAS service unreachable on port 8890 (tailscale-down?)"
+        )
 
     level = "ok" if not failures else "critical"
     return {
@@ -328,6 +489,7 @@ def collect_health() -> dict[str, Any]:
         "preflights": preflights,
         "gateways": gateways,
         "listeners": listeners,
+        "hindsight_checks": _check_hindsight_configs(profiles),
     }
 
 
@@ -366,10 +528,18 @@ def _html_table(rows: list[dict[str, Any]], kind: str) -> str:
     return "\n".join(body)
 
 
+def _hindsight_table(checks: list[str]) -> str:
+    if not checks:
+        return "<small>no failures</small>"
+    lines = "<br>".join(html.escape(f) for f in checks)
+    return f"<pre style=\"color:#e8edf7;margin:0;font-size:12px\">{lines}</pre>"
+
+
 def _write_html(payload: dict[str, Any]) -> None:
     level = payload["level"].upper()
     failures = payload.get("failures") or ["No active failures."]
     fail_html = "<br>".join(html.escape(str(item)) for item in failures)
+    hindsight_checks = payload.get("hindsight_checks") or []
     doc = f"""<!doctype html>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="60">
@@ -384,6 +554,7 @@ code,small{{color:#b9d7ff}}
 <h1>Hermes Health Guard</h1>
 <div class="card"><span class="pill">{level}</span> <b>Updated:</b> {html.escape(payload["timestamp"])}</div>
 <div class="card"><b>Failures:</b><br>{fail_html}</div>
+<div class="card"><h2>Hindsight Config</h2>{_hindsight_table(hindsight_checks)}</div>
 <div class="card"><h2>Gateway State</h2><table><tr><th>Profile</th><th>Status</th><th>Detail</th></tr>{_html_table(payload["gateways"], "gateway")}</table></div>
 <div class="card"><h2>Kanban Preflight</h2><table><tr><th>Profile</th><th>Status</th><th>Detail</th></tr>{_html_table(payload["preflights"], "preflight")}</table></div>
 <div class="card"><small>JSON: {html.escape(str(STATE_PATH))}<br>History: {html.escape(str(HISTORY_PATH))}<br>LaunchAgent label: ai.hermes.health-guard</small></div>
