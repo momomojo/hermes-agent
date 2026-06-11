@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -226,19 +227,48 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
-    script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
-        "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
-    )
+    # The snapshot commands are platform-specific: Linux ships
+    # ps/pstree/dmesg + /proc, macOS ships BSD ps + vm_stat + sysctl and
+    # has neither pstree nor /proc.  Build the right script per platform so
+    # the diagnostic is actually useful on the fleet's macOS hosts instead
+    # of emitting a page of "command not found".
+    if sys.platform == "darwin":
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps (top 60 by cpu) ---'; "
+            "ps -Ao pid,ppid,pcpu,pmem,rss,command -r 2>/dev/null | head -60; "
+            "echo '--- loadavg ---'; "
+            "sysctl -n vm.loadavg 2>/dev/null || uptime 2>/dev/null || true; "
+            "echo '--- vm_stat ---'; "
+            "vm_stat 2>/dev/null | head -20 || true; "
+            "echo '=== end ==='"
+        )
+    else:
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps auxf (top 60 by cpu) ---'; "
+            "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+            "echo '--- pstree of self ---'; "
+            f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
+            "echo '--- /proc/loadavg ---'; "
+            "cat /proc/loadavg 2>/dev/null || true; "
+            "echo '--- recent dmesg (oom/killed) ---'; "
+            "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
+            "echo '=== end ==='"
+        )
+
+    # GNU coreutils `timeout` is the self-cleaning watchdog on Linux, but
+    # macOS ships neither `timeout` nor `gtimeout` by default.  Prefer it
+    # when present; otherwise run bash directly — the snapshot is detached
+    # (start_new_session) and writes to an inherited fd, so it never blocks
+    # the event loop regardless, and the macOS commands are bounded/fast.
+    timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+    if timeout_bin:
+        argv = [timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+    else:
+        argv = ["bash", "-c", script]
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -255,7 +285,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            argv,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

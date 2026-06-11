@@ -8,12 +8,17 @@ operators can tell when drift or adapter trouble returns.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +31,11 @@ STATE_PATH = BASE / "state.json"
 HISTORY_PATH = BASE / "history.jsonl"
 HTML_PATH = BASE / "index.html"
 LOG_PATH = HOME / "logs" / "hermes_health_guard.log"
+NOTIFY_STATE_PATH = BASE / "notify_state.json"
+NOTIFY_WEBHOOK_URL = os.environ.get(
+    "HERMES_HEALTH_WEBHOOK_URL", "http://127.0.0.1:8648/webhooks/health-guard"
+)
+NOTIFY_WEBHOOK_NAME = NOTIFY_WEBHOOK_URL.rstrip("/").rsplit("/", 1)[-1]
 
 DEFAULT_EXPECTED_PROFILES = (
     "codex-coding",
@@ -35,6 +45,12 @@ DEFAULT_EXPECTED_PROFILES = (
     "nas-ops",
 )
 BAD_PLATFORM_STATES = {"fatal", "paused", "retrying", "disconnected"}
+
+# Non-gateway listeners that must stay up; gateway ports are covered via
+# each profile's gateway_state.json instead.
+CRITICAL_LISTENERS = {"delivery-pubsub-push-adapter": 8663}
+BACKUP_LOG = HOME / "logs" / "home-backup.log"
+BACKUP_MAX_AGE_HOURS = float(os.environ.get("HERMES_BACKUP_MAX_AGE_HOURS", "36"))
 
 
 def _now() -> str:
@@ -150,6 +166,29 @@ def _load_runtime_state(profile: str | None) -> dict[str, Any] | None:
         return None
 
 
+def _disabled_platforms(profile: str | None) -> set[str]:
+    """Platforms explicitly disabled in the profile's config.yaml.
+
+    A gateway may still report a disabled platform (e.g. webhook with
+    enabled: false) as "disconnected"; that is not a failure.
+    """
+    config_path = _profile_home(profile) / "config.yaml"
+    try:
+        import yaml  # available in the hermes venv
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return set()
+    return {
+        name
+        for name, pconf in platforms.items()
+        if isinstance(pconf, dict) and pconf.get("enabled") is False
+    }
+
+
 def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     label = profile or "default"
     state = _load_runtime_state(profile)
@@ -171,9 +210,14 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
     if not _pid_alive(pid):
         errors.append(f"pid {pid or 'missing'} is not alive")
 
+    disabled = _disabled_platforms(profile)
+    skipped: list[str] = []
     platforms = state.get("platforms") or {}
     if isinstance(platforms, dict):
         for platform, pdata in sorted(platforms.items()):
+            if platform in disabled:
+                skipped.append(platform)
+                continue
             if not isinstance(pdata, dict):
                 errors.append(f"{platform}: invalid platform state")
                 continue
@@ -191,9 +235,66 @@ def _check_gateway_state(profile: str | None) -> dict[str, Any]:
         "pid": pid,
         "gateway_state": gateway_state,
         "platforms": platforms,
+        "skipped_disabled": skipped,
         "updated_at": state.get("updated_at"),
         "errors": errors,
     }
+
+
+def _check_listener(name: str, port: int) -> dict[str, Any]:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            return {"name": name, "port": port, "ok": True, "error": None}
+    except OSError as exc:
+        return {"name": name, "port": port, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _check_cron_failures(profiles: list[str]) -> list[str]:
+    """One failure line per enabled, unpaused cron job whose latest run errored.
+
+    This is what catches a daily no_agent script that starts exiting
+    nonzero — previously invisible unless a human read jobs.json.
+    """
+    failures: list[str] = []
+    paths = [(None, HOME / "cron" / "jobs.json")]
+    paths += [(p, HOME / "profiles" / p / "cron" / "jobs.json") for p in profiles]
+    for profile, path in paths:
+        label = profile or "default"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue  # profile without cron jobs is normal
+        jobs = data.get("jobs") if isinstance(data, dict) else data
+        for job in jobs or []:
+            if not isinstance(job, dict):
+                continue
+            if not job.get("enabled", True) or job.get("paused_at"):
+                continue
+            if job.get("last_status") == "error":
+                name = job.get("name") or job.get("id") or "?"
+                detail = job.get("last_error") or "error"
+                failures.append(f"cron job failing for {label}: {name}: {detail}")
+    return failures
+
+
+def _check_backup_freshness() -> list[str]:
+    """Alert when the nightly ~/.hermes -> NAS mirror hasn't succeeded lately."""
+    try:
+        text = BACKUP_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [f"home-backup log missing ({BACKUP_LOG})"]
+    last: str | None = None
+    for m in re.finditer(
+        r"=== finished (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) rsync_rc=0/0 ===", text
+    ):
+        last = m.group(1)
+    if last is None:
+        return ["home-backup has never succeeded (no rsync_rc=0/0 in log)"]
+    age = datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+    if age > timedelta(hours=BACKUP_MAX_AGE_HOURS):
+        hours = age.total_seconds() / 3600
+        return [f"home-backup stale: last success {last} ({hours:.0f}h ago)"]
+    return []
 
 
 def collect_health() -> dict[str, Any]:
@@ -202,6 +303,7 @@ def collect_health() -> dict[str, Any]:
     gateway_profiles = [None, *profiles]
     preflights = [_check_kanban_preflight(profile) for profile in preflight_profiles]
     gateways = [_check_gateway_state(profile) for profile in gateway_profiles]
+    listeners = [_check_listener(name, port) for name, port in sorted(CRITICAL_LISTENERS.items())]
     failures: list[str] = []
 
     for item in preflights:
@@ -210,6 +312,11 @@ def collect_health() -> dict[str, Any]:
     for item in gateways:
         if not item["ok"]:
             failures.append(f"gateway unhealthy for {item['profile']}: {'; '.join(item['errors'])}")
+    for item in listeners:
+        if not item["ok"]:
+            failures.append(f"listener down: {item['name']} (127.0.0.1:{item['port']}): {item['error']}")
+    failures.extend(_check_cron_failures(profiles))
+    failures.extend(_check_backup_freshness())
 
     level = "ok" if not failures else "critical"
     return {
@@ -220,6 +327,7 @@ def collect_health() -> dict[str, Any]:
         "failures": failures,
         "preflights": preflights,
         "gateways": gateways,
+        "listeners": listeners,
     }
 
 
@@ -284,11 +392,68 @@ code,small{{color:#b9d7ff}}
     HTML_PATH.write_text(doc, encoding="utf-8")
 
 
+def _notify_secret() -> str | None:
+    try:
+        subs = json.loads((HOME / "webhook_subscriptions.json").read_text(encoding="utf-8"))
+        return subs[NOTIFY_WEBHOOK_NAME]["secret"]
+    except Exception:
+        return None
+
+
+def _post_alert(alert_text: str, level: str) -> bool:
+    secret = _notify_secret()
+    if secret is None:
+        return False
+    body = json.dumps({
+        "source": "health-guard",
+        "ts": _now(),
+        "level": level,
+        "alert_text": alert_text,
+    }).encode()
+    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(NOTIFY_WEBHOOK_URL, data=body, headers={
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": sig,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def _notify_if_changed(payload: dict[str, Any]) -> None:
+    """Deliver one alert per state change (deliver-only route, zero LLM).
+
+    Silent while the failure set is unchanged; failed deliveries leave
+    notify_state untouched so the next 300s tick retries.
+    """
+    try:
+        prev = json.loads(NOTIFY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        prev = None
+    current = {"level": payload["level"], "failures": sorted(payload["failures"])}
+    if prev is not None and prev == current:
+        return
+    if payload["ok"]:
+        if prev is None or prev.get("level") == "ok":
+            _write_json(NOTIFY_STATE_PATH, current)
+            return
+        alert_text = "✅ Hermes health guard: all clear (recovered from: " + \
+            "; ".join(prev.get("failures") or ["unknown"]) + ")"
+    else:
+        lines = "\n".join(f"- {f}" for f in current["failures"])
+        alert_text = f"🚨 Hermes health guard: {len(current['failures'])} failure(s)\n{lines}"
+    if _post_alert(alert_text, payload["level"]):
+        _write_json(NOTIFY_STATE_PATH, current)
+
+
 def main() -> int:
     payload = collect_health()
     _write_json(STATE_PATH, payload)
     _append_history(payload)
     _write_html(payload)
+    _notify_if_changed(payload)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(f"{payload['timestamp']} {payload['level']} failures={len(payload['failures'])}\n")

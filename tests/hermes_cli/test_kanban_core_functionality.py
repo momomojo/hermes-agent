@@ -366,7 +366,18 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
 # Worker aliveness / crash detection
 # ---------------------------------------------------------------------------
 
-def test_pid_alive_helper():
+def test_pid_alive_helper(monkeypatch):
+    from gateway import status as gateway_status
+
+    real_pid_exists = gateway_status._pid_exists
+
+    def fake_pid_exists(pid):
+        if int(pid) == 2 ** 30:
+            return False
+        return real_pid_exists(pid)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", fake_pid_exists)
+
     # Our own pid is alive.
     assert kb._pid_alive(os.getpid())
     # PID 0 / None / negative.
@@ -3081,8 +3092,58 @@ def test_dispatch_blocks_legacy_task_with_missing_forced_skill(
         assert res.skill_blocked[0]["task_id"] == tid
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
+        assert task.consecutive_failures == 0
         assert task.last_failure_error is None
         events = kb.list_events(conn, tid)
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Every skill destined for --skills is checked before worker spawn.
+
+    This covers injected dispatcher skills, not only the task.skills column.
+    If the dispatcher would pass kanban-worker but the worker profile cannot
+    resolve it, the card must block without claiming or spawning.
+    """
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: True)
+
+    spawn_attempts = []
+
+    def fail_popen(*args, **kwargs):
+        spawn_attempts.append((args, kwargs))
+        raise AssertionError("dispatcher must block before spawning")
+
+    monkeypatch.setattr("subprocess.Popen", fail_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs worker skill", assignee="ops")
+
+        res = kb.dispatch_once(conn)
+
+        assert spawn_attempts == []
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        assert res.skill_blocked[0]["skills"] == ["kanban-worker"]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        events = kb.list_events(conn, tid)
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked
+        assert blocked[-1].payload["reason"].startswith(
+            "missing-skills:kanban-worker"
+        )
         assert any(e.kind == "missing_skills_auto_blocked" for e in events)
     finally:
         conn.close()
@@ -4450,8 +4511,10 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         conn.close()
 
 
-def test_detect_crashed_workers_increments_counter(kanban_home):
+def test_detect_crashed_workers_increments_counter(kanban_home, monkeypatch):
     """A single crash increments the consecutive_failures counter."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
@@ -4604,6 +4667,17 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock, **_kwargs: {
+            "prev_pid": int(pid) if pid else None,
+            "host_local": bool(claim_lock),
+            "termination_attempted": False,
+            "terminated": False,
+            "sigkill": False,
+        },
+    )
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
