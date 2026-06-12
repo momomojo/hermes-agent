@@ -17,6 +17,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,13 @@ DEFAULT_EXPECTED_PROFILES = (
     "nas-ops",
 )
 BAD_PLATFORM_STATES = {"fatal", "paused", "retrying", "disconnected"}
+
+# Minimum delay between the latest git HEAD commit time and a gateway's process
+# start time before the gateway is flagged as stale (running pre-update code).
+# The 30-minute threshold gives the nightly updater (03:31) time to complete
+# before alerting, while catching the incident pattern where profile gateways
+# ran stale code for 10+ hours after the checkout advanced.
+STALENESS_THRESHOLD_MINUTES = 30
 
 # Non-gateway listeners that must stay up; gateway ports are covered via
 # each profile's gateway_state.json instead.
@@ -146,6 +154,29 @@ def _hermes_cmd(profile: str | None, *args: str) -> list[str]:
         cmd.extend(["--profile", profile])
     cmd.extend(args)
     return cmd
+
+
+def _ensure_venv_python() -> None:
+    """Re-exec script runs under the Hermes venv when launched directly.
+
+    The LaunchAgent already points at ``venv/bin/python``, but manual runs or
+    stale plists can hit macOS/system Python where optional runtime deps such
+    as PyYAML are absent.  Re-execing the script (not import-time) keeps unit
+    tests safe while making direct/launchd execution use the dependency set
+    Hermes itself runs with.
+    """
+    if os.environ.get("HERMES_HEALTH_GUARD_REEXECED") == "1":
+        return
+    try:
+        desired = PYTHON.expanduser().resolve()
+        current = Path(sys.executable).expanduser().resolve()
+    except OSError:
+        return
+    if not desired.exists() or current == desired:
+        return
+    env = os.environ.copy()
+    env["HERMES_HEALTH_GUARD_REEXECED"] = "1"
+    os.execve(str(desired), [str(desired), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 
 def _check_kanban_preflight(profile: str | None) -> dict[str, Any]:
@@ -437,6 +468,84 @@ def _check_hindsight_configs(profiles: list[str]) -> list[str]:
     return failures
 
 
+def _check_gateway_staleness(profiles: list[str]) -> list[str]:
+    """Detect profile gateways running pre-update code.
+
+    Compares each gateway's process start time against the git HEAD commit
+    timestamp.  If the HEAD is newer than the gateway's start time by more
+    than STALENESS_THRESHOLD_MINUTES, the gateway is considered stale (it
+    was started before the latest code update and was never restarted).
+
+    Returns a list of human-readable failure strings (empty = all current).
+    """
+    failures: list[str] = []
+
+    # Read HEAD commit timestamp as Unix epoch (seconds since 1970) —
+    # avoids timezone math entirely.
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        head_epoch = int(result.stdout.strip())
+        head_dt = datetime.fromtimestamp(head_epoch)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        failures.append(f"staleness: cannot read HEAD commit time from git: {exc}")
+        return failures
+
+    for profile in [None, *profiles]:
+        label = profile or "default"
+        pid = _launchd_service_pid(profile)
+        if pid is None:
+            continue
+
+        # Get process start time as Unix epoch via `ps -o etime`
+        try:
+            ps_result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if ps_result.returncode != 0:
+                continue
+            lstart = (ps_result.stdout or "").strip()
+            if not lstart:
+                continue
+            # Format: "Thu Jun 11 18:51:18 2026" (local time)
+            proc_local = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y")
+            # Convert local → epoch via mktime (respects DST)
+            proc_epoch = time.mktime(proc_local.timetuple())
+            proc_dt = datetime.fromtimestamp(proc_epoch)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+
+        # Staleness condition: HEAD commit is newer than process start + threshold
+        gap = (head_dt - proc_dt).total_seconds()
+        gap_minutes = gap / 60.0
+
+        if gap_minutes > STALENESS_THRESHOLD_MINUTES:
+            failures.append(
+                f"gateway stale for {label}: "
+                f"process started {proc_dt.strftime('%b %d %H:%M')} "
+                f"(~{gap_minutes:.0f} min before HEAD commit "
+                f"{datetime.fromtimestamp(head_epoch).strftime('%Y-%m-%d %H:%M')}), "
+                f"restart required to pick up new code"
+            )
+        elif gap_minutes > 0:
+            # Gateway started before latest commit but within the threshold —
+            # informational, not a failure.  The nightly updater may still be
+            # running or about to kickstart gateways.
+            pass
+
+    return failures
+
+
 def collect_health() -> dict[str, Any]:
     profiles = _profile_names()
     preflight_profiles = [None, *profiles]
@@ -458,6 +567,7 @@ def collect_health() -> dict[str, Any]:
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
     failures.extend(_check_launchd_jobs())
+    failures.extend(_check_gateway_staleness(profiles))
     hindsight_failures = _check_hindsight_configs(profiles)
     # Consolidate bank-reachability failures when the root cause is shared
     # (e.g. NAS service down — don't spam 7 identical lines).
@@ -640,4 +750,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _ensure_venv_python()
     raise SystemExit(main())
