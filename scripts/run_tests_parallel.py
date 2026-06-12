@@ -38,11 +38,15 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
@@ -77,6 +81,124 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 600.0  # 10 minutes
 
+# Pytest's autouse fixtures isolate HERMES_HOME per test, but collection-time
+# imports run before fixtures execute. If this runner is launched from a live
+# gateway/kanban worker, those imports would otherwise inherit the production
+# profile and can write synthetic ERRORs to ~/.hermes/logs. Every pytest
+# subprocess (collection and per-file execution) therefore gets a temp Hermes
+# home before Python imports any test/module code.
+_PYTEST_ENV_DROP_PREFIXES = (
+    "HERMES_KANBAN_",
+    "HERMES_SESSION_",
+)
+_PYTEST_ENV_DROP_NAMES = {
+    "HERMES_HOME_MODE",
+    "HERMES_GATEWAY_SESSION",
+    "HERMES_CRON_SESSION",
+    "_HERMES_GATEWAY",
+    "HERMES_PLATFORM",
+    "HERMES_MODEL",
+    "HERMES_INFERENCE_MODEL",
+    "HERMES_INFERENCE_PROVIDER",
+    "HERMES_TUI_PROVIDER",
+    "HERMES_MANAGED",
+    "HERMES_DEV",
+    "HERMES_CONTAINER",
+    "HERMES_EPHEMERAL_SYSTEM_PROMPT",
+    "HERMES_TIMEZONE",
+    "HERMES_REDACT_SECRETS",
+    "HERMES_BACKGROUND_NOTIFICATIONS",
+    "HERMES_EXEC_ASK",
+    "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
+    "API_SERVER_ENABLED",
+    "API_SERVER_HOST",
+    "API_SERVER_PORT",
+    "API_SERVER_KEY",
+    "API_SERVER_CORS_ORIGINS",
+    "API_SERVER_MODEL_NAME",
+}
+
+
+def _prepare_hermes_home(root: Path, label: str) -> Path:
+    """Create a minimal Hermes home under ``root`` for one pytest process."""
+    hermes_home = root / label
+    for child in ("logs", "sessions", "cron", "memories", "skills", "plugins"):
+        (hermes_home / child).mkdir(parents=True, exist_ok=True)
+    return hermes_home
+
+
+def _safe_home_label(file: Path, repo_root: Path) -> str:
+    """Stable, filesystem-safe label for the per-file pytest HERMES_HOME."""
+    try:
+        raw = str(file.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        raw = str(file.resolve())
+    digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in raw)
+    safe = safe.strip(".-")[:80] or "pytest"
+    return f"{safe}-{digest}"
+
+
+def _build_pytest_env(hermes_home: Path) -> dict[str, str]:
+    """Return an env for pytest that cannot touch live Hermes profile logs."""
+    env = os.environ.copy()
+    for name in list(env):
+        if name in _PYTEST_ENV_DROP_NAMES or any(
+            name.startswith(prefix) for prefix in _PYTEST_ENV_DROP_PREFIXES
+        ):
+            env.pop(name, None)
+
+    env["HERMES_HOME"] = str(hermes_home)
+    env["TZ"] = "UTC"
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
+    env["PYTHONHASHSEED"] = "0"
+    return env
+
+# Resolve the project Python — prefer venv over system python.
+def _resolve_python(repo_root: Path) -> str:
+    """Resolve a Python that can import pytest.
+
+    Worktrees usually do not have their own venv, so also probe the canonical
+    Hermes install venv before falling back to the interpreter running this
+    script. This keeps direct invocations of scripts/run_tests_parallel.py from
+    silently using system Python and failing with ``No module named pytest``.
+    """
+    candidate_venvs: list[Path] = []
+    for candidate in ("venv", ".venv"):
+        candidate_venvs.append(repo_root / candidate)
+    if os.environ.get("VIRTUAL_ENV"):
+        candidate_venvs.append(Path(os.environ["VIRTUAL_ENV"]))
+    candidate_venvs.append(Path.home() / ".hermes" / "hermes-agent" / "venv")
+
+    seen: set[Path] = set()
+    candidate_pythons: list[Path] = []
+    for venv in candidate_venvs:
+        for rel in (
+            ("bin", "python3"),
+            ("bin", "python"),
+            ("Scripts", "python.exe"),
+        ):
+            exe = venv.joinpath(*rel)
+            if exe not in seen:
+                seen.add(exe)
+                candidate_pythons.append(exe)
+    candidate_pythons.append(Path(sys.executable))
+
+    for candidate_path in candidate_pythons:
+        if candidate_path.is_file():
+            try:
+                probe = subprocess.run(
+                    [str(candidate_path), "-c", "import pytest"],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if probe.returncode == 0:
+                    return str(candidate_path)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    return sys.executable
+
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
@@ -84,7 +206,10 @@ _DURATIONS_FILE = "test_durations.json"
 
 
 def _count_tests(
-    files: List[Path], repo_root: Path, pytest_passthrough: List[str]
+    files: List[Path],
+    repo_root: Path,
+    pytest_passthrough: List[str],
+    test_home_root: Path | None = None,
 ) -> dict[Path, int]:
     """Run ``pytest --co -q`` once to count individual tests per file.
 
@@ -112,18 +237,22 @@ def _count_tests(
                 ignore_args.extend(["--ignore", str(d)])
 
     cmd = [
-        sys.executable, "-m", "pytest",
+        _resolve_python(repo_root), "-m", "pytest",
         "--co", "-q",
         *ignore_args,
         *[str(f) for f in files],
         *pytest_passthrough,
     ]
+    env = None
+    if test_home_root is not None:
+        env = _build_pytest_env(_prepare_hermes_home(test_home_root, "collect"))
     try:
         result = subprocess.run(
             cmd,
             cwd=repo_root,
             capture_output=True,
             text=True,
+            env=env,
             timeout=120,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -251,6 +380,7 @@ def _spawn_pytest_once(
     repo_root: Path,
     file_timeout: float,
     *,
+    env: dict[str, str] | None = None,
     timeout_note: str = "per-file timeout",
 ) -> Tuple[int, str]:
     """Run one ``pytest`` subprocess to completion and return ``(rc, output)``.
@@ -267,6 +397,7 @@ def _spawn_pytest_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -343,6 +474,7 @@ def _run_one_file(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    test_home_root: Path | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -370,9 +502,16 @@ def _run_one_file(
     timeouts inside the subprocess; this outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = [_resolve_python(repo_root), "-m", "pytest", str(file), *pytest_args]
+    env = None
+    if test_home_root is not None:
+        label = _safe_home_label(file, repo_root)
+        env = _build_pytest_env(_prepare_hermes_home(test_home_root, label))
     subproc_start = time.monotonic()
-    rc, output = _spawn_pytest_once(cmd, repo_root, file_timeout)
+    if env is None:
+        rc, output = _spawn_pytest_once(cmd, repo_root, file_timeout)
+    else:
+        rc, output = _spawn_pytest_once(cmd, repo_root, file_timeout, env=env)
 
     # pytest exit 4 = "file or directory not found" at exec time. On loaded
     # shared CI runners we have seen the planner enumerate a file (its tests
@@ -390,10 +529,21 @@ def _run_one_file(
     while rc == 4 and attempt < _EXIT4_RETRY_ATTEMPTS and _file_present(file):
         attempt += 1
         time.sleep(_EXIT4_RETRY_BACKOFF_SECONDS * attempt)
-        rc, output = _spawn_pytest_once(
-            cmd, repo_root, file_timeout,
-            timeout_note=f"per-file timeout on exit-4 retry {attempt}",
-        )
+        if env is None:
+            rc, output = _spawn_pytest_once(
+                cmd,
+                repo_root,
+                file_timeout,
+                timeout_note=f"per-file timeout on exit-4 retry {attempt}",
+            )
+        else:
+            rc, output = _spawn_pytest_once(
+                cmd,
+                repo_root,
+                file_timeout,
+                env=env,
+                timeout_note=f"per-file timeout on exit-4 retry {attempt}",
+            )
 
     if rc == 4:
         # Exit-4 survived the retries (or the file was judged absent).
@@ -793,8 +943,17 @@ def main() -> int:
         print(f"No test files discovered under {[str(r) for r in roots]}", file=sys.stderr)
         return 1
 
+    test_home_root = Path(tempfile.mkdtemp(prefix="hermes-pytest-home-"))
+    atexit.register(shutil.rmtree, test_home_root, ignore_errors=True)
+    print(
+        f"  Isolated pytest HERMES_HOME root: {test_home_root}",
+        flush=True,
+    )
+
     # Count individual tests per file via a single pytest --co pass.
-    test_counts = _count_tests(files, repo_root, pytest_passthrough)
+    test_counts = _count_tests(
+        files, repo_root, pytest_passthrough, test_home_root
+    )
     total_tests = sum(test_counts.values())
 
     # Apply slicing if requested — distribute files across CI jobs by
@@ -873,7 +1032,12 @@ def main() -> int:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
+                _run_one_file,
+                file,
+                pytest_passthrough,
+                repo_root,
+                args.file_timeout,
+                test_home_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
