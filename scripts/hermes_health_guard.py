@@ -65,6 +65,22 @@ BACKUP_MAX_AGE_HOURS = float(os.environ.get("HERMES_BACKUP_MAX_AGE_HOURS", "36")
 # how the M5 went stale for days before the 2026-06-10 review.
 CRITICAL_LAUNCHD_JOBS = ("com.hermes.nightly-update-guarded",)
 
+# Provider-health sentinel output (written by the "provider-health-sentinel"
+# cron every 15 min). 40 min default = two missed ticks + slack.
+PROVIDER_HEALTH_STATE_PATH = HOME / "state" / "provider-health-state.json"
+PROVIDER_HEALTH_MAX_AGE_MIN = float(
+    os.environ.get("HERMES_PROVIDER_HEALTH_MAX_AGE_MIN", "40.0")
+)
+PROVIDER_HEALTH_PAGE_STATES = {"down", "critical", "error"}
+# Cap per-lane detail in failure lines — sentinel details can embed whole
+# tracebacks/HTTP bodies and huge alert strings drown the pager.
+PROVIDER_HEALTH_DETAIL_MAX_CHARS = 160
+
+# Managed-layer drift: an uncommitted path in the ~/.hermes git overlay older
+# than this survived the 04:15 nightly autocommit, so the autocommit is
+# aborting or failing.
+MANAGED_DRIFT_MAX_AGE_H = float(os.environ.get("HERMES_MANAGED_DRIFT_MAX_AGE_H", "30.0"))
+
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -349,6 +365,145 @@ def _check_launchd_jobs() -> list[str]:
     return failures
 
 
+def _provider_sentinel_registered() -> bool:
+    """True when an enabled, unpaused "provider-health-sentinel" cron exists.
+
+    Portability guard: clones of this home (e.g. the m5max) carry this
+    script but not the sentinel cron — they must never page about a state
+    file the sentinel was never going to write.
+    """
+    path = HOME / "cron" / "jobs.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        if not job.get("enabled", True) or job.get("paused_at"):
+            continue
+        if job.get("name") == "provider-health-sentinel":
+            return True
+    return False
+
+
+def _load_provider_health_state() -> dict[str, Any] | None:
+    try:
+        data = json.loads(PROVIDER_HEALTH_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _provider_health_summary() -> dict[str, str]:
+    """Compact {lane: status} map for the payload ({} when not applicable)."""
+    if not _provider_sentinel_registered():
+        return {}
+    state = _load_provider_health_state()
+    lanes = state.get("lanes") if state else None
+    if not isinstance(lanes, dict):
+        return {}
+    summary: dict[str, str] = {}
+    for lane, ldata in sorted(lanes.items()):
+        status = ldata.get("status") if isinstance(ldata, dict) else None
+        summary[str(lane)] = str(status or "unknown")
+    return summary
+
+
+def _check_provider_health() -> list[str]:
+    """Page when the provider-health sentinel reports a bad lane or goes dark.
+
+    Lanes may include per-profile keys like "codex-provider@radulator" —
+    they are treated as ordinary lanes. "warn"/"degraded" lanes do NOT page.
+    """
+    if not _provider_sentinel_registered():
+        return []
+    state = _load_provider_health_state()
+    if state is None:
+        return [
+            "provider-health: state file missing/unreadable "
+            "(sentinel cron registered but no output)"
+        ]
+
+    updated: datetime | None = None
+    if isinstance(state.get("updated"), str):
+        try:
+            updated = datetime.fromisoformat(state["updated"])
+        except ValueError:
+            updated = None
+    if updated is None:
+        # No usable timestamp: indistinguishable from no output at all.
+        return [
+            "provider-health: state file missing/unreadable "
+            "(sentinel cron registered but no output)"
+        ]
+
+    failures: list[str] = []
+    now = datetime.now(updated.tzinfo) if updated.tzinfo else datetime.now()
+    age_min = (now - updated).total_seconds() / 60.0
+    if age_min > PROVIDER_HEALTH_MAX_AGE_MIN:
+        failures.append(
+            f"provider-health: state stale ({age_min:.0f} min old; sentinel dead?)"
+        )
+
+    lanes = state.get("lanes")
+    if isinstance(lanes, dict):
+        for lane, ldata in sorted(lanes.items()):
+            if not isinstance(ldata, dict):
+                continue
+            status = str(ldata.get("status") or "unknown").lower()
+            if status not in PROVIDER_HEALTH_PAGE_STATES:
+                continue
+            detail = str(ldata.get("detail") or status)
+            if len(detail) > PROVIDER_HEALTH_DETAIL_MAX_CHARS:
+                detail = detail[:PROVIDER_HEALTH_DETAIL_MAX_CHARS]
+            failures.append(f"provider-health: lane {lane} {status}: {detail}")
+    return failures
+
+
+def _check_managed_layer_drift() -> list[str]:
+    """Page when uncommitted ~/.hermes paths survive the nightly autocommit.
+
+    The 04:15 autocommit should sweep the managed layer daily; a dirty path
+    older than MANAGED_DRIFT_MAX_AGE_H hours means the autocommit aborted or
+    is failing. One consolidated failure line — never one per path.
+    """
+    if not (HOME / ".git").exists():
+        return []
+    result = _run(["git", "-C", str(HOME), "status", "--porcelain", "--untracked-files=all"])
+    if not result["ok"]:
+        return []
+    cutoff = time.time() - MANAGED_DRIFT_MAX_AGE_H * 3600.0
+    old_paths: list[str] = []
+    for line in (result["stdout"] or "").splitlines():
+        # Porcelain v1: two status chars, a space, then the path. _run strips
+        # the whole stdout, which can eat the first line's leading space —
+        # fall back to splitting on the first space in that case.
+        if len(line) >= 4 and line[2] == " ":
+            rel = line[3:]
+        elif " " in line:
+            rel = line.split(" ", 1)[1]
+        else:
+            continue
+        if " -> " in rel:  # rename: page on the new path
+            rel = rel.split(" -> ", 1)[1]
+        rel = rel.strip().strip('"')
+        try:
+            mtime = (HOME / rel).stat().st_mtime
+        except OSError:
+            continue  # path no longer exists — nothing to age-check
+        if mtime < cutoff:
+            old_paths.append(rel)
+    if not old_paths:
+        return []
+    shown = ", ".join(old_paths[:5])
+    return [
+        f"managed-layer drift: {len(old_paths)} uncommitted path(s) older than "
+        f"{MANAGED_DRIFT_MAX_AGE_H:g}h (autocommit aborted/failing?): {shown}"
+    ]
+
+
 def _check_backup_freshness() -> list[str]:
     """Alert when the nightly ~/.hermes -> NAS mirror hasn't succeeded lately."""
     try:
@@ -567,6 +722,8 @@ def collect_health() -> dict[str, Any]:
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
     failures.extend(_check_launchd_jobs())
+    failures.extend(_check_provider_health())
+    failures.extend(_check_managed_layer_drift())
     failures.extend(_check_gateway_staleness(profiles))
     hindsight_failures = _check_hindsight_configs(profiles)
     # Consolidate bank-reachability failures when the root cause is shared
@@ -599,6 +756,7 @@ def collect_health() -> dict[str, Any]:
         "preflights": preflights,
         "gateways": gateways,
         "listeners": listeners,
+        "provider_health": _provider_health_summary(),
         "hindsight_checks": _check_hindsight_configs(profiles),
     }
 

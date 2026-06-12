@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -62,3 +66,148 @@ def test_ensure_venv_python_noops_when_already_in_venv(monkeypatch, tmp_path):
     )
 
     guard._ensure_venv_python()
+
+
+# ── provider-health sentinel integration ───────────────────────────────────
+#
+# The autouse _hermetic_environment fixture points HERMES_HOME at a per-test
+# tempdir before the module loads, so guard.HOME (and the derived
+# PROVIDER_HEALTH_STATE_PATH) already target the fake home.
+
+
+def _register_sentinel(home: Path, *, enabled: bool = True, paused: bool = False) -> None:
+    (home / "cron").mkdir(exist_ok=True)
+    job = {"name": "provider-health-sentinel", "enabled": enabled}
+    if paused:
+        job["paused_at"] = "2026-06-12T00:00:00+00:00"
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [job]}), encoding="utf-8"
+    )
+
+
+def _write_provider_state(home: Path, payload) -> None:
+    state_dir = home / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "provider-health-state.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def test_provider_health_skipped_when_sentinel_not_registered():
+    guard = _load_health_guard_module()
+    # No cron/jobs.json at all → portability guard keeps us silent even
+    # though the state file is also missing.
+    assert guard._check_provider_health() == []
+    assert guard._provider_health_summary() == {}
+
+
+def test_provider_health_skipped_when_sentinel_disabled_or_paused():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME, enabled=False)
+    assert guard._check_provider_health() == []
+    _register_sentinel(guard.HOME, paused=True)
+    assert guard._check_provider_health() == []
+
+
+def test_provider_health_missing_state_pages_once():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME)
+    failures = guard._check_provider_health()
+    assert failures == [
+        "provider-health: state file missing/unreadable "
+        "(sentinel cron registered but no output)"
+    ]
+    assert guard._provider_health_summary() == {}
+
+
+def test_provider_health_stale_state_pages():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME)
+    stale = (datetime.now().astimezone() - timedelta(minutes=120)).isoformat()
+    _write_provider_state(guard.HOME, {"updated": stale, "lanes": {}})
+    failures = guard._check_provider_health()
+    assert len(failures) == 1
+    assert "provider-health: state stale" in failures[0]
+    assert "sentinel dead?" in failures[0]
+
+
+def test_provider_health_fresh_state_no_failures():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME)
+    fresh = datetime.now().astimezone().isoformat()
+    _write_provider_state(
+        guard.HOME,
+        {"updated": fresh, "lanes": {"anthropic": {"status": "ok", "detail": ""}}},
+    )
+    assert guard._check_provider_health() == []
+    assert guard._provider_health_summary() == {"anthropic": "ok"}
+
+
+def test_provider_health_down_lane_pages_and_warn_lane_does_not():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME)
+    fresh = datetime.now().astimezone().isoformat()
+    _write_provider_state(
+        guard.HOME,
+        {
+            "updated": fresh,
+            "lanes": {
+                "codex-provider@radulator": {"status": "down", "detail": "x" * 500},
+                "anthropic": {"status": "warn", "detail": "slow"},
+                "openrouter": {"status": "degraded", "detail": "flaky"},
+            },
+        },
+    )
+    failures = guard._check_provider_health()
+    assert len(failures) == 1
+    assert failures[0].startswith("provider-health: lane codex-provider@radulator down: ")
+    detail = failures[0].split("down: ", 1)[1]
+    assert detail == "x" * 160  # truncated to 160 chars
+    summary = guard._provider_health_summary()
+    assert summary == {
+        "anthropic": "warn",
+        "codex-provider@radulator": "down",
+        "openrouter": "degraded",
+    }
+
+
+def test_provider_health_unparseable_updated_treated_as_no_output():
+    guard = _load_health_guard_module()
+    _register_sentinel(guard.HOME)
+    _write_provider_state(guard.HOME, {"updated": "not-a-date", "lanes": {}})
+    failures = guard._check_provider_health()
+    assert len(failures) == 1
+    assert "state file missing/unreadable" in failures[0]
+
+
+# ── managed-layer drift ─────────────────────────────────────────────────────
+
+
+def test_managed_layer_drift_skipped_without_git(monkeypatch):
+    guard = _load_health_guard_module()
+    monkeypatch.setattr(guard, "REPO", guard.HOME)  # _run cwd must exist
+    assert not (guard.HOME / ".git").exists()
+    assert guard._check_managed_layer_drift() == []
+
+
+def test_managed_layer_drift_fresh_vs_old_dirty_paths(monkeypatch):
+    guard = _load_health_guard_module()
+    monkeypatch.setattr(guard, "REPO", guard.HOME)  # _run cwd must exist
+    subprocess.run(
+        ["git", "init", "-q", str(guard.HOME)], check=True, capture_output=True
+    )
+
+    dirty = guard.HOME / "config-drift.json"
+    dirty.write_text("{}\n", encoding="utf-8")
+
+    # Fresh dirty file: survived no autocommit yet → silent.
+    assert guard._check_managed_layer_drift() == []
+
+    # Same file with mtime pushed past the threshold → one consolidated page.
+    old = datetime.now() - timedelta(hours=guard.MANAGED_DRIFT_MAX_AGE_H + 1)
+    os.utime(dirty, (old.timestamp(), old.timestamp()))
+    failures = guard._check_managed_layer_drift()
+    assert len(failures) == 1
+    assert failures[0].startswith("managed-layer drift: 1 uncommitted path(s) older than ")
+    assert "config-drift.json" in failures[0]
+    assert "autocommit aborted/failing?" in failures[0]
