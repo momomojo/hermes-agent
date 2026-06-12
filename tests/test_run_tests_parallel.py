@@ -293,3 +293,63 @@ def test_file_present_reports_truly_missing(tmp_path, monkeypatch):
     f = tmp_path / "nope.py"
     monkeypatch.setattr(rtp.Path, "exists", lambda self: False)
     assert rtp._file_present(f, attempts=3, delay=0.0) is False
+
+
+def test_runner_isolates_hermes_home_before_pytest_collection(tmp_path):
+    """Collection-time imports must not inherit the live profile HERMES_HOME.
+
+    conftest.py redirects HERMES_HOME in an autouse fixture, but pytest imports
+    test modules during collection before fixtures run. This probe writes a log
+    file at module import; the runner must route that write to its temp home,
+    not the HERMES_HOME inherited from a gateway/kanban worker.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    live_home = tmp_path / "live-hermes-home"
+    (live_home / "logs").mkdir(parents=True)
+    probe_out = tmp_path / "collection-home.txt"
+
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_collection_home.py"
+    probe.write_text(textwrap.dedent(f"""
+        import os
+        from pathlib import Path
+
+        home = Path(os.environ["HERMES_HOME"])
+        (home / "logs").mkdir(parents=True, exist_ok=True)
+        (home / "logs" / "collection-probe.log").write_text(str(home))
+        Path({str(probe_out)!r}).write_text(str(home))
+
+        def test_ok():
+            assert Path(os.environ["HERMES_HOME"]).exists()
+    """).strip() + "\n")
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(live_home)
+    env["HERMES_KANBAN_DB"] = str(tmp_path / "live-kanban.db")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert probe_out.exists(), proc.stdout
+    observed_home = Path(probe_out.read_text().strip())
+    assert observed_home != live_home
+    assert not (live_home / "logs" / "collection-probe.log").exists()
