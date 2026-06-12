@@ -33,6 +33,14 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
         "key", nargs="?", help="Configuration key (e.g., model, terminal.backend)"
     )
     config_set.add_argument("value", nargs="?", help="Value to set")
+    config_set.add_argument(
+        "--verdict",
+        metavar="ID",
+        help=(
+            "Judge ledger verdict id required for config.yaml mutations "
+            "(validated by scripts/judge_gate_check.py)"
+        ),
+    )
 
     # config path
     config_subparsers.add_parser("path", help="Print config file path")
