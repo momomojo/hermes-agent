@@ -1044,6 +1044,7 @@ export interface Translations {
     getKey: string
     replaceCurrent: string
     pasteApiKey: string
+    localApiKeyPlaceholder: string
     couldNotSave: string
     connecting: string
     update: string
@@ -1197,6 +1198,9 @@ export interface Translations {
     terminal: string
     noFolderSelected: string
     changeCwdTitle: string
+    remotePickerTitle: string
+    remotePickerDescription: string
+    remotePickerSelect: string
     folderTip: (cwd: string) => string
     openFolder: string
     refreshTree: string
@@ -1440,6 +1444,13 @@ export interface Translations {
     noClipboardImage: string
     clipboardPasteFailed: string
     dropFiles: string
+    handoff: {
+      pickPlatform: string
+      success: (platform: string) => string
+      systemNote: (platform: string) => string
+      failed: (error: string) => string
+      timedOut: string
+    }
   }
 
   errors: {
