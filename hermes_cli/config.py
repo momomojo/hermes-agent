@@ -12,6 +12,7 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -5473,48 +5474,97 @@ _COMMENTED_SECTIONS = """
 """
 
 
-def save_config(config: Dict[str, Any]):
-    """Save configuration to ~/.hermes/config.yaml."""
-    with _CONFIG_LOCK:
-        if is_managed():
-            managed_error("save configuration")
-            return
-        from utils import atomic_yaml_write
+# Sentinel: distinguishes "caller did not request a stale-write check" from
+# an explicit snapshot (which may legitimately be None for an absent file).
+_EXPECTED_STATE_UNSET = object()
 
-        ensure_hermes_home()
-        config_path = get_config_path()
-        current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        normalized = current_normalized
-        raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
-        if raw_existing:
-            normalized = _preserve_env_ref_templates(
+
+def save_config(config: Dict[str, Any], *, expected_state: Any = _EXPECTED_STATE_UNSET):
+    """Save configuration to ~/.hermes/config.yaml.
+
+    Holds the cross-process config lock while re-reading the existing file
+    (env-ref template preservation) and writing, so concurrent savers
+    serialize.  Callers doing a full load→modify→save cycle should use
+    :func:`config_update` instead, which holds the lock across the read as
+    well and passes ``expected_state`` (a ``utils.file_write_state``
+    snapshot) so a racing non-locking writer raises
+    ``utils.ConfigWriteConflictError`` instead of being reverted.
+    """
+    if is_managed():
+        managed_error("save configuration")
+        return
+    from utils import atomic_yaml_write, config_file_lock
+
+    config_path = get_config_path()
+    # Lock order: config_file_lock before _CONFIG_LOCK, always — config_update
+    # holds the file lock while load_config/read_raw_config take _CONFIG_LOCK,
+    # so acquiring them in the reverse order here could deadlock.
+    with config_file_lock(config_path):
+        with _CONFIG_LOCK:
+            ensure_hermes_home()
+            current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+            normalized = current_normalized
+            raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
+            if raw_existing:
+                normalized = _preserve_env_ref_templates(
+                    normalized,
+                    raw_existing,
+                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
+                )
+
+            # Build optional commented-out sections for features that are off by
+            # default or only relevant when explicitly configured.
+            parts = []
+            sec = normalized.get("security", {})
+            if not sec or sec.get("redact_secrets") is None:
+                parts.append(_SECURITY_COMMENT)
+            fb = normalized.get("fallback_model", {})
+            fb_is_valid = False
+            if isinstance(fb, list):
+                fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
+            elif isinstance(fb, dict):
+                fb_is_valid = bool(fb.get("provider") and fb.get("model"))
+            if not fb_is_valid:
+                parts.append(_FALLBACK_COMMENT)
+
+            write_kwargs: Dict[str, Any] = {}
+            if expected_state is not _EXPECTED_STATE_UNSET:
+                write_kwargs["expected_state"] = expected_state
+            atomic_yaml_write(
+                config_path,
                 normalized,
-                raw_existing,
-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
+                extra_content="".join(parts) if parts else None,
+                **write_kwargs,
             )
+            _secure_file(config_path)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
-        # Build optional commented-out sections for features that are off by
-        # default or only relevant when explicitly configured.
-        parts = []
-        sec = normalized.get("security", {})
-        if not sec or sec.get("redact_secrets") is None:
-            parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_model", {})
-        fb_is_valid = False
-        if isinstance(fb, list):
-            fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
-        elif isinstance(fb, dict):
-            fb_is_valid = bool(fb.get("provider") and fb.get("model"))
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
-            config_path,
-            normalized,
-            extra_content="".join(parts) if parts else None,
-        )
-        _secure_file(config_path)
-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+@contextlib.contextmanager
+def config_update():
+    """Cross-process-safe read→modify→save cycle for config.yaml.
+
+    Two concurrent ``load_config()`` → mutate → ``save_config()`` cycles
+    race last-writer-wins: each saves the full config it read, silently
+    reverting the other's edit.  This context manager holds the advisory
+    config lock across the whole cycle so concurrent updaters serialize::
+
+        with config_update() as cfg:
+            cfg["model"]["max_tokens"] = 8192
+
+    The save also carries a stale-write guard, so a writer that bypasses
+    the lock raises ``utils.ConfigWriteConflictError`` instead of having
+    its change reverted.  An exception inside the block skips the save.
+    """
+    from utils import config_file_lock, file_write_state
+
+    ensure_hermes_home()
+    config_path = get_config_path()
+    with config_file_lock(config_path):
+        snapshot = file_write_state(config_path)
+        cfg = load_config()
+        yield cfg
+        save_config(cfg, expected_state=snapshot)
 
 
 def load_env() -> Dict[str, str]:
@@ -6198,21 +6248,7 @@ def set_config_value(key: str, value: str):
         return
     
     # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
     config_path = get_config_path()
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
-    # Handle nested keys (e.g., "tts.provider") including numeric list
-    # indices (e.g., "custom_providers.0.api_key").  Delegates to
-    # _set_nested which preserves list-typed nodes; before #17876 the
-    # inline navigation here silently overwrote lists with dicts.
 
     # Convert value to appropriate type
     if value.lower() in {'true', 'yes', 'on'}:
@@ -6224,12 +6260,23 @@ def set_config_value(key: str, value: str):
     elif value.replace('.', '', 1).isdigit():
         value = float(value)
 
-    _set_nested(user_config, key, value)
-    
-    # Write only user config back (not the full merged defaults)
+    # Read the raw user config (not merged with defaults, to avoid dumping
+    # all default values back to the file), apply the key, and write —
+    # the full cycle under the cross-process config lock so a concurrent
+    # `hermes config set` (or programmatic saver) can't be reverted by a
+    # last-writer-wins race.
+    #
+    # Handle nested keys (e.g., "tts.provider") including numeric list
+    # indices (e.g., "custom_providers.0.api_key").  Delegates to
+    # _set_nested which preserves list-typed nodes; before #17876 the
+    # inline navigation here silently overwrote lists with dicts.
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    from utils import locked_yaml_mutate
+    locked_yaml_mutate(
+        config_path,
+        lambda cfg: _set_nested(cfg, key, value),
+        sort_keys=False,
+    )
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.

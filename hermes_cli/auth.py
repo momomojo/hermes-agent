@@ -46,7 +46,7 @@ import httpx
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, is_truthy_value
+from utils import SKIP_WRITE, atomic_replace, is_truthy_value, locked_yaml_mutate
 
 logger = logging.getLogger(__name__)
 
@@ -6062,49 +6062,49 @@ def _update_config_for_provider(
         auth_store["active_provider"] = provider_id
         _save_auth_store(auth_store)
 
-    # Update config.yaml model section
+    # Update config.yaml model section — full read-modify-write under the
+    # cross-process config lock so a concurrent config writer isn't reverted.
     config_path = get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config = read_raw_config()
+    def _apply(config: dict) -> None:
+        current_model = config.get("model")
+        if isinstance(current_model, dict):
+            model_cfg = dict(current_model)
+        elif isinstance(current_model, str) and current_model.strip():
+            model_cfg = {"default": current_model.strip()}
+        else:
+            model_cfg = {}
 
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        model_cfg = dict(current_model)
-    elif isinstance(current_model, str) and current_model.strip():
-        model_cfg = {"default": current_model.strip()}
-    else:
-        model_cfg = {}
+        model_cfg["provider"] = provider_id
+        if inference_base_url and inference_base_url.strip():
+            model_cfg["base_url"] = inference_base_url.rstrip("/")
+        else:
+            # Clear stale base_url to prevent contamination when switching providers
+            model_cfg.pop("base_url", None)
 
-    model_cfg["provider"] = provider_id
-    if inference_base_url and inference_base_url.strip():
-        model_cfg["base_url"] = inference_base_url.rstrip("/")
-    else:
-        # Clear stale base_url to prevent contamination when switching providers
-        model_cfg.pop("base_url", None)
+        # Clear stale api_key/api_mode left over from a previous custom provider.
+        # When the user switches from e.g. a MiniMax custom endpoint
+        # (api_mode=anthropic_messages, api_key=mxp-...) to a built-in provider
+        # (e.g. OpenRouter), the stale api_key/api_mode would override the new
+        # provider's credentials and transport choice.  Built-in providers that
+        # need a specific api_mode (copilot, xai) set it at request-resolution
+        # time via `_copilot_runtime_api_mode` / `_detect_api_mode_for_url`, so
+        # removing the persisted value here is safe.
+        model_cfg.pop("api_key", None)
+        model_cfg.pop("api_mode", None)
 
-    # Clear stale api_key/api_mode left over from a previous custom provider.
-    # When the user switches from e.g. a MiniMax custom endpoint
-    # (api_mode=anthropic_messages, api_key=mxp-...) to a built-in provider
-    # (e.g. OpenRouter), the stale api_key/api_mode would override the new
-    # provider's credentials and transport choice.  Built-in providers that
-    # need a specific api_mode (copilot, xai) set it at request-resolution
-    # time via `_copilot_runtime_api_mode` / `_detect_api_mode_for_url`, so
-    # removing the persisted value here is safe.
-    model_cfg.pop("api_key", None)
-    model_cfg.pop("api_mode", None)
+        # When switching to a non-OpenRouter provider, ensure model.default is
+        # valid for the new provider.  An OpenRouter-formatted name like
+        # "anthropic/claude-opus-4.6" will fail on direct-API providers.
+        if default_model:
+            cur_default = model_cfg.get("default", "")
+            if not cur_default or "/" in cur_default:
+                model_cfg["default"] = default_model
 
-    # When switching to a non-OpenRouter provider, ensure model.default is
-    # valid for the new provider.  An OpenRouter-formatted name like
-    # "anthropic/claude-opus-4.6" will fail on direct-API providers.
-    if default_model:
-        cur_default = model_cfg.get("default", "")
-        if not cur_default or "/" in cur_default:
-            model_cfg["default"] = default_model
+        config["model"] = model_cfg
 
-    config["model"] = model_cfg
-
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    locked_yaml_mutate(config_path, _apply, sort_keys=False)
     return config_path
 
 
@@ -6162,16 +6162,17 @@ def _reset_config_provider() -> Path:
     if not config_path.exists():
         return config_path
 
-    config = read_raw_config()
-    if not config:
-        return config_path
+    def _apply(config: dict):
+        if not config:
+            return SKIP_WRITE
+        model = config.get("model")
+        if isinstance(model, dict):
+            model["provider"] = "auto"
+            if "base_url" in model:
+                model["base_url"] = OPENROUTER_BASE_URL
+        return None
 
-    model = config.get("model")
-    if isinstance(model, dict):
-        model["provider"] = "auto"
-        if "base_url" in model:
-            model["base_url"] = OPENROUTER_BASE_URL
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    locked_yaml_mutate(config_path, _apply, sort_keys=False)
     return config_path
 
 
@@ -6416,15 +6417,16 @@ def _save_model_choice(model_id: str) -> None:
     The model is stored in config.yaml only — NOT in .env.  This avoids
     conflicts in multi-agent setups where env vars would stomp each other.
     """
-    from hermes_cli.config import save_config, load_config
+    from hermes_cli.config import config_update
 
-    config = load_config()
-    # Always use dict format so provider/base_url can be stored alongside
-    if isinstance(config.get("model"), dict):
-        config["model"]["default"] = model_id
-    else:
-        config["model"] = {"default": model_id}
-    save_config(config)
+    # Full load→modify→save cycle under the cross-process config lock so a
+    # concurrent writer (e.g. `hermes config set`) isn't silently reverted.
+    with config_update() as config:
+        # Always use dict format so provider/base_url can be stored alongside
+        if isinstance(config.get("model"), dict):
+            config["model"]["default"] = model_id
+        else:
+            config["model"] = {"default": model_id}
 
 
 def login_command(args) -> None:
