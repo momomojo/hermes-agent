@@ -157,8 +157,20 @@ class TestFalsyValues:
             config_command(args)
 
     def test_config_command_accepts_empty_string(self, _isolated_hermes_home):
-        """config set KEY '' should not exit — it should set the value."""
-        args = argparse.Namespace(config_command="set", key="model", value="")
+        """config set KEY '' with a valid verdict should set the value."""
+        scripts = _isolated_hermes_home / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "judge_gate_check.py").write_text(
+            "import sys\n"
+            "sys.exit(0 if sys.argv[-1] == 'abcdef123456' else 1)\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            config_command="set",
+            key="model",
+            value="",
+            verdict="abcdef123456",
+        )
         config_command(args)
         config = _read_config(_isolated_hermes_home)
         assert "model" in config

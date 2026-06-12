@@ -6377,7 +6377,7 @@ def config_command(args):
                 key,
                 value,
                 verdict_id=getattr(args, 'verdict', None),
-                require_verdict=hasattr(args, 'verdict'),
+                require_verdict=True,
             )
         except ValueError as exc:
             print(f"Error: {exc}")
