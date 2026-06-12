@@ -257,6 +257,7 @@ class TestSpawnEnvIsolation:
             def __init__(self, cmd, *args, **kwargs):
                 captured["cmd"] = list(cmd)
                 captured["env"] = kwargs.get("env", {}).copy()
+                captured["preexec_fn"] = kwargs.get("preexec_fn")
                 self.stdin = None
                 self.stdout = None
                 self.stderr = None
@@ -296,3 +297,140 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+        # preexec_fn=os.setsid isolates codex + its sandbox children into a
+        # dedicated process group so close() can killpg the entire tree.
+        import os
+        assert captured["preexec_fn"] is os.setsid, (
+            f"expected os.setsid as preexec_fn, got {captured['preexec_fn']!r}"
+        )
+
+
+class TestCodexAppServerCleanup:
+    """Regression: orphan sandbox processes when codex is killed.
+
+    During the 2026-06-11 rc=0 protocol-violation burst, ~50 SkyComputerUse
+    sandbox processes were orphaned to pid 1 because CodexAppServerClient.close()
+    sent SIGKILL to the codex parent only. The fix isolates codex in its own
+    process group (preexec_fn=os.setsid) and uses os.killpg() to kill the whole
+    tree.
+    """
+
+    def test_close_kills_process_group_on_timeout(self, monkeypatch):
+        """close() must escalate from SIGTERM to SIGKILL on the process
+        group when the subprocess doesn't exit in time."""
+        import os as real_os
+        import subprocess
+        import signal
+        from agent.transports import codex_app_server as cas
+
+        killpg_calls = []
+        monkeypatch.setattr(real_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+        monkeypatch.setattr(real_os, "getpgid", lambda pid: 42)
+
+        class SlowPopen:
+            """Mimics a codex subprocess that doesn't respond to SIGTERM."""
+
+            def __init__(self, cmd=None, *args, **kwargs):
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None  # alive
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout or 3.0)
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: SlowPopen())
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = False
+        client._proc = SlowPopen()  # ensure real poll() path
+
+        client.close(timeout=0.01)
+
+        # Must have sent both SIGTERM and SIGKILL to the process group
+        assert len(killpg_calls) == 2, (
+            f"expected 2 killpg calls (SIGTERM then SIGKILL), got {killpg_calls}"
+        )
+        assert killpg_calls[0] == (42, signal.SIGTERM), (
+            f"first killpg should be SIGTERM, got {killpg_calls[0]}"
+        )
+        assert killpg_calls[1] == (42, signal.SIGKILL), (
+            f"second killpg should be SIGKILL, got {killpg_calls[1]}"
+        )
+
+    def test_close_skips_kill_on_dead_process(self, monkeypatch):
+        """close() is a no-op when the subprocess has already exited."""
+        import os as real_os
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        killpg_calls = []
+        monkeypatch.setattr(real_os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+        class DeadPopen:
+            def __init__(self, cmd=None, *args, **kwargs):
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = 0
+
+            def poll(self):
+                return 0  # already dead
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: DeadPopen())
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = False
+        client._proc = DeadPopen()
+
+        client.close(timeout=0.01)
+        assert len(killpg_calls) == 0, (
+            f"expected no killpg calls for already-dead process, got {killpg_calls}"
+        )
+
+    def test_preexec_fn_is_os_setsid(self, monkeypatch):
+        """subprocess.Popen must receive preexec_fn=os.setsid so codex and
+        its sandbox children run in an isolated process group."""
+        import os as real_os
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class PopenChecker:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["preexec_fn"] = kwargs.get("preexec_fn")
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(subprocess, "Popen", PopenChecker)
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        assert captured["preexec_fn"] is real_os.setsid, (
+            f"expected os.setsid as preexec_fn, got {captured['preexec_fn']!r}"
+        )
