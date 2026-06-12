@@ -37,9 +37,9 @@ from gateway.session import SessionSource, build_session_key
 from hermes_cli.config import cfg_get
 from utils import (
     atomic_json_write,
-    atomic_yaml_write,
     base_url_host_matches,
     is_truthy_value,
+    locked_yaml_mutate,
 )
 
 logger = logging.getLogger("gateway.run")
@@ -1266,35 +1266,41 @@ class GatewaySlashCommandsMixin:
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
 
-            # Persist to config if --global
+            # Persist to config if --global — hold the cross-process config
+            # lock across the read→modify→save cycle so a concurrent config
+            # writer (CLI sweep, another session) isn't silently reverted.
             if persist_global:
                 try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
                     from hermes_cli.config import save_config
-                    save_config(cfg)
+                    from utils import config_file_lock, file_write_state
+
+                    with config_file_lock(config_path):
+                        snapshot = file_write_state(config_path)
+                        if config_path.exists():
+                            with open(config_path, encoding="utf-8") as f:
+                                cfg = yaml.safe_load(f) or {}
+                        else:
+                            cfg = {}
+                        # Coerce scalar/None ``model:`` into a dict before mutation —
+                        # otherwise ``cfg.setdefault("model", {})`` returns the existing
+                        # scalar and the next assignment raises
+                        # ``TypeError: 'str' object does not support item assignment``.
+                        # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
+                        # string) instead of the proper nested ``model: {default: ...}``.
+                        raw_model = cfg.get("model")
+                        if isinstance(raw_model, dict):
+                            model_cfg = raw_model
+                        elif isinstance(raw_model, str) and raw_model.strip():
+                            model_cfg = {"default": raw_model.strip()}
+                            cfg["model"] = model_cfg
+                        else:
+                            model_cfg = {}
+                            cfg["model"] = model_cfg
+                        model_cfg["default"] = result.new_model
+                        model_cfg["provider"] = result.target_provider
+                        if result.base_url:
+                            model_cfg["base_url"] = result.base_url
+                        save_config(cfg, expected_state=snapshot)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
 
@@ -1421,15 +1427,22 @@ class GatewaySlashCommandsMixin:
 
         # Load + persist via the same helpers used for /model and /yolo
         try:
-            from hermes_cli.config import load_config, save_config
+            from hermes_cli.config import config_update, load_config
         except Exception as exc:
             return f"❌ Could not load config: {exc}"
         cfg = load_config()
 
+        def _persist_runtime(mutated_cfg):
+            # Re-apply just the runtime flag in a locked read→modify→save
+            # cycle — persisting the full (possibly stale) `cfg` snapshot
+            # would revert any config change that landed since load_config().
+            with config_update() as fresh:
+                crs.set_runtime(fresh, crs.get_current_runtime(mutated_cfg))
+
         result = crs.apply(
             cfg,
             new_value,
-            persist_callback=(save_config if new_value is not None else None),
+            persist_callback=(_persist_runtime if new_value is not None else None),
         )
 
         # On a real change, evict the cached agent so the new runtime takes
@@ -1485,12 +1498,19 @@ class GatewaySlashCommandsMixin:
                 return "\n".join(p for p in parts if p)
             return str(value)
 
+        def _save_system_prompt(prompt_value: str) -> None:
+            # Full read-modify-write under the config lock so this write
+            # composes with concurrent config edits (last-writer-wins fix).
+            def _mut(cfg: dict) -> None:
+                if "agent" not in cfg or not isinstance(cfg.get("agent"), dict):
+                    cfg["agent"] = {}
+                cfg["agent"]["system_prompt"] = prompt_value
+
+            locked_yaml_mutate(config_path, _mut)
+
         if args in {"none", "default", "neutral"}:
             try:
-                if "agent" not in config or not isinstance(config.get("agent"), dict):
-                    config["agent"] = {}
-                config["agent"]["system_prompt"] = ""
-                atomic_yaml_write(config_path, config)
+                _save_system_prompt("")
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
             self._ephemeral_system_prompt = ""
@@ -1500,10 +1520,7 @@ class GatewaySlashCommandsMixin:
 
             # Write to config.yaml, same pattern as CLI save_config_value.
             try:
-                if "agent" not in config or not isinstance(config.get("agent"), dict):
-                    config["agent"] = {}
-                config["agent"]["system_prompt"] = new_prompt
-                atomic_yaml_write(config_path, config)
+                _save_system_prompt(new_prompt)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
 
@@ -1973,12 +1990,8 @@ class GatewaySlashCommandsMixin:
         )
 
         def _save_config_key(key_path: str, value):
-            """Save a dot-separated key to config.yaml."""
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
+            """Save a dot-separated key to config.yaml (locked read-modify-write)."""
+            def _mut(user_config: dict) -> None:
                 keys = key_path.split(".")
                 current = user_config
                 for k in keys[:-1]:
@@ -1986,7 +1999,9 @@ class GatewaySlashCommandsMixin:
                         current[k] = {}
                     current = current[k]
                 current[keys[-1]] = value
-                atomic_yaml_write(config_path, user_config)
+
+            try:
+                locked_yaml_mutate(config_path, _mut)
                 return True
             except Exception as e:
                 logger.error("Failed to save config key %s: %s", key_path, e)
@@ -2083,13 +2098,12 @@ class GatewaySlashCommandsMixin:
         config_path = _hermes_home / "config.yaml"
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
-            atomic_yaml_write(config_path, user_config)
+            locked_yaml_mutate(
+                config_path,
+                lambda cfg: cfg.setdefault("memory", {}).update(
+                    write_approval=bool(enabled)
+                ),
+            )
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
@@ -2137,13 +2151,12 @@ class GatewaySlashCommandsMixin:
                     "writes here with /skills pending.")
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-            user_config.setdefault("skills", {})["write_approval"] = bool(enabled)
-            atomic_yaml_write(config_path, user_config)
+            locked_yaml_mutate(
+                config_path,
+                lambda cfg: cfg.setdefault("skills", {}).update(
+                    write_approval=bool(enabled)
+                ),
+            )
             # New setting must take effect next message → drop cached agent.
             self._evict_cached_agent(session_key)
 
@@ -2180,12 +2193,8 @@ class GatewaySlashCommandsMixin:
             return t("gateway.fast.not_supported")
 
         def _save_config_key(key_path: str, value):
-            """Save a dot-separated key to config.yaml."""
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
+            """Save a dot-separated key to config.yaml (locked read-modify-write)."""
+            def _mut(user_config: dict) -> None:
                 keys = key_path.split(".")
                 current = user_config
                 for k in keys[:-1]:
@@ -2193,7 +2202,9 @@ class GatewaySlashCommandsMixin:
                         current[k] = {}
                     current = current[k]
                 current[keys[-1]] = value
-                atomic_yaml_write(config_path, user_config)
+
+            try:
+                locked_yaml_mutate(config_path, _mut)
                 return True
             except Exception as e:
                 logger.error("Failed to save config key %s: %s", key_path, e)
@@ -2279,17 +2290,21 @@ class GatewaySlashCommandsMixin:
         idx = (cycle.index(current) + 1) % len(cycle)
         new_mode = cycle[idx]
 
-        # Save to display.platforms.<platform>.tool_progress
+        # Save to display.platforms.<platform>.tool_progress — re-read under
+        # the config lock (not the user_config snapshot from above) so the
+        # write composes with concurrent config edits.
         try:
-            if "display" not in user_config or not isinstance(user_config.get("display"), dict):
-                user_config["display"] = {}
-            display = user_config["display"]
-            if "platforms" not in display or not isinstance(display.get("platforms"), dict):
-                display["platforms"] = {}
-            if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
-                display["platforms"][platform_key] = {}
-            display["platforms"][platform_key]["tool_progress"] = new_mode
-            atomic_yaml_write(config_path, user_config)
+            def _set_tool_progress(cfg: dict) -> None:
+                if "display" not in cfg or not isinstance(cfg.get("display"), dict):
+                    cfg["display"] = {}
+                display = cfg["display"]
+                if "platforms" not in display or not isinstance(display.get("platforms"), dict):
+                    display["platforms"] = {}
+                if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
+                    display["platforms"][platform_key] = {}
+                display["platforms"][platform_key]["tool_progress"] = new_mode
+
+            locked_yaml_mutate(config_path, _set_tool_progress)
             return (
                 f"{descriptions[new_mode]}\n"
                 + t("gateway.verbose.saved_suffix", platform=platform_key)
@@ -2357,14 +2372,18 @@ class GatewaySlashCommandsMixin:
             return t("gateway.footer.usage")
 
         # --- write global flag ---------------------------------------------
+        # Re-read under the config lock (not the user_config snapshot from
+        # above) so the write composes with concurrent config edits.
         try:
-            if not isinstance(user_config.get("display"), dict):
-                user_config["display"] = {}
-            display = user_config["display"]
-            if not isinstance(display.get("runtime_footer"), dict):
-                display["runtime_footer"] = {}
-            display["runtime_footer"]["enabled"] = new_state
-            atomic_yaml_write(config_path, user_config)
+            def _set_footer(cfg: dict) -> None:
+                if not isinstance(cfg.get("display"), dict):
+                    cfg["display"] = {}
+                display = cfg["display"]
+                if not isinstance(display.get("runtime_footer"), dict):
+                    display["runtime_footer"] = {}
+                display["runtime_footer"]["enabled"] = new_state
+
+            locked_yaml_mutate(config_path, _set_footer)
         except Exception as e:
             logger.warning("Failed to save runtime_footer.enabled: %s", e)
             return t("gateway.config_save_failed", error=e)
