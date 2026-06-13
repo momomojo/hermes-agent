@@ -75,6 +75,14 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning", {}).get("effort") == "high"
 
+    def test_xhigh_reasoning_config(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[],
+            reasoning_config={"effort": "xhigh"},
+        )
+        assert kw.get("reasoning", {}).get("effort") == "xhigh"
+
     def test_reasoning_disabled(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

@@ -109,6 +109,25 @@ class TestChatVerboseArg:
         assert "verbose" not in captured
 
 
+class TestTopLevelReasoningArg:
+    def test_top_level_reasoning_parses_for_oneshot(self):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat_parser = build_top_level_parser()
+        args = parser.parse_args(["--reasoning", "xhigh", "-z", "hi"])
+
+        assert args.reasoning == "xhigh"
+        assert args.oneshot == "hi"
+
+    def test_top_level_reasoning_effort_alias_parses(self):
+        from hermes_cli._parser import build_top_level_parser
+
+        parser, _subparsers, _chat_parser = build_top_level_parser()
+        args = parser.parse_args(["-z", "hi", "--reasoning-effort", "high"])
+
+        assert args.reasoning == "high"
+
+
 class TestYoloEnvVar:
     """Verify --yolo sets HERMES_YOLO_MODE regardless of flag position.
 

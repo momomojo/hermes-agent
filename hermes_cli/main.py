@@ -361,6 +361,7 @@ def _apply_profile_override() -> None:
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning", "--reasoning-effort",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -10555,6 +10556,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning", "--reasoning-effort",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -10780,6 +10782,7 @@ def _try_termux_fast_cli_launch() -> bool:
                 args.oneshot,
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
+                reasoning=getattr(args, "reasoning", None),
                 toolsets=getattr(args, "toolsets", None),
             )
         )
@@ -11996,6 +11999,7 @@ def main():
                 args.oneshot,
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
+                reasoning=getattr(args, "reasoning", None),
                 toolsets=getattr(args, "toolsets", None),
             )
         )
