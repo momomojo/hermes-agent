@@ -211,3 +211,57 @@ def test_managed_layer_drift_fresh_vs_old_dirty_paths(monkeypatch):
     assert failures[0].startswith("managed-layer drift: 1 uncommitted path(s) older than ")
     assert "config-drift.json" in failures[0]
     assert "autocommit aborted/failing?" in failures[0]
+
+
+def test_hindsight_recall_types_observation_only_is_healthy(monkeypatch):
+    guard = _load_health_guard_module()
+    (guard.HOME / "hindsight").mkdir(exist_ok=True)
+    (guard.HOME / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    (guard.HOME / "hindsight" / "config.json").write_text(
+        json.dumps({
+            "api_url": "http://truenas-scale.tail1339c4.ts.net:8890",
+            "bank_id": "hermes-owner",
+            "recall_types": ["observation"],
+        }),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return json.dumps({"banks": [{"bank_id": "hermes-owner"}]}).encode()
+
+    monkeypatch.setattr(guard.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    assert guard._check_hindsight_config(None) == []
+
+
+def test_hindsight_recall_types_mixed_is_flagged(monkeypatch):
+    guard = _load_health_guard_module()
+    (guard.HOME / "hindsight").mkdir(exist_ok=True)
+    (guard.HOME / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    (guard.HOME / "hindsight" / "config.json").write_text(
+        json.dumps({
+            "api_url": "http://truenas-scale.tail1339c4.ts.net:8890",
+            "bank_id": "hermes-owner",
+            "recall_types": ["observation", "world", "experience"],
+        }),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return json.dumps({"banks": [{"bank_id": "hermes-owner"}]}).encode()
+
+    monkeypatch.setattr(guard.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    failures = guard._check_hindsight_config(None)
+    assert len(failures) == 1
+    assert "should be ['observation']" in failures[0]

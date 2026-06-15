@@ -185,8 +185,6 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
-
-
 # ---------------------------------------------------------------------------
 # exit-4 retry loop (transient "file or directory not found" on loaded runners)
 # ---------------------------------------------------------------------------

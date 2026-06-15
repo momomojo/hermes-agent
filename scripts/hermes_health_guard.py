@@ -530,7 +530,7 @@ def _check_hindsight_config(profile: str | None) -> list[str]:
     Checks (only for profiles with memory.provider=hindsight):
       1. $HERMES_HOME/hindsight/config.json exists.
       2. api_url points at the NAS service.
-      3. recall_types includes observation, world, experience.
+      3. recall_types is observation-only by default for precise state recall.
       4. The configured bank_id appears in the NAS banks listing.
 
     Returns a list of failure strings (empty = all good).
@@ -572,13 +572,18 @@ def _check_hindsight_config(profile: str | None) -> list[str]:
         failures.append(f"hindsight [{label}]: api_url={api_url} does not point at NAS service")
 
     # --- check 3: recall_types ---
-    recall_types = hc.get("recall_types", [])
-    if not isinstance(recall_types, list):
+    recall_types = hc.get("recall_types")
+    if recall_types is None:
+        # Provider default is observation-only; absent key is acceptable and
+        # keeps state/current-status recalls free of raw experience metadata.
+        pass
+    elif not isinstance(recall_types, list):
         failures.append(f"hindsight [{label}]: recall_types is not a list")
-    else:
-        missing = [t for t in ("observation", "world", "experience") if t not in recall_types]
-        if missing:
-            failures.append(f"hindsight [{label}]: recall_types missing {missing}")
+    elif recall_types != ["observation"]:
+        failures.append(
+            f"hindsight [{label}]: recall_types={recall_types} should be ['observation'] "
+            "for default state recall; use per-call types/tags for broad history searches"
+        )
 
     # --- check 4: bank reachability ---
     bank_id = hc.get("bank_id", "")

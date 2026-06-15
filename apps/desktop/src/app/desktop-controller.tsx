@@ -11,7 +11,6 @@ import { Pane, PaneMain } from '@/components/pane-shell'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
-import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getCronJobs, getSessionMessages, listAllProfileSessions, type SessionInfo, triggerCronJob } from '../hermes'
 import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
@@ -21,6 +20,7 @@ import {
   MESSAGING_SESSION_SOURCE_IDS,
   normalizeSessionSource
 } from '../lib/session-source'
+import { latestSessionTodos } from '../lib/todos'
 import { setCronFocusJobId, setCronJobs } from '../store/cron'
 import {
   $panesFlipped,
@@ -37,6 +37,7 @@ import {
   SIDEBAR_SESSIONS_PAGE_SIZE,
   unpinSession
 } from '../store/layout'
+import { respondToApprovalAction } from '../store/native-notifications'
 import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../store/preview'
 import {
   $activeGatewayProfile,
@@ -76,10 +77,12 @@ import {
   setSessionsLoading,
   setSessionsTotal
 } from '../store/session'
+import { clearSessionTodos, setSessionTodos, todoListActive } from '../store/todos'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
 import { isSecondaryWindow } from '../store/windows'
 
 import { ChatView } from './chat'
+import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
   ChatPreviewRail,
@@ -142,7 +145,7 @@ const CRON_POLL_INTERVAL_MS = 30_000
 // self-managed sidebar section (refreshMessagingSessions). Excluding both here
 // keeps "Load more" paging through interactive local chats instead of
 // interleaving gateway threads that bury them.
-const SIDEBAR_EXCLUDED_SOURCES = ['cron', ...MESSAGING_SESSION_SOURCE_IDS]
+const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSION_SOURCE_IDS]
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
@@ -268,28 +271,53 @@ export function DesktopController() {
     }
   }, [])
 
+  // Notification click: the main process already focused the window; jump to its session.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onFocusSession?.(sessionId => {
+      if (sessionId) {
+        navigate(sessionRoute(sessionId))
+      }
+    })
+
+    return () => unsubscribe?.()
+  }, [navigate])
+
+  // Notification action button (Approve/Reject) — resolve in place, no navigation.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId)
+    })
+
+    return () => unsubscribe?.()
+  }, [])
+
   // hermes:// deep links (e.g. a docs "Send to App" button for an automation blueprint).
   // Build the equivalent /blueprint slash command from the payload and drop
   // it into the composer — the user reviews/edits, then sends; the agent (or
   // the shared command handler) creates the job. Signal readiness so a link
   // that arrived during boot is flushed exactly once.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onDeepLink?.((payload) => {
+    const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
       if (!payload || payload.kind !== 'blueprint' || !payload.name) {
         return
       }
+
       const slots = Object.entries(payload.params || {})
         .map(([k, v]) => {
           const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
+
           return `${k}=${sval}`
         })
         .join(' ')
+
       const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
       requestComposerInsert(command, { mode: 'block', target: 'main' })
       requestComposerFocus('main')
     })
+
     // Tell the main process the renderer is ready to receive deep links.
     void window.hermesDesktop?.signalDeepLinkReady?.()
+
     return () => unsubscribe?.()
   }, [])
 
@@ -555,14 +583,26 @@ export function DesktopController() {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
+          const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
             state => ({
               ...state,
-              messages: preserveLocalAssistantErrors(toChatMessages(latest.messages), state.messages)
+              messages: preserveLocalAssistantErrors(messages, state.messages)
             }),
             storedSessionId
           )
+
+          // Seed the status stack's todo group from history — but only while
+          // the plan is still in flight, so reopening an old chat doesn't pin
+          // its finished todo list above the composer forever.
+          const todos = latestSessionTodos(messages)
+
+          if (todos && todoListActive(todos)) {
+            setSessionTodos(runtimeSessionId, todos)
+          } else {
+            clearSessionTodos(runtimeSessionId)
+          }
 
           return
         } catch {
@@ -583,6 +623,7 @@ export function DesktopController() {
     queryClient,
     refreshHermesConfig,
     refreshSessions,
+    sessionStateByRuntimeIdRef,
     updateSessionState
   })
 
@@ -712,6 +753,7 @@ export function DesktopController() {
     editMessage,
     handleThreadMessagesChange,
     reloadFromMessage,
+    restoreToMessage,
     steerPrompt,
     submitText,
     transcribeVoiceAudio
@@ -946,6 +988,7 @@ export function DesktopController() {
       onPickImages={() => void composer.pickImages()}
       onReload={reloadFromMessage}
       onRemoveAttachment={id => void composer.removeAttachment(id)}
+      onRestoreToMessage={restoreToMessage}
       onSteer={steerPrompt}
       onSubmit={submitText}
       onThreadMessagesChange={handleThreadMessagesChange}
@@ -991,8 +1034,8 @@ export function DesktopController() {
       width={FILE_BROWSER_DEFAULT_WIDTH}
     >
       <RightSidebarPane
-        onActivateFile={composer.attachContextFilePath}
-        onActivateFolder={composer.attachContextFolderPath}
+        onActivateFile={path => composer.insertContextPathInlineRef(path)}
+        onActivateFolder={path => composer.insertContextPathInlineRef(path, true)}
         onChangeCwd={changeSessionCwd}
       />
     </Pane>

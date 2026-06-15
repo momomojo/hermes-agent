@@ -559,6 +559,33 @@ class TestToolHandlers:
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
 
+    def test_recall_per_call_options_override_config(self, provider_with_config):
+        p = provider_with_config(
+            recall_tags=["default-tag"],
+            recall_tags_match="all",
+            recall_types=["world", "experience"],
+            recall_max_tokens=1024,
+        )
+        p.handle_tool_call(
+            "hindsight_recall",
+            {
+                "query": "pool health",
+                "types": ["observation"],
+                "tags": ["nas-health", "pool"],
+                "tags_match": "all_strict",
+                "query_timestamp": "2026-06-15T12:00:00Z",
+                "budget": "high",
+                "max_tokens": 2048,
+            },
+        )
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["types"] == ["observation"]
+        assert call_kwargs["tags"] == ["nas-health", "pool"]
+        assert call_kwargs["tags_match"] == "all_strict"
+        assert call_kwargs["query_timestamp"] == "2026-06-15T12:00:00Z"
+        assert call_kwargs["budget"] == "high"
+        assert call_kwargs["max_tokens"] == 2048
+
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
         result = json.loads(provider.handle_tool_call(
