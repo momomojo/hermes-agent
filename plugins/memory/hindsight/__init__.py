@@ -307,13 +307,45 @@ RETAIN_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "Search long-term memory. For current-state questions, prefer "
+        "types=['observation'] so consolidated state facts outrank raw session "
+        "metadata. Omit filters for open-ended history/provenance searches."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["observation", "world", "experience"]},
+                "description": (
+                    "Optional fact-type filter. Use ['observation'] for state/current facts; "
+                    "omit for broad history searches. Defaults to configured recall_types."
+                ),
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tag filter for domain-scoped recall.",
+            },
+            "tags_match": {
+                "type": "string",
+                "enum": ["any", "all", "any_strict", "all_strict"],
+                "description": "Tag matching mode when tags are provided.",
+            },
+            "query_timestamp": {
+                "type": "string",
+                "description": "Optional ISO timestamp anchor for recency-sensitive recall.",
+            },
+            "budget": {
+                "type": "string",
+                "enum": ["low", "mid", "high"],
+                "description": "Optional per-call recall budget override.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Optional per-call maximum token budget for returned recall text.",
+            },
         },
         "required": ["query"],
     },
@@ -2034,16 +2066,32 @@ class HindsightMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: query")
             try:
                 recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
+                    "bank_id": self._bank_id,
+                    "query": query,
+                    "budget": str(args.get("budget") or self._budget),
+                    "max_tokens": int(args.get("max_tokens") or self._recall_max_tokens),
                 }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
+
+                call_tags = _normalize_string_list(args.get("tags")) if "tags" in args else self._recall_tags
+                if call_tags:
+                    recall_kwargs["tags"] = call_tags
+                    recall_kwargs["tags_match"] = str(args.get("tags_match") or self._recall_tags_match)
+                elif args.get("tags_match"):
+                    recall_kwargs["tags_match"] = str(args["tags_match"])
+
+                if "types" in args:
+                    call_types = _normalize_string_list(args.get("types"))
+                    if call_types:
+                        recall_kwargs["types"] = call_types
+                elif self._recall_types:
                     recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
+
+                query_timestamp = args.get("query_timestamp")
+                if query_timestamp:
+                    recall_kwargs["query_timestamp"] = str(query_timestamp)
+
+                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s, types=%s",
+                             self._bank_id, len(query), recall_kwargs["budget"], recall_kwargs.get("types"))
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
