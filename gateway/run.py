@@ -7820,6 +7820,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return message_text
 
+    def _record_inbound_artifacts(self, event: MessageEvent, *, session_id: str | None) -> None:
+        """Best-effort lifecycle registry import for gateway-cached media."""
+
+        if not getattr(event, "media_urls", None):
+            return
+        try:
+            from hermes_cli.artifact_registry import record_gateway_inbound_files
+
+            records = record_gateway_inbound_files(event, session_id=session_id)
+            if records:
+                logger.debug(
+                    "Registered %d inbound artifact(s) for session %s",
+                    len(records),
+                    session_id or "?",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Inbound artifact registry update failed: %s", exc)
+
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
         if not pending_native:
@@ -8499,6 +8517,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        self._record_inbound_artifacts(event, session_id=session_entry.session_id)
         message_text = await self._prepare_inbound_message_text(
             event=event,
             source=source,
@@ -15348,6 +15367,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                         )
                         return result
+                    self._record_inbound_artifacts(pending_event, session_id=session_id)
                     next_message = await self._prepare_inbound_message_text(
                         event=pending_event,
                         source=next_source,

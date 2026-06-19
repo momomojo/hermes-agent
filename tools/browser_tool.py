@@ -1650,6 +1650,76 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
+def _registry_session_id(session_info: Dict[str, Any], session_key: str) -> str:
+    return str(
+        session_info.get("bb_session_id")
+        or session_info.get("session_name")
+        or session_key
+    )
+
+
+def _registry_backend(session_info: Dict[str, Any], session_key: str) -> str:
+    features = session_info.get("features") or {}
+    if isinstance(features, dict) and features.get("cdp_override"):
+        return "cdp"
+    if _is_local_sidecar_key(session_key) or not session_info.get("cdp_url"):
+        return "browser-local"
+    if isinstance(features, dict) and features.get("firecrawl"):
+        return "firecrawl"
+    try:
+        provider = _get_cloud_provider()
+        if provider is not None:
+            name = getattr(provider, "name", None)
+            if not name:
+                name = provider.provider_name()
+            return str(name).strip().lower().replace(" ", "-") or "browser-cloud"
+    except Exception:
+        pass
+    return "browser-cdp"
+
+
+def _record_browser_registry_session(
+    session_key: str,
+    domain_or_url: str,
+    session_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort browser session registry update."""
+    try:
+        from tools.browser_session_registry import upsert_session
+
+        if session_info is None:
+            with _cleanup_lock:
+                session_info = dict(_active_sessions.get(session_key, {}))
+        if not session_info:
+            return
+        upsert_session(
+            domain=domain_or_url,
+            backend=_registry_backend(session_info, session_key),
+            session_id=_registry_session_id(session_info, session_key),
+            ttl_seconds=_get_session_inactivity_timeout(),
+        )
+    except Exception as exc:
+        logger.debug("browser session registry update failed: %s", exc)
+
+
+def _drop_browser_registry_session(
+    session_key: str,
+    session_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort browser session registry removal for a closed backend."""
+    try:
+        from tools.browser_session_registry import close_sessions
+
+        if session_info is None:
+            with _cleanup_lock:
+                session_info = dict(_active_sessions.get(session_key, {}))
+        if not session_info:
+            return
+        close_sessions(session_id=_registry_session_id(session_info, session_key))
+    except Exception as exc:
+        logger.debug("browser session registry cleanup failed: %s", exc)
+
+
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     """
     Get or create session info for the given session key.
@@ -2440,6 +2510,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "url": final_url,
             "title": title
         }
+        _record_browser_registry_session(nav_session_key, final_url or url, session_info)
         _copy_fallback_warning(response, result)
 
         # Detect common "blocked" page patterns from title/url
@@ -3460,6 +3531,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     if session_info:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
+        _drop_browser_registry_session(task_id, session_info)
 
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)

@@ -48,6 +48,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Web
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from hermes_cli import artifact_registry
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 
@@ -752,6 +753,20 @@ async def upload_task_attachment(
             uploaded_by=(uploaded_by or "dashboard"),
         )
         att = kanban_db.get_attachment(conn, att_id)
+        try:
+            artifact_registry.register_artifact(
+                dest_path,
+                source="kanban_attachment",
+                source_id=str(att_id),
+                mime_type=file.content_type,
+                sensitivity="user-provided",
+                task_id=task_id,
+                board=board,
+                metadata={"uploaded_by": uploaded_by or "dashboard", "attachment_id": att_id},
+                filename=candidate,
+            )
+        except Exception as exc:  # pragma: no cover - upload should not fail on registry drift
+            log.warning("failed to register kanban attachment artifact", exc_info=exc)
         return {"attachment": _attachment_dict(att) if att else None}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

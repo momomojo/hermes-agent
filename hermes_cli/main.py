@@ -274,6 +274,10 @@ from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.credential_intake import build_credential_intake_parser
+from hermes_cli.subcommands.capabilities import build_capabilities_parser
+from hermes_cli.subcommands.artifacts import build_artifacts_parser
+from hermes_cli.subcommands.project_memory import build_project_memory_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
@@ -4044,6 +4048,34 @@ def cmd_auth(args):
     auth_command(args)
 
 
+def cmd_credential_intake(args):
+    """Manage local credential intake links."""
+    from hermes_cli.credential_intake import credential_intake_command
+
+    credential_intake_command(args)
+
+
+def cmd_capabilities(args):
+    """Manage local capability manifests."""
+    from hermes_cli.capability_catalog import capability_catalog_command
+
+    return capability_catalog_command(args)
+
+
+def cmd_artifacts(args):
+    """Manage artifact lifecycle registry."""
+    from hermes_cli.artifacts import artifacts_command
+
+    artifacts_command(args)
+
+
+def cmd_project_memory(args):
+    """Manage file-backed Project Memory documents."""
+    from hermes_cli.project_memory import project_memory_command
+
+    project_memory_command(args)
+
+
 def cmd_status(args):
     """Show status of all components."""
     from hermes_cli.status import show_status
@@ -4101,6 +4133,13 @@ def cmd_kanban(args):
     from hermes_cli.kanban import kanban_command
 
     return kanban_command(args)
+
+
+def cmd_browser_sessions(args):
+    """Inspect and manage the browser session registry."""
+    from hermes_cli.browser_sessions import browser_sessions_command
+
+    browser_sessions_command(args)
 
 
 def cmd_hooks(args):
@@ -10525,12 +10564,12 @@ def cmd_logs(args):
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
-        "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "acp", "artifacts", "auth", "backup", "browser-session", "browser-sessions", "bundles",
+        "capabilities", "capability", "checkpoints", "claw", "completion", "computer-use",
+        "config", "credential-intake", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
-        "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
+        "model", "pairing", "plugins", "portal", "postinstall", "profile", "project-memories", "project-memory", "projects-memory", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -11224,6 +11263,26 @@ def main():
     build_auth_parser(subparsers, cmd_auth=cmd_auth)
 
     # =========================================================================
+    # credential-intake command (parser built in hermes_cli/subcommands/credential_intake.py)
+    # =========================================================================
+    build_credential_intake_parser(subparsers, cmd_credential_intake=cmd_credential_intake)
+
+    # =========================================================================
+    # capabilities command (parser built in hermes_cli/subcommands/capabilities.py)
+    # =========================================================================
+    build_capabilities_parser(subparsers, cmd_capabilities=cmd_capabilities)
+
+    # =========================================================================
+    # artifacts command (parser built in hermes_cli/subcommands/artifacts.py)
+    # =========================================================================
+    build_artifacts_parser(subparsers, cmd_artifacts=cmd_artifacts)
+
+    # =========================================================================
+    # project-memory command (parser built in hermes_cli/subcommands/project_memory.py)
+    # =========================================================================
+    build_project_memory_parser(subparsers, cmd_project_memory=cmd_project_memory)
+
+    # =========================================================================
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
@@ -11251,6 +11310,13 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # browser-sessions command — browser/CDP/computer-use registry
+    # =========================================================================
+    from hermes_cli.browser_sessions import build_parser as _build_browser_sessions_parser
+
+    _build_browser_sessions_parser(subparsers)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

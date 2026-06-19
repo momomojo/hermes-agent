@@ -81,6 +81,127 @@ def test_briefing_queue_bounded_registry_only(monkeypatch):
     assert "Your call." in spoken
 
 
+def test_action_registry_delegate_marks_in_flight_and_reuses_existing_task(tmp_path):
+    delegate = load_script("action_registry_delegate.py")
+    data = {"items": [{"id": "abc", "title": "Review one thing", "status": "pending"}]}
+    item, _ = delegate.find_item(data, "abc")
+
+    changed = delegate.mark_delegated(item, item_id="abc", task_id="t_11111111", timestamp="2026-06-18T12:00:00+00:00")
+
+    assert changed is True
+    assert item["status"] == "in-flight"
+    assert item["delegated_task_id"] == "t_11111111"
+    assert item["delegated_at"] == "2026-06-18T12:00:00+00:00"
+    assert "hide from Jarvis BRIEFING" in item["notes"]
+
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(data), encoding="utf-8")
+    result = delegate.delegate_item("abc", registry_path=registry_path, task_id="t_22222222", dry_run=True)
+
+    # Existing delegated_task_id wins: repeated delegation cannot overwrite the
+    # original worker card or create a duplicate queue item.
+    assert result["reused_existing"] is True
+    assert result["delegated_task_id"] == "t_11111111"
+
+
+def test_action_registry_delegate_cli_dry_run_does_not_write_and_real_run_suppresses_briefing(tmp_path):
+    root = tmp_path / "hermes"
+    state = root / "state"
+    state.mkdir(parents=True)
+    db = root / "kanban.db"
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    conn.execute("INSERT INTO tasks VALUES (?, ?)", ("t_33333333", "ready"))
+    conn.commit()
+    conn.close()
+    registry = state / "mohib-action-registry.json"
+    registry.write_text(
+        json.dumps({"items": [{"id": "x", "title": "Delegate me", "status": "pending"}]}),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_ROOT"] = str(root)
+
+    dry = subprocess.run(
+        [sys.executable, str(SCRIPTS / "action_registry_delegate.py"), "x", "--task-id", "t_33333333", "--registry", str(registry), "--dry-run"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        env=env,
+    )
+    assert json.loads(dry.stdout)["dry_run"] is True
+    assert json.loads(registry.read_text())["items"][0]["status"] == "pending"
+
+    subprocess.run(
+        [sys.executable, str(SCRIPTS / "action_registry_delegate.py"), "x", "--task-id", "t_33333333", "--registry", str(registry)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        env=env,
+    )
+    item = json.loads(registry.read_text())["items"][0]
+    assert item["status"] == "in-flight"
+    assert item["delegated_task_id"] == "t_33333333"
+
+    queue = subprocess.run(
+        [sys.executable, str(SCRIPTS / "jarvis_briefing_queue.py"), "--json", "--no-kanban"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        env=env,
+    )
+    payload = json.loads(queue.stdout)
+    assert payload["count"] == 0
+    assert payload["sources"]["registry_pending"] == 0
+
+
+def test_briefing_queue_suppresses_pending_item_with_active_delegated_task(tmp_path):
+    helper = load_script("jarvis_briefing_queue.py")
+    import sqlite3
+    db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    conn.execute("INSERT INTO tasks VALUES (?, ?)", ("t_44444444", "ready"))
+    conn.commit()
+    conn.close()
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps({
+            "items": [
+                {"id": "delegated", "title": "Worker has it", "status": "pending", "delegated_task_id": "t_44444444"},
+                {"id": "plain", "title": "Still needs Mohib", "status": "pending"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    items = helper.load_registry(path=registry, kanban_db=db)
+    titles = {item["title"] for item in items}
+
+    assert "Worker has it" not in titles
+    assert "Still needs Mohib" in titles
+
+
+def test_action_board_render_places_in_flight_items_in_delegated_section():
+    board = load_script("mohib_action_board.py")
+    text = board.render([
+        {"id": "pending", "title": "Needs Mohib", "profile": "default", "status": "pending"},
+        {"id": "delegated", "title": "Worker has it", "profile": "default", "status": "in-flight", "delegated_task_id": "t_44444444"},
+    ])
+
+    assert "== WAITING ON YOU (undated) ==" in text
+    assert "☐ Needs Mohib" in text
+    assert "== IN PROCESS / DELEGATED ==" in text
+    assert "🔄 Worker has it  [default] → t_44444444" in text
+
+
 def test_briefing_helper_cli_no_kanban_outputs_one_spoken_line(tmp_path):
     root = tmp_path / "hermes"
     state = root / "state"

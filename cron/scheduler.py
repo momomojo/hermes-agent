@@ -1302,6 +1302,33 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
+def _record_no_agent_watchdog(
+    job: dict,
+    *,
+    status: str,
+    output: str = "",
+    error: str | None = None,
+) -> str:
+    """Record no-agent watchdog output and return archive-only metadata.
+
+    Ledger failures must never break the watchdog path: a broken monitor should
+    still alert, and a healthy monitor should still deliver/suppress exactly as
+    it did before the ledger existed.
+    """
+    try:
+        from cron.watchdog_ledger import format_watchdog_metadata, record_watchdog_result
+
+        result = record_watchdog_result(job, status=status, output=output, error=error)
+        return format_watchdog_metadata(result)
+    except Exception as exc:  # pragma: no cover - defensive safety net
+        logger.warning(
+            "Job '%s' (no_agent): failed to update watchdog ledger: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        return ""
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1364,6 +1391,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Script crashed / timed out / exited non-zero.  Deliver the
             # error so the user knows the watchdog itself broke — silent
             # failure for an alerting job is the worst-case outcome.
+            watchdog_metadata = _record_no_agent_watchdog(
+                job, status="error", output=output, error=output
+            )
             alert = (
                 f"⚠ Cron watchdog '{job_name}' script failed\n\n"
                 f"{output}\n\n"
@@ -1374,6 +1404,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Job ID:** {job_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
+                f"{watchdog_metadata}"
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
@@ -1385,31 +1416,41 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.info(
                 "Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id
             )
+            watchdog_metadata = _record_no_agent_watchdog(
+                job, status="silent", output=output
+            )
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
+                f"{watchdog_metadata}"
                 f"**Status:** silent (wakeAgent=false)\n"
             )
             return True, silent_doc, SILENT_MARKER, None
 
         if not output.strip():
             logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
+            watchdog_metadata = _record_no_agent_watchdog(
+                job, status="silent", output=output
+            )
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
+                f"{watchdog_metadata}"
                 f"**Status:** silent (empty output)\n"
             )
             return True, silent_doc, SILENT_MARKER, None
 
+        watchdog_metadata = _record_no_agent_watchdog(job, status="ok", output=output)
         doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
             f"**Run Time:** {now_iso}\n"
-            f"**Mode:** no_agent (script)\n\n"
+            f"**Mode:** no_agent (script)\n"
+            f"{watchdog_metadata}\n"
             f"---\n\n"
             f"{output}\n"
         )

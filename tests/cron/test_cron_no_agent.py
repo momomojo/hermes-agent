@@ -35,6 +35,8 @@ def hermes_env(tmp_path, monkeypatch):
     importlib.reload(cron.jobs)
     import cron.scheduler
     importlib.reload(cron.scheduler)
+    import cron.watchdog_ledger
+    importlib.reload(cron.watchdog_ledger)
 
     return home
 
@@ -208,6 +210,14 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+    assert "**Watchdog Changed:** true" in doc
+
+    from cron.watchdog_ledger import load_watchdog_record
+
+    record = load_watchdog_record(job["id"])
+    assert record is not None
+    assert record["last_status"] == "ok"
+    assert record["last_reason"] == "first_seen"
 
 
 def test_run_job_no_agent_empty_output_is_silent(hermes_env):
@@ -225,6 +235,13 @@ def test_run_job_no_agent_empty_output_is_silent(hermes_env):
     assert success is True
     assert error is None
     assert final_response == SILENT_MARKER
+    assert "**Watchdog Reason:** first_seen" in doc
+
+    from cron.watchdog_ledger import load_watchdog_record
+
+    record = load_watchdog_record(job["id"])
+    assert record is not None
+    assert record["last_status"] == "silent"
 
 
 def test_run_job_no_agent_wake_gate_is_silent(hermes_env):
@@ -241,6 +258,13 @@ def test_run_job_no_agent_wake_gate_is_silent(hermes_env):
     success, doc, final_response, error = run_job(job)
     assert success is True
     assert final_response == SILENT_MARKER
+    assert "**Watchdog Changed:** true" in doc
+
+    from cron.watchdog_ledger import load_watchdog_record
+
+    record = load_watchdog_record(job["id"])
+    assert record is not None
+    assert record["last_status"] == "silent"
 
 
 def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
@@ -259,6 +283,13 @@ def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
     assert error is not None
     assert "oops" in final_response or "exited with code 3" in final_response
     assert "Cron watchdog" in final_response  # alert header
+    assert "**Watchdog Reason:** first_seen" in doc
+
+    from cron.watchdog_ledger import load_watchdog_record
+
+    record = load_watchdog_record(job["id"])
+    assert record is not None
+    assert record["last_status"] == "error"
 
 
 def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
