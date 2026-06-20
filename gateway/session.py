@@ -21,6 +21,13 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+RESUME_PENDING_MAX_AGE_SECONDS = int(
+    os.environ.get("HERMES_RESUME_PENDING_MAX_AGE_SECONDS", "300")
+)
+RESUME_PENDING_MAX_PROMPT_TOKENS = int(
+    os.environ.get("HERMES_RESUME_PENDING_MAX_PROMPT_TOKENS", "80000")
+)
+
 
 def _now() -> datetime:
     """Return the current local time."""
@@ -863,6 +870,24 @@ class SessionStore:
                 return "daily"
         
         return None
+
+    def _resume_pending_reset_reason(self, entry: SessionEntry, now: datetime) -> Optional[str]:
+        """Return a reset reason when a restart-resume would be too stale/heavy."""
+        marked_at = entry.last_resume_marked_at or entry.updated_at
+        try:
+            age_seconds = (now - marked_at).total_seconds()
+        except TypeError:
+            # Guard mixed aware/naive datetimes from old session files.
+            age_seconds = RESUME_PENDING_MAX_AGE_SECONDS + 1
+        if age_seconds > RESUME_PENDING_MAX_AGE_SECONDS:
+            return "resume_too_old"
+        try:
+            prompt_tokens = int(entry.last_prompt_tokens or 0)
+        except (TypeError, ValueError):
+            prompt_tokens = 0
+        if prompt_tokens >= RESUME_PENDING_MAX_PROMPT_TOKENS:
+            return "resume_context_cap"
+        return None
     
     def has_any_sessions(self) -> bool:
         """Check if any sessions have ever been created (across all platforms).
@@ -920,15 +945,19 @@ class SessionStore:
                 if entry.suspended:
                     reset_reason = "suspended"
                 elif entry.resume_pending:
-                    # Restart-interrupted session: preserve the session_id
-                    # and return the existing entry so the transcript
-                    # reloads intact.  ``resume_pending`` is cleared after
-                    # the NEXT successful turn completes (not here), which
-                    # means a re-interrupted retry keeps trying — the
-                    # stuck-loop counter handles terminal escalation.
-                    entry.updated_at = now
-                    self._save()
-                    return entry
+                    resume_reset_reason = self._resume_pending_reset_reason(entry, now)
+                    if resume_reset_reason:
+                        reset_reason = resume_reset_reason
+                    else:
+                        # Restart-interrupted session: preserve the session_id
+                        # and return the existing entry so the transcript
+                        # reloads intact.  ``resume_pending`` is cleared after
+                        # the NEXT successful turn completes (not here), which
+                        # means a re-interrupted retry keeps trying — the
+                        # stuck-loop counter handles terminal escalation.
+                        entry.updated_at = now
+                        self._save()
+                        return entry
                 else:
                     reset_reason = self._should_reset(entry, source)
                 if not reset_reason:

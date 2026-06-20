@@ -32,7 +32,13 @@ STATE_PATH = BASE / "state.json"
 HISTORY_PATH = BASE / "history.jsonl"
 HTML_PATH = BASE / "index.html"
 LOG_PATH = HOME / "logs" / "hermes_health_guard.log"
+LOG_MAX_BYTES = int(os.environ.get("HERMES_HEALTH_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+LAUNCHD_LOG_PATHS = [
+    Path(os.environ.get("HERMES_HEALTH_LAUNCHD_STDOUT_PATH", str(HOME / "logs" / "hermes_health_guard.launchd.log"))),
+    Path(os.environ.get("HERMES_HEALTH_LAUNCHD_STDERR_PATH", str(HOME / "logs" / "hermes_health_guard.launchd.err"))),
+]
 NOTIFY_STATE_PATH = BASE / "notify_state.json"
+KANBAN_FLOW_STATE_PATH = BASE / "kanban_flow_state.json"
 NOTIFY_WEBHOOK_URL = os.environ.get(
     "HERMES_HEALTH_WEBHOOK_URL", "http://127.0.0.1:8648/webhooks/health-guard"
 )
@@ -80,6 +86,9 @@ PROVIDER_HEALTH_DETAIL_MAX_CHARS = 160
 # than this survived the 04:15 nightly autocommit, so the autocommit is
 # aborting or failing.
 MANAGED_DRIFT_MAX_AGE_H = float(os.environ.get("HERMES_MANAGED_DRIFT_MAX_AGE_H", "30.0"))
+KANBAN_ZERO_RUNNABLE_HOURS = float(os.environ.get("HERMES_KANBAN_ZERO_RUNNABLE_HOURS", "24.0"))
+KANBAN_BLOCKED_BACKLOG_THRESHOLD = int(os.environ.get("HERMES_KANBAN_BLOCKED_BACKLOG_THRESHOLD", "20"))
+KANBAN_RUNNABLE_STATUSES = {"triage", "todo", "ready", "running"}
 
 
 def _now() -> str:
@@ -148,10 +157,14 @@ def _pid_alive(pid: Any) -> bool:
 def _profile_names() -> list[str]:
     configured = os.environ.get("HERMES_HEALTH_PROFILES", "").strip()
     if configured:
-        return [p.strip() for p in configured.split(",") if p.strip()]
+        return [p.strip() for p in configured.split(",") if p.strip() and p.strip() != "default"]
 
     profiles_dir = HOME / "profiles"
-    names = [p.name for p in profiles_dir.iterdir() if p.is_dir()] if profiles_dir.exists() else []
+    names = [
+        p.name
+        for p in profiles_dir.iterdir()
+        if p.is_dir() and p.name != "default"
+    ] if profiles_dir.exists() else []
     found = set(names)
     ordered = [name for name in DEFAULT_EXPECTED_PROFILES if name in found]
     ordered.extend(sorted(found - set(ordered)))
@@ -244,7 +257,7 @@ def _disabled_platforms(profile: str | None) -> set[str]:
 def _launchd_service_pid(profile: str | None) -> int | None:
     """Live pid from launchd for the profile's gateway service, or None."""
     label = "ai.hermes.gateway" if not profile or profile == "default" else f"ai.hermes.gateway-{profile}"
-    result = _run(["launchctl", "print", f"gui/501/{label}"], timeout=10)
+    result = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=10)
     if not result["ok"]:
         return None
     m = re.search(r"^\s*pid = (\d+)", result["stdout"], re.MULTILINE)
@@ -355,7 +368,7 @@ def _check_launchd_jobs() -> list[str]:
     """One failure line per critical launchd job whose last run exited nonzero."""
     failures: list[str] = []
     for job in CRITICAL_LAUNCHD_JOBS:
-        result = _run(["launchctl", "print", f"gui/501/{job}"], timeout=10)
+        result = _run(["launchctl", "print", f"gui/{os.getuid()}/{job}"], timeout=10)
         if not result["ok"]:
             failures.append(f"launchd job missing: {job}")
             continue
@@ -706,6 +719,66 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
     return failures
 
 
+def _check_kanban_flow() -> dict[str, Any]:
+    """Detect a starved Kanban board: blocked backlog but no runnable work."""
+    result = _run(_hermes_cmd(None, "kanban", "stats", "--json"), timeout=30)
+    payload = _parse_json_output(result)
+    if not result["ok"] or not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "failures": [f"kanban flow stats failed: {result.get('stderr') or result.get('stdout') or 'invalid stats output'}"],
+            "by_status": {},
+        }
+
+    by_status = payload.get("by_status") if isinstance(payload.get("by_status"), dict) else {}
+    runnable = sum(int(by_status.get(status) or 0) for status in KANBAN_RUNNABLE_STATUSES)
+    blocked = int(by_status.get("blocked") or 0)
+    now_ts = time.time()
+
+    try:
+        state = json.loads(KANBAN_FLOW_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+
+    active = runnable == 0 and blocked >= KANBAN_BLOCKED_BACKLOG_THRESHOLD
+    if active:
+        first_seen = float(state.get("zero_runnable_since") or now_ts)
+    else:
+        first_seen = None
+
+    next_state = {
+        "updated_at": _now(),
+        "zero_runnable_since": first_seen,
+        "runnable": runnable,
+        "blocked": blocked,
+        "by_status": by_status,
+    }
+    KANBAN_FLOW_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = KANBAN_FLOW_STATE_PATH.with_suffix(KANBAN_FLOW_STATE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(next_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(KANBAN_FLOW_STATE_PATH)
+
+    failures: list[str] = []
+    if active and first_seen is not None:
+        age_hours = (now_ts - first_seen) / 3600.0
+        if age_hours >= KANBAN_ZERO_RUNNABLE_HOURS:
+            failures.append(
+                "kanban flow starved: "
+                f"0 runnable tasks for {age_hours:.1f}h while {blocked} task(s) remain blocked"
+            )
+
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "by_status": by_status,
+        "runnable": runnable,
+        "blocked": blocked,
+        "zero_runnable_since": first_seen,
+    }
+
+
 def collect_health() -> dict[str, Any]:
     profiles = _profile_names()
     preflight_profiles = [None, *profiles]
@@ -713,6 +786,7 @@ def collect_health() -> dict[str, Any]:
     preflights = [_check_kanban_preflight(profile) for profile in preflight_profiles]
     gateways = [_check_gateway_state(profile) for profile in gateway_profiles]
     listeners = [_check_listener(name, port) for name, port in sorted(CRITICAL_LISTENERS.items())]
+    kanban_flow = _check_kanban_flow()
     failures: list[str] = []
 
     for item in preflights:
@@ -724,6 +798,7 @@ def collect_health() -> dict[str, Any]:
     for item in listeners:
         if not item["ok"]:
             failures.append(f"listener down: {item['name']} (127.0.0.1:{item['port']}): {item['error']}")
+    failures.extend(kanban_flow.get("failures") or [])
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
     failures.extend(_check_launchd_jobs())
@@ -761,6 +836,7 @@ def collect_health() -> dict[str, Any]:
         "preflights": preflights,
         "gateways": gateways,
         "listeners": listeners,
+        "kanban_flow": kanban_flow,
         "provider_health": _provider_health_summary(),
         "hindsight_checks": _check_hindsight_configs(profiles),
     }
@@ -892,23 +968,65 @@ def _notify_if_changed(payload: dict[str, Any]) -> None:
         _write_json(NOTIFY_STATE_PATH, current)
 
 
+def _rotate_if_large(path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size < max_bytes:
+        return
+    rotated = path.with_suffix(path.suffix + ".1")
+    try:
+        rotated.unlink(missing_ok=True)
+        path.replace(rotated)
+    except OSError:
+        pass
+
+
+def _previous_state() -> dict[str, Any] | None:
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _same_failure_set(previous: dict[str, Any] | None, payload: dict[str, Any]) -> bool:
+    if not previous:
+        return False
+    return (
+        previous.get("level") == payload.get("level")
+        and sorted(previous.get("failures") or []) == sorted(payload.get("failures") or [])
+    )
+
+
 def main() -> int:
+    previous = _previous_state()
     payload = collect_health()
+    unchanged = _same_failure_set(previous, payload)
     _write_json(STATE_PATH, payload)
     _append_history(payload)
     _write_html(payload)
     _notify_if_changed(payload)
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_if_large(LOG_PATH)
+    for path in LAUNCHD_LOG_PATHS:
+        _rotate_if_large(path)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(f"{payload['timestamp']} {payload['level']} failures={len(payload['failures'])}\n")
-        for failure in payload["failures"]:
-            fh.write(f"  {failure}\n")
+        suffix = " unchanged" if unchanged and payload["failures"] else ""
+        fh.write(f"{payload['timestamp']} {payload['level']} failures={len(payload['failures'])}{suffix}\n")
+        if not unchanged:
+            for failure in payload["failures"]:
+                fh.write(f"  {failure}\n")
     if payload["ok"]:
         print(f"OK Hermes health guard: {STATE_PATH}")
         return 0
     print(f"FAIL Hermes health guard: {STATE_PATH}", file=sys.stderr)
-    for failure in payload["failures"]:
-        print(f"- {failure}", file=sys.stderr)
+    if unchanged:
+        print("- failure set unchanged; see state.json/html for details", file=sys.stderr)
+    else:
+        for failure in payload["failures"]:
+            print(f"- {failure}", file=sys.stderr)
     return 2
 
 

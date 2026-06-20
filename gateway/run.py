@@ -8016,6 +8016,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
+            elif reset_reason == "resume_too_old":
+                context_note = "[System note: A gateway restart left the previous session pending for too long, so this is a fresh conversation with no prior context. Answer the latest user message directly.]"
+            elif reset_reason == "resume_context_cap":
+                context_note = "[System note: A gateway restart left a very large previous session pending, so this is a fresh conversation with no prior context. Answer the latest user message directly.]"
             elif reset_reason == "daily":
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
@@ -8033,9 +8037,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended sessions always notify (they were explicitly stopped
-                # or crashed mid-operation) — skip the policy check.
-                should_notify = reset_reason == "suspended" or (
+                # Suspended/capped restart-resume sessions always notify (they
+                # were explicitly stopped, crashed mid-operation, or were too
+                # stale/heavy to resume responsively) — skip the policy check.
+                should_notify = reset_reason in {"suspended", "resume_too_old", "resume_context_cap"} or (
                     policy.notify
                     and had_activity
                     and platform_name not in policy.notify_exclude_platforms
@@ -8045,6 +8050,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if adapter:
                         if reset_reason == "suspended":
                             reason_text = "previous session was stopped or interrupted"
+                        elif reset_reason == "resume_too_old":
+                            reason_text = "interrupted restart resume was older than the live-response cap"
+                        elif reset_reason == "resume_context_cap":
+                            reason_text = "interrupted restart resume was too large to continue responsively"
                         elif reset_reason == "daily":
                             reason_text = f"daily schedule at {policy.at_hour}:00"
                         else:
