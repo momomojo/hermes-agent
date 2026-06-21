@@ -112,6 +112,22 @@ class TestCmdUpdatePip:
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
+    def test_update_fork_preflight_dispatches_without_live_update(self, mock_args):
+        from hermes_cli import main as hm
+
+        args = SimpleNamespace(fork_preflight=True)
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("hermes_cli.config.detect_install_method", return_value="git"), \
+             patch(
+                 "hermes_cli.fork_update_guard.cmd_fork_update_preflight",
+                 return_value=0,
+             ) as preflight, \
+             patch.object(hm, "_cmd_update_impl") as impl:
+            cmd_update(args)
+
+        preflight.assert_called_once_with(args, repo_root=PROJECT_ROOT)
+        impl.assert_not_called()
+
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_falls_back_to_main_when_branch_not_on_remote(

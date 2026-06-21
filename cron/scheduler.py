@@ -30,7 +30,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -855,32 +855,45 @@ _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _get_script_timeout() -> int:
+def _coerce_positive_timeout(value: Any, source: str) -> Optional[int]:
+    try:
+        timeout = int(float(value))
+    except Exception:
+        logger.warning("Invalid %s=%r; using next cron script timeout source", source, value)
+        return None
+    if timeout > 0:
+        return timeout
+    logger.warning("Invalid %s=%r; using next cron script timeout source", source, value)
+    return None
+
+
+def _get_script_timeout(job: Optional[dict[str, Any]] = None) -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
-        try:
-            timeout = int(float(_SCRIPT_TIMEOUT))
-            if timeout > 0:
+        timeout = _coerce_positive_timeout(_SCRIPT_TIMEOUT, "patched _SCRIPT_TIMEOUT")
+        if timeout:
+            return timeout
+
+    if job:
+        configured = job.get("script_timeout_seconds")
+        if configured is not None:
+            timeout = _coerce_positive_timeout(configured, "job.script_timeout_seconds")
+            if timeout:
                 return timeout
-        except Exception:
-            logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
     env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
-        try:
-            timeout = int(float(env_value))
-            if timeout > 0:
-                return timeout
-        except Exception:
-            logger.warning("Invalid HERMES_CRON_SCRIPT_TIMEOUT=%r; using config/default", env_value)
+        timeout = _coerce_positive_timeout(env_value, "HERMES_CRON_SCRIPT_TIMEOUT")
+        if timeout:
+            return timeout
 
     try:
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
         configured = cron_cfg.get("script_timeout_seconds")
         if configured is not None:
-            timeout = int(float(configured))
-            if timeout > 0:
+            timeout = _coerce_positive_timeout(configured, "cron.script_timeout_seconds")
+            if timeout:
                 return timeout
     except Exception as exc:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
@@ -888,7 +901,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, timeout_s: Optional[int] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -940,7 +953,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = timeout_s if timeout_s and timeout_s > 0 else _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -968,12 +981,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     try:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        env = os.environ.copy()
+        env["HERMES_CRON_SCRIPT_TIMEOUT_SECONDS"] = str(script_timeout)
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
+            env=env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -1056,7 +1072,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, timeout_s=_get_script_timeout(job))
         if success:
             if script_output:
                 prompt = (
@@ -1377,7 +1393,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, timeout_s=_get_script_timeout(job))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1480,7 +1496,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, timeout_s=_get_script_timeout(job))
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
