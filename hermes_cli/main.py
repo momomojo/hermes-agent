@@ -8104,6 +8104,14 @@ def cmd_update(args):
         print(format_docker_update_message())
         sys.exit(1)
 
+    if getattr(args, "fork_preflight", False):
+        from hermes_cli.fork_update_guard import cmd_fork_update_preflight
+
+        rc = cmd_fork_update_preflight(args, repo_root=PROJECT_ROOT)
+        if rc:
+            sys.exit(rc)
+        return
+
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.

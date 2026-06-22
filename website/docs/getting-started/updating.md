@@ -59,6 +59,31 @@ hermes update --check --branch experimental   # preview behindness only
 
 If your local checkout is on a different branch, Hermes auto-stashes any uncommitted work, switches HEAD to the target branch, and then pulls. Branches that don't exist locally are auto-tracked from `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches that don't exist anywhere fail cleanly — your stashed changes are restored before exit so you're never stranded in a weird state. The `main`-only fork-upstream sync logic is automatically skipped on non-`main` branches.
 
+### Fork/device branch preflight: `--fork-preflight`
+
+Forked installs and per-device branches should reconcile upstream drift before mutating the live checkout. Run a preflight first:
+
+```bash
+hermes update --fork-preflight
+# or, from another branch:
+hermes update --fork-preflight --branch mohib/mac-mini-hermes
+```
+
+The preflight creates a runtime quick snapshot, fetches the fork (`origin/<branch>`) and upstream (`upstream/main` by default), rehearses the reconcile in a temporary git worktree, and writes a Markdown report under `~/.hermes/updates/reconcile-reports/`. It does **not** pull, reset, push, reinstall dependencies, or restart gateways.
+
+Review the report before applying anything live. A clean report gives the exact follow-up command:
+
+```bash
+hermes update --branch <branch-from-report>
+```
+
+Useful options:
+
+- `--upstream-branch <name>` — compare/rehearse against a non-`main` upstream branch.
+- `--fork-strategy merge|rebase` — choose the temporary-worktree rehearsal strategy; default is `merge`.
+- `--report <path>` — write the report to a specific location.
+- `--no-fetch` — use existing refs, useful for offline review after a manual fetch.
+
 ### Local changes on non-interactive updates
 
 When you run `hermes update` in a terminal, Hermes stashes any uncommitted source-tree changes, pulls, then **asks** whether to restore them — exactly as it always has. Nothing changes for interactive updates.
