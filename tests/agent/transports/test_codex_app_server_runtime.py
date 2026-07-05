@@ -256,6 +256,7 @@ class TestSpawnEnvIsolation:
             def __init__(self, cmd, *args, **kwargs):
                 captured["cmd"] = list(cmd)
                 captured["env"] = kwargs.get("env", {}).copy()
+                captured["preexec_fn"] = kwargs.get("preexec_fn")
                 self.stdin = None
                 self.stdout = None
                 self.stderr = None

@@ -316,8 +316,30 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # Timeout knobs (config.yaml `codex_app_server:` section, all optional):
+    #   idle_timeout_seconds  — silence budget; any codex event resets it
+    #                           (default 600)
+    #   max_turn_seconds      — hard wall-clock cap, 0 = unbounded (default)
+    #   post_tool_quiet_seconds — wedge watchdog after a tool result
+    #                           (default 90)
+    _cas_cfg: Dict[str, Any] = {}
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from hermes_cli.config import load_config as _load_cas_cfg
+        _raw = (_load_cas_cfg() or {}).get("codex_app_server")
+        if isinstance(_raw, dict):
+            _cas_cfg = _raw
+    except Exception:
+        _cas_cfg = {}
+
+    try:
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=float(_cas_cfg.get("idle_timeout_seconds", 600.0)),
+            turn_max_seconds=float(_cas_cfg.get("max_turn_seconds", 0.0)),
+            post_tool_quiet_timeout=float(
+                _cas_cfg.get("post_tool_quiet_seconds", 90.0)
+            ),
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

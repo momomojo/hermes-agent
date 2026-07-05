@@ -40,6 +40,8 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -1462,6 +1464,68 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    @staticmethod
+    def _is_jarvis_briefing_request(gateway_session_key: Optional[str], user_message: str) -> bool:
+        """Return True for the bounded Jarvis BRIEFING fast path.
+
+        This deliberately matches only the voice lane's top-level briefing
+        command. Verdict turns (approve/skip/defer/details) still go through the
+        normal agent loop because they may need durable mutations.
+        """
+        if (gateway_session_key or "").strip().lower() != "jarvis":
+            return False
+        text = " ".join((user_message or "").strip().lower().split())
+        return text in {"briefing", "what needs me", "what needs me?"}
+
+    async def _run_jarvis_briefing_fastpath(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        gateway_session_key: Optional[str],
+    ) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Return a bounded BRIEFING response without entering the LLM/tool loop.
+
+        The helper script reads only Mohib's action registry plus one filtered
+        blocked-card list. If it is missing or fails, callers fall back to the
+        ordinary agent path instead of breaking Jarvis.
+        """
+        if not self._is_jarvis_briefing_request(gateway_session_key, user_message):
+            return None
+        script = Path.home() / ".hermes" / "scripts" / "jarvis_briefing_queue.py"
+        if not script.exists():
+            logger.warning("Jarvis briefing fast path helper missing: %s", script)
+            return None
+        python = sys.executable or "python3"
+
+        def _run_helper() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [python, str(script), "--spoken"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+
+        try:
+            proc = await asyncio.to_thread(_run_helper)
+            final_response = (proc.stdout or "").strip()
+        except Exception as exc:
+            logger.warning("Jarvis briefing fast path failed; falling back to agent: %s", exc)
+            return None
+        if not final_response:
+            return None
+        db = self._ensure_session_db()
+        if db is not None:
+            try:
+                db.append_message(session_id, "user", user_message)
+                db.append_message(session_id, "assistant", final_response, finish_reason="jarvis_briefing_fastpath")
+            except Exception as exc:
+                logger.warning("Failed to persist Jarvis briefing fast path turn for %s: %s", session_id, exc)
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "fast_path": "jarvis_briefing"}
+        return {"session_id": session_id, "final_response": final_response}, usage
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -1666,14 +1730,22 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
+        fastpath = await self._run_jarvis_briefing_fastpath(
             session_id=session_id,
+            user_message=user_message,
             gateway_session_key=gateway_session_key,
         )
+        if fastpath is not None:
+            result, usage = fastpath
+        else:
+            history = self._conversation_history_for_session(session_id)
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}

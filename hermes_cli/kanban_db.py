@@ -2535,6 +2535,25 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+        if skills_list and assignee:
+            try:
+                from tools.skill_reference_guard import validate_task_skills_for_profile
+
+                missing = validate_task_skills_for_profile(
+                    skills_list,
+                    assignee,
+                    allow_uninitialized_home=True,
+                    allow_missing_profile=True,
+                )
+            except Exception:
+                missing = []
+            if missing:
+                names = ", ".join(sorted({m["name"] for m in missing}))
+                raise ValueError(
+                    f"unknown skill(s) for assignee profile {assignee!r}: {names}. "
+                    "Install/restore the skill in that profile, choose a different "
+                    "assignee, or remove the forced skill from the task."
+                )
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -2771,6 +2790,21 @@ def list_tasks(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+def preflight_skill_references(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Validate non-terminal task skill references against assignee profiles."""
+    try:
+        from tools.skill_reference_guard import kanban_preflight
+
+        return kanban_preflight(conn)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "checked_tasks": 0,
+            "missing": [],
+            "error": str(exc),
+        }
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -3984,6 +4018,9 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    completion_source: Optional[str] = None,
+    completed_by: Optional[str] = None,
+    worker_session_id: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4014,6 +4051,20 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    completion_source = (
+        completion_source
+        or ("worker" if expected_run_id is not None else "manual")
+    )
+    completed_by = (
+        completed_by
+        or os.environ.get("HERMES_PROFILE")
+        or ("worker" if completion_source == "worker" else "manual")
+    )
+    if worker_session_id is None and isinstance(metadata, dict):
+        raw_session = metadata.get("worker_session_id")
+        if isinstance(raw_session, str) and raw_session.strip():
+            worker_session_id = raw_session.strip()
+    worker_session_id = worker_session_id or os.environ.get("HERMES_SESSION_ID")
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4106,6 +4157,12 @@ def complete_task(
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "completion_source": completion_source,
+            "completed_by": completed_by,
+            "worker_session_id": worker_session_id or None,
+            "run_id": run_id,
+            "expected_run_id": int(expected_run_id) if expected_run_id is not None else None,
+            "evidence_present": bool(ev_summary or result or metadata),
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
@@ -5722,6 +5779,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    skill_blocked: list[dict[str, Any]] = field(default_factory=list)
+    """Tasks blocked before spawn because forced skills cannot resolve."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -7066,6 +7125,73 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    def _missing_skills_for_spawn(
+        task_id: str,
+        assignee: Optional[str],
+        skills: Optional[Iterable[str]],
+    ) -> list[dict[str, Any]]:
+        if spawn_fn is not None and spawn_fn is not _default_spawn:
+            # Test/custom spawn functions may not invoke the Hermes CLI at all.
+            # The production gateway/CLI path uses _default_spawn, which is the
+            # path where an unresolved --skills flag is fatal at startup.
+            return []
+        try:
+            from tools.skill_reference_guard import validate_task_skills_for_profile
+
+            spawn_skills = _default_spawn_skill_names(assignee, skills)
+            missing = validate_task_skills_for_profile(
+                spawn_skills,
+                assignee,
+                allow_uninitialized_home=False,
+                allow_missing_profile=True,
+            )
+            for item in missing:
+                item.setdefault("task_id", task_id)
+                item.setdefault("source", "worker.spawn.skills")
+                item.setdefault("spawn_skills", spawn_skills)
+            return missing
+        except Exception as exc:
+            _log.debug("kanban dispatch skill preflight failed: %s", exc, exc_info=True)
+            return []
+
+    def _auto_block_missing_skills(
+        task_id: str,
+        assignee: Optional[str],
+        missing: list[dict[str, Any]],
+        *,
+        review: bool = False,
+    ) -> None:
+        names = sorted({str(item.get("name")) for item in missing if item.get("name")})
+        names_label = ",".join(names)
+        reason = (
+            f"missing-skills:{names_label} profile {assignee or 'default'!r} "
+            "cannot load required skill(s)"
+        )
+        if not dry_run:
+            block_task(conn, task_id, reason=reason)
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "missing_skills_auto_blocked",
+                    {
+                        "assignee": assignee,
+                        "missing": missing,
+                        "skills": names,
+                        "review": bool(review),
+                    },
+                )
+        result.skill_blocked.append(
+            {
+                "task_id": task_id,
+                "assignee": assignee,
+                "missing": missing,
+                "skills": names,
+                "review": bool(review),
+            }
+        )
+        result.auto_blocked.append(task_id)
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -7082,7 +7208,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, skills FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7220,6 +7346,20 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        try:
+            row_skills = json.loads(row["skills"]) if row["skills"] else []
+            if not isinstance(row_skills, list):
+                row_skills = []
+        except Exception:
+            row_skills = []
+        missing_skills = _missing_skills_for_spawn(
+            row["id"],
+            row_assignee,
+            row_skills,
+        )
+        if missing_skills:
+            _auto_block_missing_skills(row["id"], row_assignee, missing_skills)
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -7340,6 +7480,19 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        missing_review_skills = _missing_skills_for_spawn(
+            row["id"],
+            row["assignee"],
+            ["sdlc-review"],
+        )
+        if missing_review_skills:
+            _auto_block_missing_skills(
+                row["id"],
+                row["assignee"],
+                missing_review_skills,
+                review=True,
+            )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -7795,6 +7948,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    if task.goal_mode:
+        # Goal-mode workers must take the fully-quiet single-query path:
+        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
+        # cli.py's quiet branch. Without -Q the worker gets exactly one
+        # turn, prints text, exits rc=0, and the dispatcher records a
+        # protocol violation (incident 2026-06-09 t_d9cbe312).
+        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

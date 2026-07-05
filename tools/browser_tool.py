@@ -4271,6 +4271,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     if session_info:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
+        _drop_browser_registry_session(task_id, session_info)
 
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)

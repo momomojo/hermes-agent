@@ -966,25 +966,38 @@ def run_doctor(args):
                     "(should be under 'model:' section)"
                 )
                 if should_fix:
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # ``setdefault("model", {})`` would return an existing scalar
-                    # and then ``model_section[k] = ...`` would raise TypeError.
-                    raw_model = raw_config.get("model")
-                    if isinstance(raw_model, dict):
-                        model_section = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_section = {"default": raw_model.strip()}
-                        raw_config["model"] = model_section
-                    else:
-                        model_section = {}
-                        raw_config["model"] = model_section
-                    for k in stale_root_keys:
-                        if not model_section.get(k):
-                            model_section[k] = raw_config.pop(k)
+                    from utils import SKIP_WRITE, locked_yaml_mutate
+
+                    def _migrate_stale_keys(cfg: dict):
+                        # Re-derive the stale keys from the fresh read taken
+                        # under the config lock (not the detection read above)
+                        # so the fix composes with concurrent config writers.
+                        keys = [
+                            k for k in ("provider", "base_url")
+                            if k in cfg and isinstance(cfg[k], str)
+                        ]
+                        if not keys:
+                            return SKIP_WRITE
+                        # Coerce scalar/None ``model:`` into a dict before mutation —
+                        # ``setdefault("model", {})`` would return an existing scalar
+                        # and then ``model_section[k] = ...`` would raise TypeError.
+                        raw_model = cfg.get("model")
+                        if isinstance(raw_model, dict):
+                            model_section = raw_model
+                        elif isinstance(raw_model, str) and raw_model.strip():
+                            model_section = {"default": raw_model.strip()}
+                            cfg["model"] = model_section
                         else:
-                            raw_config.pop(k)
-                    from utils import atomic_yaml_write
-                    atomic_yaml_write(config_path, raw_config)
+                            model_section = {}
+                            cfg["model"] = model_section
+                        for k in keys:
+                            if not model_section.get(k):
+                                model_section[k] = cfg.pop(k)
+                            else:
+                                cfg.pop(k)
+                        return None
+
+                    locked_yaml_mutate(config_path, _migrate_stale_keys)
                     check_ok("Migrated stale root-level keys into model section")
                     fixed_count += 1
                 else:

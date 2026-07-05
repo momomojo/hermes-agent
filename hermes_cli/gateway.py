@@ -81,6 +81,26 @@ class ProfileGatewayProcess:
     pid: int
 
 
+@dataclass(frozen=True)
+class LaunchdGatewayService:
+    profile: str
+    label: str
+    plist_path: Path
+
+
+@dataclass(frozen=True)
+class LaunchdGatewayConvergenceRow:
+    profile: str
+    label: str
+    plist_path: Path
+    domain: str
+    pid: int | None
+    started_at: str | None
+    started_after_head: bool | None
+    ok: bool
+    error: str | None = None
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -1240,6 +1260,64 @@ def _probe_launchd_service_running() -> bool:
     return _parse_launchd_pid_from_list_output(result.stdout) is not None
 
 
+def _parse_launchd_list_pid(output: str | None) -> int | None:
+    match = re.search(r'"PID"\s*=\s*(\d+);', output or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _process_parent_pid(pid: int) -> int | None:
+    try:
+        ps_result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if ps_result.returncode == 0:
+            return int(ps_result.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+def _launchd_managed_pid() -> int | None:
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", get_launchd_label()],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    pid = _parse_launchd_list_pid(result.stdout)
+    if pid is None:
+        return None
+    return pid if _process_parent_pid(pid) == 1 else None
+
+
+def _wait_for_launchd_managed_gateway(
+    *, previous_pid: int | None = None, timeout: float = 3.0
+) -> int | None:
+    """Return a launchd-supervised replacement PID if one appears quickly."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pid = _launchd_managed_pid()
+        if pid is not None and (previous_pid is None or pid != previous_pid):
+            return pid
+        time.sleep(0.3)
+    return None
+
+
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
     """Return a unified view of gateway liveness for the current profile."""
     gateway_pids = tuple(find_gateway_pids())
@@ -1348,6 +1426,16 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
         print(f"  PID(s): {_format_gateway_pids(snapshot.gateway_pids, limit=None)}")
         print("  This is usually a manual foreground/tmux/nohup run, so `hermes gateway`")
         print("  can refuse to start another copy until this process stops.")
+
+
+def _print_runtime_health() -> None:
+    runtime_lines = _runtime_health_lines()
+    if not runtime_lines:
+        return
+    print()
+    print("Recent gateway health:")
+    for line in runtime_lines:
+        print(f"  {line}")
 
 
 def _print_other_profiles_gateway_status() -> None:
@@ -3369,12 +3457,7 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
     if configured_user:
         print(f"Configured to run as: {configured_user}")
 
-    runtime_lines = _runtime_health_lines()
-    if runtime_lines:
-        print()
-        print("Recent gateway health:")
-        for line in runtime_lines:
-            print(f"  {line}")
+    _print_runtime_health()
 
     unit_props = _read_systemd_unit_properties(system=system)
     active_state = unit_props.get("ActiveState", "")
@@ -3437,6 +3520,279 @@ def get_launchd_label() -> str:
     """Return the launchd service label, scoped per profile."""
     suffix = _profile_suffix()
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+
+
+def _profile_from_launchd_label(label: str) -> str:
+    if label == "ai.hermes.gateway":
+        return "default"
+    prefix = "ai.hermes.gateway-"
+    if label.startswith(prefix):
+        return label[len(prefix) :]
+    return label
+
+
+def _read_launchd_plist_label(plist_path: Path) -> str | None:
+    try:
+        data = plistlib.loads(plist_path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    label = data.get("Label") if isinstance(data, dict) else None
+    return str(label) if label else None
+
+
+def _launchd_gateway_services() -> list[LaunchdGatewayService]:
+    """Enumerate installed macOS gateway LaunchAgents across all profiles."""
+    agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return []
+
+    services: dict[str, LaunchdGatewayService] = {}
+    for plist_path in sorted(agents_dir.glob("ai.hermes.gateway*.plist")):
+        label = _read_launchd_plist_label(plist_path) or plist_path.stem
+        if label != "ai.hermes.gateway" and not label.startswith("ai.hermes.gateway-"):
+            continue
+        profile = _profile_from_launchd_label(label)
+        services.setdefault(
+            label,
+            LaunchdGatewayService(profile=profile, label=label, plist_path=plist_path),
+        )
+
+    return sorted(
+        services.values(),
+        key=lambda svc: (svc.profile != "default", svc.profile),
+    )
+
+
+def _launchd_domain_for_label(label: str) -> str:
+    """Return the launchd domain that currently manages *label*.
+
+    This is label-aware, unlike ``_launchd_domain()``, whose result is cached
+    for the active profile. Fleet convergence must probe each profile label
+    independently or a loaded default gateway can mask an unloaded profile.
+    """
+    uid = os.getuid()
+    gui_domain = f"gui/{uid}"
+    user_domain = f"user/{uid}"
+    for domain in (gui_domain, user_domain):
+        try:
+            subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=True,
+                timeout=5,
+                capture_output=True,
+            )
+            return domain
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "managername"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if "Aqua" in (result.stdout or ""):
+            return gui_domain
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return user_domain
+
+
+def _launchd_pid_for_label(label: str, domain: str | None = None) -> int | None:
+    domains = [domain] if domain else [
+        f"gui/{os.getuid()}",
+        f"user/{os.getuid()}",
+    ]
+    for candidate in domains:
+        if not candidate:
+            continue
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"{candidate}/{label}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        match = re.search(r"^\s*pid = (\d+)", result.stdout or "", re.MULTILINE)
+        if not match:
+            continue
+        try:
+            pid = int(match.group(1))
+        except ValueError:
+            continue
+        if pid > 0:
+            return pid
+    return None
+
+
+def _pid_lstart(pid: int) -> tuple[float | None, str | None]:
+    import time as _time
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None, None
+    try:
+        parsed = datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None, raw
+    return _time.mktime(parsed.timetuple()), raw
+
+
+def _head_commit_epoch() -> int | None:
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int((result.stdout or "").strip())
+    except ValueError:
+        return None
+
+
+def _launchd_gateway_convergence_rows(
+    services: list[LaunchdGatewayService],
+    *,
+    head_epoch: int | None,
+) -> list[LaunchdGatewayConvergenceRow]:
+    rows: list[LaunchdGatewayConvergenceRow] = []
+    for service in services:
+        domain = _launchd_domain_for_label(service.label)
+        pid = _launchd_pid_for_label(service.label, domain)
+        started_epoch = None
+        started_at = None
+        if pid:
+            started_epoch, started_at = _pid_lstart(pid)
+        started_after_head = None
+        if head_epoch is not None and started_epoch is not None:
+            started_after_head = started_epoch >= head_epoch
+        error = None
+        if pid is None:
+            error = "not running"
+        elif started_after_head is False:
+            error = "pid predates active Hermes HEAD"
+        rows.append(
+            LaunchdGatewayConvergenceRow(
+                profile=service.profile,
+                label=service.label,
+                plist_path=service.plist_path,
+                domain=domain,
+                pid=pid,
+                started_at=started_at,
+                started_after_head=started_after_head,
+                ok=error is None,
+                error=error,
+            )
+        )
+    return rows
+
+
+def _print_launchd_gateway_convergence_rows(
+    rows: list[LaunchdGatewayConvergenceRow],
+    *,
+    mode: str,
+    head_epoch: int | None,
+) -> None:
+    print(f"Gateway LaunchAgent convergence ({mode})")
+    if head_epoch is not None:
+        print(
+            "  active_head: "
+            f"{datetime.fromtimestamp(head_epoch).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    if not rows:
+        print("  no ai.hermes.gateway*.plist files found")
+        return
+    seen: set[str] = set()
+    for row in rows:
+        marker = "✓" if row.ok else "✗"
+        freshness = ""
+        if row.started_after_head is True:
+            freshness = " current"
+        elif row.started_after_head is False:
+            freshness = " stale"
+        pid = row.pid if row.pid is not None else "-"
+        started = row.started_at or "-"
+        print(
+            f"  {marker} {row.profile:<16s} label={row.label} "
+            f"pid={pid} domain={row.domain} started={started}{freshness}"
+        )
+        if row.error:
+            print(f"      {row.error}")
+        if row.profile in seen:
+            print("      duplicate profile entry")
+        seen.add(row.profile)
+
+
+def launchd_converge_all_gateways(*, check_only: bool = True) -> bool:
+    """Check or restart every installed macOS profile gateway LaunchAgent."""
+    services = _launchd_gateway_services()
+    head_epoch = _head_commit_epoch()
+
+    if not check_only:
+        for service in services:
+            domain = _launchd_domain_for_label(service.label)
+            target = f"{domain}/{service.label}"
+            if _launchd_pid_for_label(service.label, domain) is None:
+                subprocess.run(
+                    ["launchctl", "bootstrap", domain, str(service.plist_path)],
+                    check=False,
+                    timeout=30,
+                )
+            subprocess.run(
+                ["launchctl", "kickstart", "-k", target],
+                check=True,
+                timeout=90,
+            )
+
+        import time as _time
+
+        deadline = _time.monotonic() + 30.0
+        while _time.monotonic() < deadline:
+            rows = _launchd_gateway_convergence_rows(services, head_epoch=head_epoch)
+            if all(row.ok for row in rows):
+                break
+            _time.sleep(0.5)
+
+        service_pids = {
+            pid
+            for svc in services
+            for pid in [_launchd_pid_for_label(svc.label, _launchd_domain_for_label(svc.label))]
+            if pid is not None
+        }
+        killed = kill_gateway_processes(exclude_pids=service_pids, all_profiles=True)
+        if killed:
+            print(f"✓ Killed {killed} stale detached gateway process(es)")
+
+    rows = _launchd_gateway_convergence_rows(services, head_epoch=head_epoch)
+    _print_launchd_gateway_convergence_rows(
+        rows,
+        mode="check" if check_only else "apply",
+        head_epoch=head_epoch,
+    )
+    return bool(rows) and all(row.ok for row in rows)
 
 
 # Cached launchd domain result — probing is cheap but should only run once per
@@ -4279,8 +4635,17 @@ def launchd_restart():
         if not _launchd_error_indicates_unloaded(e):
             # Not a "job unloaded" code. If the domain is fundamentally
             # unmanageable (error 5), degrade to detached; the old process was
-            # already drained/terminated above. Otherwise re-raise.
+            # already drained/terminated above. First probe launchd because
+            # some macOS builds return exit 5 even though a replacement process
+            # is already supervised.
             if _launchctl_domain_unsupported(e.returncode):
+                managed_pid = _wait_for_launchd_managed_gateway(previous_pid=pid)
+                if managed_pid is not None:
+                    print(
+                        "✓ launchctl reported an error, but launchd is "
+                        f"supervising the replacement gateway (PID {managed_pid})"
+                    )
+                    return
                 _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
                 return
             raise
@@ -4386,6 +4751,8 @@ def launchd_status(deep: bool = False):
         print("  Run: hermes gateway start")
         if fallback_pid:
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
+
+    _print_runtime_health()
 
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
@@ -5147,13 +5514,34 @@ def _runtime_health_lines() -> list[str]:
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
 
-    for platform, pdata in platforms.items():
-        if pdata.get("state") == "fatal":
-            message = pdata.get("error_message") or "unknown error"
-            lines.append(f"⚠ {platform}: {message}")
+    for platform in sorted(platforms):
+        pdata = platforms.get(platform) or {}
+        platform_state = str(pdata.get("state") or "unknown")
+        updated_at = _format_runtime_status_timestamp(pdata.get("updated_at"))
+        suffix = f" ({updated_at})" if updated_at else ""
+        error_code = pdata.get("error_code")
+        error_message = pdata.get("error_message")
+        error_detail = ""
+        if error_code and error_message:
+            error_detail = f" — {error_code}: {error_message}"
+        elif error_message:
+            error_detail = f" — {error_message}"
+        elif error_code:
+            error_detail = f" — {error_code}"
+
+        if platform_state == "connected":
+            lines.append(f"✓ {platform}: connected{suffix}")
+        elif platform_state in {"connecting", "retrying"}:
+            lines.append(f"⏳ {platform}: {platform_state}{error_detail}{suffix}")
+        elif platform_state in {"fatal", "paused", "disconnected"}:
+            lines.append(f"⚠ {platform}: {platform_state}{error_detail}{suffix}")
+        else:
+            lines.append(f"• {platform}: {platform_state}{error_detail}{suffix}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
+    elif gateway_state == "degraded":
+        lines.append("⚠ Gateway runtime is degraded; one or more platforms are reconnecting")
     elif gateway_state == "draining":
         action = "restart" if restart_requested else "shutdown"
         from gateway.status import parse_active_agents
@@ -6790,6 +7178,7 @@ def _gateway_command_inner(args):
         service_available = False
         system = getattr(args, "system", False)
         restart_all = getattr(args, "all", False)
+        check_only = getattr(args, "check", False)
         service_configured = False
 
         # Phase 4: inside a container with s6, dispatch via the service
@@ -6803,6 +7192,14 @@ def _gateway_command_inner(args):
             return
 
         if restart_all:
+            if is_macos():
+                ok = launchd_converge_all_gateways(check_only=check_only)
+                if check_only:
+                    sys.exit(0 if ok else 2)
+                return
+            if check_only:
+                print("gateway restart --all --check is currently implemented for macOS launchd fleets.")
+                sys.exit(2)
             # --all: stop every gateway process across all profiles, then start fresh
             service_stopped = False
             if supports_systemd_services() and (
@@ -6965,12 +7362,7 @@ def _gateway_command_inner(args):
             if pids:
                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
                 print("  (Running manually, not as a system service)")
-                runtime_lines = _runtime_health_lines()
-                if runtime_lines:
-                    print()
-                    print("Recent gateway health:")
-                    for line in runtime_lines:
-                        print(f"  {line}")
+                _print_runtime_health()
                 print()
                 if is_termux():
                     print("Termux note:")
@@ -6994,12 +7386,7 @@ def _gateway_command_inner(args):
                     print("  sudo hermes gateway install --system")
             else:
                 print("✗ Gateway is not running")
-                runtime_lines = _runtime_health_lines()
-                if runtime_lines:
-                    print()
-                    print("Recent gateway health:")
-                    for line in runtime_lines:
-                        print(f"  {line}")
+                _print_runtime_health()
                 print()
                 print("To start:")
                 print("  hermes gateway run      # Run in foreground")
@@ -7029,6 +7416,14 @@ def _gateway_command_inner(args):
 
     elif subcmd == "list":
         _gateway_list()
+
+    elif subcmd == "converge":
+        if not is_macos():
+            print("gateway converge is currently implemented for macOS launchd fleets.")
+            sys.exit(2)
+        apply = getattr(args, "apply", False)
+        ok = launchd_converge_all_gateways(check_only=not apply)
+        sys.exit(0 if ok else 2)
 
     elif subcmd == "migrate-legacy":
         # Stop, disable, and remove legacy Hermes gateway unit files from

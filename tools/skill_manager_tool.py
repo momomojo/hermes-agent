@@ -1007,8 +1007,42 @@ def _patch_skill(
     return result
 
 
+def _archive_skill_dir(skill_dir: Path, name: str) -> Tuple[bool, str]:
+    """Move ``skill_dir`` to its containing skills root's ``.archive`` dir."""
+    skills_root = _containing_skills_root(skill_dir)
+    archive_root = skills_root / ".archive"
+    try:
+        archive_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"failed to create archive dir: {exc}"
+
+    dest = archive_root / skill_dir.name
+    if dest.exists():
+        from datetime import datetime, timezone
+
+        dest = archive_root / (
+            f"{skill_dir.name}-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        )
+    try:
+        skill_dir.rename(dest)
+    except OSError:
+        try:
+            shutil.move(str(skill_dir), str(dest))
+        except Exception as exc:
+            return False, f"failed to archive skill '{name}': {exc}"
+
+    parent = skill_dir.parent
+    try:
+        if parent != skills_root and parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+    return True, f"archived to {dest}"
+
+
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
-    """Delete a skill.
+    """Archive a skill recoverably.
 
     ``absorbed_into`` declares intent:
       - ``None`` / missing  → caller didn't declare (legacy / non-curator path);
@@ -1032,6 +1066,30 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     fail_closed = _curator_consolidation_delete_guard(name, absorbed_into)
     if fail_closed:
         return fail_closed
+
+    try:
+        from tools.skill_reference_guard import collect_protected_references
+
+        protected = collect_protected_references()
+        if name in set(protected.get("protected_names") or []):
+            refs = protected.get("by_name", {}).get(name, [])
+            sources = sorted(
+                {
+                    str(ref.get("source") or "unknown")
+                    for ref in refs
+                    if isinstance(ref, dict)
+                }
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"Skill '{name}' is protected by live references "
+                    f"({', '.join(sources) or 'runtime ABI'}) and cannot be "
+                    "archived or deleted until those references are migrated."
+                ),
+            }
+    except Exception:
+        logger.debug("protected skill lookup failed for %s", name, exc_info=True)
 
     pinned_err = _pinned_guard(name)
     if pinned_err:
@@ -1097,10 +1155,13 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
     shutil.rmtree(skill_dir)
 
-    # Clean up empty category directories (don't remove the skills root itself)
-    parent = skill_dir.parent
-    if parent != skills_root and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+        ok, archive_msg = skill_usage.archive_skill(name)
+    except Exception:
+        logger.debug("skill_usage.archive_skill failed for %s", name, exc_info=True)
+    if not ok:
+        ok, archive_msg = _archive_skill_dir(skill_dir, name)
+    if not ok:
+        return {"success": False, "error": archive_msg}
 
     message = f"Skill '{name}' deleted."
     if is_consolidation:

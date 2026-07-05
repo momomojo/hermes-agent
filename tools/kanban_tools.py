@@ -629,6 +629,11 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    completion_source=(
+                        "worker" if _worker_run_id(tid) is not None else "manual"
+                    ),
+                    completed_by=os.environ.get("HERMES_PROFILE") or "worker",
+                    worker_session_id=os.environ.get("HERMES_SESSION_ID"),
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the

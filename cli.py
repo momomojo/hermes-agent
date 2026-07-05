@@ -8098,16 +8098,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Load + persist via the existing config helpers
         try:
-            from hermes_cli.config import load_config, save_config
+            from hermes_cli.config import config_update, load_config
         except Exception as exc:
             _cprint(f"❌ could not load config: {exc}")
             return
         cfg = load_config()
 
+        def _persist_runtime(mutated_cfg):
+            # Re-apply just the runtime flag in a locked read→modify→save
+            # cycle — persisting the full (possibly stale) `cfg` snapshot
+            # would revert any config change that landed since load_config().
+            with config_update() as fresh:
+                crs.set_runtime(fresh, crs.get_current_runtime(mutated_cfg))
+
         result = crs.apply(
             cfg,
             new_value,
-            persist_callback=(save_config if new_value is not None else None),
+            persist_callback=(_persist_runtime if new_value is not None else None),
         )
 
         prefix = "✓" if result.success else "✗"

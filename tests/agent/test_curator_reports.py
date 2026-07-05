@@ -139,6 +139,48 @@ def test_run_json_has_expected_shape(curator_env):
     assert payload["counts"]["tool_calls_total"] == 3
 
 
+def test_report_records_protected_reference_scan(curator_env):
+    """Reports must show protected skill references and attempted mutations."""
+    curator = curator_env["curator"]
+    start = datetime.now(timezone.utc)
+
+    run_dir = curator._write_run_report(
+        started_at=start,
+        elapsed_seconds=1.0,
+        auto_counts={
+            "checked": 1,
+            "marked_stale": 0,
+            "archived": 0,
+            "reactivated": 0,
+            "protected_skipped": 1,
+        },
+        auto_summary="no changes",
+        before_report=[{"name": "kanban-worker", "state": "active", "pinned": False}],
+        before_names={"kanban-worker"},
+        after_report=[{"name": "kanban-worker", "state": "active", "pinned": False}],
+        llm_meta=_make_llm_meta(
+            tool_calls=[
+                {
+                    "name": "skill_manage",
+                    "arguments": json.dumps({
+                        "action": "delete",
+                        "name": "kanban-worker",
+                        "absorbed_into": "",
+                    }),
+                }
+            ],
+        ),
+    )
+    payload = json.loads((run_dir / "run.json").read_text())
+    md = (run_dir / "REPORT.md").read_text()
+
+    assert "protected_references" in payload
+    assert "kanban-worker" in payload["protected_references"]["protected_names"]
+    assert payload["blocked_mutations"][0]["skill"] == "kanban-worker"
+    assert "Protected skill references" in md
+    assert "blocked curator mutations" in md
+
+
 def test_report_md_is_human_readable(curator_env):
     """REPORT.md should be a valid markdown doc with the key sections visible."""
     curator = curator_env["curator"]

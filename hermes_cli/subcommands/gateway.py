@@ -210,6 +210,22 @@ def build_gateway_parser(
     # gateway list
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
+    # gateway converge
+    gateway_converge = gateway_subparsers.add_parser(
+        "converge",
+        help="Check or repair every installed macOS profile gateway LaunchAgent",
+    )
+    gateway_converge.add_argument(
+        "--check",
+        action="store_true",
+        help="Read-only convergence check (default)",
+    )
+    gateway_converge.add_argument(
+        "--apply",
+        action="store_true",
+        help="Restart each installed profile LaunchAgent and verify fresh PIDs",
+    )
+
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 

@@ -12,6 +12,7 @@ This module provides:
 - hermes config wizard   - Re-run setup wizard
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -6596,9 +6597,11 @@ def save_config(
         if raw_existing:
             normalized = _preserve_env_ref_templates(
                 normalized,
-                raw_existing,
-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
+                extra_content="".join(parts) if parts else None,
+                **write_kwargs,
             )
+            _secure_file(config_path)
+            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
         # Strip schema-default values so the user's custom settings are not
         # silently reset on every save.  Keys the user explicitly set (paths
@@ -6634,13 +6637,31 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
-            config_path,
-            normalized,
-            extra_content="".join(parts) if parts else None,
-        )
-        _secure_file(config_path)
-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+@contextlib.contextmanager
+def config_update():
+    """Cross-process-safe read→modify→save cycle for config.yaml.
+
+    Two concurrent ``load_config()`` → mutate → ``save_config()`` cycles
+    race last-writer-wins: each saves the full config it read, silently
+    reverting the other's edit.  This context manager holds the advisory
+    config lock across the whole cycle so concurrent updaters serialize::
+
+        with config_update() as cfg:
+            cfg["model"]["max_tokens"] = 8192
+
+    The save also carries a stale-write guard, so a writer that bypasses
+    the lock raises ``utils.ConfigWriteConflictError`` instead of having
+    its change reverted.  An exception inside the block skips the save.
+    """
+    from utils import config_file_lock, file_write_state
+
+    ensure_hermes_home()
+    config_path = get_config_path()
+    with config_file_lock(config_path):
+        snapshot = file_write_state(config_path)
+        cfg = load_config()
+        yield cfg
+        save_config(cfg, expected_state=snapshot)
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -7556,8 +7577,6 @@ def set_config_value(key: str, value: str):
         return
     
     # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
     config_path = get_config_path()
     user_config = {}
     if config_path.exists():
@@ -7594,8 +7613,12 @@ def set_config_value(key: str, value: str):
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    from utils import locked_yaml_mutate
+    locked_yaml_mutate(
+        config_path,
+        lambda cfg: _set_nested(cfg, key, value),
+        sort_keys=False,
+    )
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.

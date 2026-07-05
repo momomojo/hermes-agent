@@ -57,11 +57,8 @@ function rawHashLooksLikeSession(): boolean {
     return false
   }
 
-  return (
-    !hash.startsWith('/settings') &&
-    !hash.startsWith('/skills') &&
-    !hash.startsWith('/messaging') &&
-    !hash.startsWith('/artifacts')
+  return ![SETTINGS_ROUTE, SKILLS_ROUTE, KANBAN_ROUTE, MESSAGING_ROUTE, ARTIFACTS_ROUTE].some(route =>
+    hash.startsWith(route)
   )
 }
 

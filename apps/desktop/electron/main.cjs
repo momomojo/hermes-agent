@@ -2733,6 +2733,19 @@ function resolveWebDist() {
   return fallback
 }
 
+function resolveDashboardWebDist() {
+  const override = process.env.HERMES_DESKTOP_WEB_DIST
+  if (override && directoryExists(path.resolve(override))) return path.resolve(override)
+
+  const candidates = [
+    !IS_PACKAGED ? path.join(SOURCE_REPO_ROOT, 'web', 'dist') : null,
+    path.join(ACTIVE_HERMES_ROOT, 'web', 'dist'),
+    path.join(ACTIVE_HERMES_ROOT, 'hermes_cli', 'web_dist')
+  ].filter(Boolean)
+
+  return candidates.find(directoryExists) || path.join(ACTIVE_HERMES_ROOT, 'web', 'dist')
+}
+
 function resolveRendererIndex() {
   const candidates = [path.join(APP_ROOT, 'dist', 'index.html'), path.join(resolveWebDist(), 'index.html')]
   const found = candidates.find(fileExists)

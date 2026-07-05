@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -134,6 +135,13 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            # Create a new session / process group so that when the codex
+            # app-server child (SkyComputerUse sandboxes, Rust worker threads)
+            # outlive the parent, they can be killed as a group in close()
+            # instead of being orphaned to pid 1. Prevents the sandbox-leak
+            # pattern: ~50 orphan SkyComputerUse processes found during the
+            # 2026-06-11 rc=0 protocol-violation burst.
+            preexec_fn=os.setsid,
         )
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
@@ -178,7 +186,12 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess to exit, escalating to kill."""
+        """Close stdin and kill the subprocess AND its children (sandbox processes).
+
+        Without process-group isolation (preexec_fn=os.setsid in __init__),
+        SIGKILL here orphans sandbox children to pid 1. With the process
+        group, killpg sends the signal to every process in the group.
+        """
         if self._closed:
             return
         self._closed = True
@@ -187,12 +200,21 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
+        # Process already dead — nothing to kill.
+        if self._proc.poll() is not None:
+            return
+        # Compute the process group once; if it fails the process vanished
+        # between the poll above and this call, just fall through.
         try:
-            self._proc.terminate()
+            pgid = os.getpgid(self._proc.pid)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
             self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
-                self._proc.kill()
+                os.killpg(pgid, signal.SIGKILL)
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass

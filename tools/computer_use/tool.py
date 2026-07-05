@@ -182,6 +182,19 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
     _always_allow = set()
 
 
+def _record_computer_use_registry_session() -> None:
+    try:
+        from tools.browser_session_registry import upsert_session
+
+        upsert_session(
+            domain="desktop",
+            backend="computer_use",
+            session_id=f"computer-use-{os.getpid()}",
+        )
+    except Exception as exc:
+        logger.debug("computer_use session registry update failed: %s", exc)
+
+
 class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     """Test/CI stub. Records calls; returns trivial results."""
 
@@ -280,6 +293,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                     "If a Python dependency is missing, the error above shows the exact install command.",
         })
+
+    _record_computer_use_registry_session()
 
     try:
         return _dispatch(backend, action, args)

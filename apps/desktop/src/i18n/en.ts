@@ -208,6 +208,7 @@ export const en: Translations = {
       'nav.settings': 'Open settings',
       'nav.profiles': 'Open profiles',
       'nav.skills': 'Open skills',
+      'nav.kanban': 'Open Kanban',
       'nav.messaging': 'Open messaging',
       'nav.artifacts': 'Open artifacts',
       'nav.cron': 'Open scheduled jobs',
@@ -894,6 +895,7 @@ export const en: Translations = {
       newChat: { title: 'New session', detail: 'Start a fresh session' },
       settings: { title: 'Settings', detail: 'Configure Hermes desktop' },
       skills: { title: 'Skills & Tools', detail: 'Enable skills, toolsets, and providers' },
+      kanban: { title: 'Kanban', detail: 'View orchestrated tasks and handoffs' },
       messaging: { title: 'Messaging', detail: 'Set up Telegram, Slack, Discord, and more' },
       artifacts: { title: 'Artifacts', detail: 'Browse generated outputs' }
     },
@@ -1305,6 +1307,7 @@ export const en: Translations = {
     nav: {
       'new-session': 'New session',
       skills: 'Skills & Tools',
+      kanban: 'Kanban',
       messaging: 'Messaging',
       artifacts: 'Artifacts'
     },

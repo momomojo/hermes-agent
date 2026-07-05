@@ -378,6 +378,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "prompt": "hello",
         "model": "gpt-test",
         "provider": "openai",
+        "reasoning": None,
         "toolsets": None,
     }
 
@@ -616,6 +617,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "prompt": "hello",
         "model": None,
         "provider": None,
+        "reasoning": None,
         "toolsets": "web,terminal",
     }
 
@@ -660,6 +662,45 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == "done\n"
     assert captured.err == ""
+
+
+def test_oneshot_forwards_reasoning_override(monkeypatch, capsys):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    captured = {}
+
+    def _fake_run_agent(*_args, **kwargs):
+        captured.update(kwargs)
+        return "done"
+
+    monkeypatch.setattr(oneshot_mod, "_run_agent", _fake_run_agent)
+
+    assert oneshot_mod.run_oneshot("hello", reasoning="xhigh") == 0
+    assert captured["reasoning"] == "xhigh"
+    assert capsys.readouterr().out == "done\n"
+
+
+def test_oneshot_rejects_invalid_reasoning_before_redirect(monkeypatch, capsys):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    assert oneshot_mod.run_oneshot("hello", reasoning="banana") == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--reasoning must be one of" in captured.err
+
+
+def test_oneshot_reasoning_ignores_env_var(monkeypatch):
+    from hermes_cli.oneshot import _resolve_reasoning_config
+
+    monkeypatch.setenv("HERMES_REASONING_EFFORT", "xhigh")
+
+    assert _resolve_reasoning_config({"agent": {}}) is None
+    assert _resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}) == {
+        "enabled": True,
+        "effort": "high",
+    }
 
 
 def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):

@@ -1202,14 +1202,24 @@ class TestSendTelegramHtmlDetection:
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "HTML"
 
-    def test_closing_tag_detected(self, monkeypatch):
+    def test_supported_closing_tag_detected(self, monkeypatch):
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
 
-        asyncio.run(_send_telegram("tok", "123", "text </div> more"))
+        asyncio.run(_send_telegram("tok", "123", "text </b> more"))
 
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "HTML"
+
+    def test_unsupported_angle_bracket_word_not_detected(self, monkeypatch):
+        """Traceback frames like '<module>' are not Telegram-supported HTML."""
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(_send_telegram("tok", "123", "Traceback in <module>"))
+
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["parse_mode"] == "MarkdownV2"
 
     def test_angle_brackets_in_math_not_detected(self, monkeypatch):
         """Expressions like 'x < 5' or '3 > 2' should not trigger HTML mode."""
@@ -1233,7 +1243,7 @@ class TestSendTelegramHtmlDetection:
         _install_telegram_mock(monkeypatch, bot)
 
         result = asyncio.run(
-            _send_telegram("tok", "123", "<invalid>broken html</invalid>")
+            _send_telegram("tok", "123", "<b>broken html")
         )
 
         assert result["success"] is True

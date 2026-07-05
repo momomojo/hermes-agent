@@ -89,6 +89,8 @@ def _live_subcommand_names() -> set[str]:
         (["hermes", "-m", "gpt5", "chat"], "chat"),
         (["hermes", "--model", "gpt5", "chat", "hi"], "chat"),
         (["hermes", "-m", "gpt5", "--provider", "openai", "chat"], "chat"),
+        (["hermes", "--reasoning", "xhigh", "-z", "hello world"], None),
+        (["hermes", "--reasoning-effort", "high", "chat"], "chat"),
         (["hermes", "-z", "hello world"], None),
         (["hermes", "-z", "hello", "chat"], "chat"),
         (["hermes", "--model=gpt5", "chat"], "chat"),     # inline form

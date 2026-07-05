@@ -648,6 +648,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    p_preflight = sub.add_parser(
+        "preflight",
+        help="Validate live Kanban skill references against assignee profiles",
+    )
+    p_preflight.add_argument("--json", action="store_true")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -960,6 +966,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
+            "preflight": _cmd_preflight,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
@@ -1900,6 +1907,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                completion_source=(
+                    "worker" if _worker_run_id_for(tid) is not None else "manual"
+                ),
+                completed_by=_profile_author(),
+                worker_session_id=os.environ.get("HERMES_SESSION_ID"),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2180,6 +2192,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skill_blocked": res.skill_blocked,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2196,6 +2209,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    if res.skill_blocked:
+        print("Blocked (missing skills):")
+        for entry in res.skill_blocked:
+            skills = ", ".join(entry.get("skills") or [])
+            print(
+                f"  - {entry.get('task_id')} -> {entry.get('assignee') or '-'} "
+                f"missing {skills or '(unknown)'}"
+            )
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -2219,6 +2240,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     return 0
+
+
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        report = kb.preflight_skill_references(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report.get("ok") else 1
+
+    print(
+        "KANBAN_PREFLIGHT "
+        f"ok={bool(report.get('ok'))} "
+        f"checked_tasks={report.get('checked_tasks', 0)}"
+    )
+    if report.get("error"):
+        print(f"error: {report['error']}", file=sys.stderr)
+    missing = report.get("missing") or []
+    if missing:
+        print("Missing forced skills:")
+        for item in missing:
+            print(
+                f"  - {item.get('task_id')} "
+                f"({item.get('profile') or item.get('assignee') or 'default'}): "
+                f"{item.get('name')} in {item.get('home') or '?'}"
+            )
+    return 0 if report.get("ok") else 1
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:

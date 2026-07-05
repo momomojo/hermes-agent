@@ -135,6 +135,18 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_flag(
+        parser,
+        "--reasoning",
+        "--reasoning-effort",
+        dest="reasoning",
+        metavar="EFFORT",
+        default=None,
+        help=(
+            "Reasoning effort override for this invocation "
+            "(none, minimal, low, medium, high, xhigh). Applies to -z/--oneshot."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",

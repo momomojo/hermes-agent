@@ -40,11 +40,15 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
@@ -84,6 +88,124 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
+
+# Pytest's autouse fixtures isolate HERMES_HOME per test, but collection-time
+# imports run before fixtures execute. If this runner is launched from a live
+# gateway/kanban worker, those imports would otherwise inherit the production
+# profile and can write synthetic ERRORs to ~/.hermes/logs. Every pytest
+# subprocess (collection and per-file execution) therefore gets a temp Hermes
+# home before Python imports any test/module code.
+_PYTEST_ENV_DROP_PREFIXES = (
+    "HERMES_KANBAN_",
+    "HERMES_SESSION_",
+)
+_PYTEST_ENV_DROP_NAMES = {
+    "HERMES_HOME_MODE",
+    "HERMES_GATEWAY_SESSION",
+    "HERMES_CRON_SESSION",
+    "_HERMES_GATEWAY",
+    "HERMES_PLATFORM",
+    "HERMES_MODEL",
+    "HERMES_INFERENCE_MODEL",
+    "HERMES_INFERENCE_PROVIDER",
+    "HERMES_TUI_PROVIDER",
+    "HERMES_MANAGED",
+    "HERMES_DEV",
+    "HERMES_CONTAINER",
+    "HERMES_EPHEMERAL_SYSTEM_PROMPT",
+    "HERMES_TIMEZONE",
+    "HERMES_REDACT_SECRETS",
+    "HERMES_BACKGROUND_NOTIFICATIONS",
+    "HERMES_EXEC_ASK",
+    "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
+    "API_SERVER_ENABLED",
+    "API_SERVER_HOST",
+    "API_SERVER_PORT",
+    "API_SERVER_KEY",
+    "API_SERVER_CORS_ORIGINS",
+    "API_SERVER_MODEL_NAME",
+}
+
+
+def _prepare_hermes_home(root: Path, label: str) -> Path:
+    """Create a minimal Hermes home under ``root`` for one pytest process."""
+    hermes_home = root / label
+    for child in ("logs", "sessions", "cron", "memories", "skills", "plugins"):
+        (hermes_home / child).mkdir(parents=True, exist_ok=True)
+    return hermes_home
+
+
+def _safe_home_label(file: Path, repo_root: Path) -> str:
+    """Stable, filesystem-safe label for the per-file pytest HERMES_HOME."""
+    try:
+        raw = str(file.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        raw = str(file.resolve())
+    digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in raw)
+    safe = safe.strip(".-")[:80] or "pytest"
+    return f"{safe}-{digest}"
+
+
+def _build_pytest_env(hermes_home: Path) -> dict[str, str]:
+    """Return an env for pytest that cannot touch live Hermes profile logs."""
+    env = os.environ.copy()
+    for name in list(env):
+        if name in _PYTEST_ENV_DROP_NAMES or any(
+            name.startswith(prefix) for prefix in _PYTEST_ENV_DROP_PREFIXES
+        ):
+            env.pop(name, None)
+
+    env["HERMES_HOME"] = str(hermes_home)
+    env["TZ"] = "UTC"
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
+    env["PYTHONHASHSEED"] = "0"
+    return env
+
+# Resolve the project Python — prefer venv over system python.
+def _resolve_python(repo_root: Path) -> str:
+    """Resolve a Python that can import pytest.
+
+    Worktrees usually do not have their own venv, so also probe the canonical
+    Hermes install venv before falling back to the interpreter running this
+    script. This keeps direct invocations of scripts/run_tests_parallel.py from
+    silently using system Python and failing with ``No module named pytest``.
+    """
+    candidate_venvs: list[Path] = []
+    for candidate in ("venv", ".venv"):
+        candidate_venvs.append(repo_root / candidate)
+    if os.environ.get("VIRTUAL_ENV"):
+        candidate_venvs.append(Path(os.environ["VIRTUAL_ENV"]))
+    candidate_venvs.append(Path.home() / ".hermes" / "hermes-agent" / "venv")
+
+    seen: set[Path] = set()
+    candidate_pythons: list[Path] = []
+    for venv in candidate_venvs:
+        for rel in (
+            ("bin", "python3"),
+            ("bin", "python"),
+            ("Scripts", "python.exe"),
+        ):
+            exe = venv.joinpath(*rel)
+            if exe not in seen:
+                seen.add(exe)
+                candidate_pythons.append(exe)
+    candidate_pythons.append(Path(sys.executable))
+
+    for candidate_path in candidate_pythons:
+        if candidate_path.is_file():
+            try:
+                probe = subprocess.run(
+                    [str(candidate_path), "-c", "import pytest"],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if probe.returncode == 0:
+                    return str(candidate_path)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    return sys.executable
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
@@ -876,7 +998,12 @@ def main() -> int:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
+                _run_one_file,
+                file,
+                pytest_passthrough,
+                repo_root,
+                args.file_timeout,
+                test_home_root,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)

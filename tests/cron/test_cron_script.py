@@ -181,6 +181,11 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    def test_script_timeout_job_override(self, cron_env):
+        from cron.scheduler import _get_script_timeout
+
+        assert _get_script_timeout({"script_timeout_seconds": 900}) == 900
+
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script

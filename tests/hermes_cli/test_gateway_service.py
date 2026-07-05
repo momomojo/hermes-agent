@@ -949,6 +949,7 @@ class TestLaunchdServiceRecovery:
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
         monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
@@ -962,6 +963,81 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_status_reports_launchd_managed_pid(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist\n", encoding="utf-8")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 1234;\n};\n',
+                    stderr="",
+                )
+            if cmd[:3] == ["ps", "-p", "1234"]:
+                return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert "launchd-managed (PID 1234)" in output
+
+    def test_launchd_status_warns_when_loaded_pid_is_detached(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist\n", encoding="utf-8")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 4321;\n};\n',
+                    stderr="",
+                )
+            if cmd[:3] == ["ps", "-p", "4321"]:
+                return SimpleNamespace(returncode=0, stdout="999\n", stderr="")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert "loaded but PID 4321 has parent 999" in output
+
+    def test_launchd_status_prints_runtime_platform_health(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist\n", encoding="utf-8")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 1234;\n};\n',
+                    stderr="",
+                )
+            if cmd[:3] == ["ps", "-p", "1234"]:
+                return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: ["✓ telegram: connected"])
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert "Recent gateway health:" in output
+        assert "✓ telegram: connected" in output
     def test_launchd_domain_uses_user_domain(self, monkeypatch):
         # The user/<uid> domain (not gui/<uid>) is the one reachable from
         # non-Aqua/background sessions on macOS 26+ (issue #23387).
@@ -1097,6 +1173,7 @@ class TestLaunchdServiceRecovery:
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
         monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_managed_gateway", lambda previous_pid=None, timeout=3.0: None)
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
 
@@ -1158,6 +1235,42 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
         ]
+
+    def test_launchd_restart_skips_detached_when_launchd_supervises_after_error_5(self, monkeypatch, capsys):
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: None)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd == ["launchctl", "kickstart", "-k", target]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    5, cmd, stderr="Input/output error"
+                )
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 654;\n};\n',
+                    stderr="",
+                )
+            if cmd[:3] == ["ps", "-p", "654"]:
+                return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        spawned = []
+        monkeypatch.setattr(
+            gateway_cli, "_spawn_detached_gateway", lambda: spawned.append(True) or True
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert spawned == []
+        assert "supervising the replacement gateway (PID 654)" in capsys.readouterr().out
 
     def test_launchd_stop_tolerates_domain_unsupported_bootout(self, monkeypatch, capsys):
         """bootout exit 125 (macOS 26) must fall through to PID-based kill, not raise."""

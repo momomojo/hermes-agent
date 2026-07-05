@@ -3734,6 +3734,22 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert spawned_tasks[0].skills == ["sdlc-review"]
 
 
+def test_dispatch_review_blocks_when_review_skill_missing(
+    kanban_home, all_assignees_spawnable,
+):
+    profile_home = kanban_home / "profiles" / "alice"
+    (profile_home / "skills").mkdir(parents=True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn)
+        assert not res.spawned
+        assert res.skill_blocked
+        assert kb.get_task(conn, t).status == "blocked"
+        events = kb.list_events(conn, t)
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:

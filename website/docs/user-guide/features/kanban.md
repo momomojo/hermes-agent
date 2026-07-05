@@ -173,6 +173,13 @@ body and hoping it finds them.
   file's name and its **absolute path**. The worker has full file/terminal
   tool access, so it reads attachments directly (`read_file`, or shell
   tools like `pdftotext`).
+- **Lifecycle registry** — uploads are also recorded in the
+  [Artifact Lifecycle Registry](./artifacts) with task id, board, MIME type,
+  uploader, and Kanban attachment id. Telegram and other gateway inbound files
+  are registered with session metadata, so operators can trace a user-sent
+  attachment into the Kanban card that later used it. Registry cleanup only
+  deletes registry-owned copies under `~/.hermes/artifacts/blobs/`; it does
+  not delete live Kanban attachment files.
 - **Download / remove** — the drawer lists each attachment with a download
   link and a remove (×) control. Removing an attachment deletes both the
   metadata row and the on-disk file.

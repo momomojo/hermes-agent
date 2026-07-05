@@ -62,6 +62,43 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--fork-preflight",
+        action="store_true",
+        default=False,
+        help=(
+            "Fork/device-branch safety check: snapshot runtime state, fetch "
+            "origin and upstream, rehearse the reconcile in a temporary "
+            "worktree, write a report, and exit without applying the update."
+        ),
+    )
+    update_parser.add_argument(
+        "--upstream-branch",
+        default="main",
+        metavar="NAME",
+        help="Upstream branch used by --fork-preflight (default: main).",
+    )
+    update_parser.add_argument(
+        "--fork-strategy",
+        choices=("merge", "rebase"),
+        default="merge",
+        help="Temporary-worktree reconcile strategy for --fork-preflight.",
+    )
+    update_parser.add_argument(
+        "--report",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write the --fork-preflight reconcile report to PATH instead of "
+            "~/.hermes/updates/reconcile-reports/."
+        ),
+    )
+    update_parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        default=False,
+        help="For --fork-preflight, use existing refs without fetching remotes.",
+    )
+    update_parser.add_argument(
         "--force",
         action="store_true",
         default=False,

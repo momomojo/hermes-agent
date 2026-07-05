@@ -277,6 +277,10 @@ from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.credential_intake import build_credential_intake_parser
+from hermes_cli.subcommands.capabilities import build_capabilities_parser
+from hermes_cli.subcommands.artifacts import build_artifacts_parser
+from hermes_cli.subcommands.project_memory import build_project_memory_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
@@ -395,6 +399,7 @@ def _apply_profile_override() -> None:
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning", "--reasoning-effort",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -4201,6 +4206,34 @@ def cmd_auth(args):
     from hermes_cli.auth_commands import auth_command
 
     auth_command(args)
+
+
+def cmd_credential_intake(args):
+    """Manage local credential intake links."""
+    from hermes_cli.credential_intake import credential_intake_command
+
+    credential_intake_command(args)
+
+
+def cmd_capabilities(args):
+    """Manage local capability manifests."""
+    from hermes_cli.capability_catalog import capability_catalog_command
+
+    return capability_catalog_command(args)
+
+
+def cmd_artifacts(args):
+    """Manage artifact lifecycle registry."""
+    from hermes_cli.artifacts import artifacts_command
+
+    artifacts_command(args)
+
+
+def cmd_project_memory(args):
+    """Manage file-backed Project Memory documents."""
+    from hermes_cli.project_memory import project_memory_command
+
+    project_memory_command(args)
 
 
 def cmd_status(args):
@@ -9089,6 +9122,14 @@ def cmd_update(args):
         print(format_docker_update_message())
         sys.exit(1)
 
+    if getattr(args, "fork_preflight", False):
+        from hermes_cli.fork_update_guard import cmd_fork_update_preflight
+
+        rc = cmd_fork_update_preflight(args, repo_root=PROJECT_ROOT)
+        if rc:
+            sys.exit(rc)
+        return
+
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
@@ -11956,6 +11997,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--reasoning", "--reasoning-effort",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -12181,6 +12223,7 @@ def _try_termux_fast_cli_launch() -> bool:
                 args.oneshot,
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
+                reasoning=getattr(args, "reasoning", None),
                 toolsets=getattr(args, "toolsets", None),
             )
         )
@@ -12652,6 +12695,26 @@ def main():
     # auth command  (parser built in hermes_cli/subcommands/auth.py)
     # =========================================================================
     build_auth_parser(subparsers, cmd_auth=cmd_auth)
+
+    # =========================================================================
+    # credential-intake command (parser built in hermes_cli/subcommands/credential_intake.py)
+    # =========================================================================
+    build_credential_intake_parser(subparsers, cmd_credential_intake=cmd_credential_intake)
+
+    # =========================================================================
+    # capabilities command (parser built in hermes_cli/subcommands/capabilities.py)
+    # =========================================================================
+    build_capabilities_parser(subparsers, cmd_capabilities=cmd_capabilities)
+
+    # =========================================================================
+    # artifacts command (parser built in hermes_cli/subcommands/artifacts.py)
+    # =========================================================================
+    build_artifacts_parser(subparsers, cmd_artifacts=cmd_artifacts)
+
+    # =========================================================================
+    # project-memory command (parser built in hermes_cli/subcommands/project_memory.py)
+    # =========================================================================
+    build_project_memory_parser(subparsers, cmd_project_memory=cmd_project_memory)
 
     # =========================================================================
     # status command  (parser built in hermes_cli/subcommands/status.py)
@@ -13609,6 +13672,7 @@ def main():
                 args.oneshot,
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
+                reasoning=getattr(args, "reasoning", None),
                 toolsets=getattr(args, "toolsets", None),
             )
         )

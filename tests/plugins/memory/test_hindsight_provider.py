@@ -382,6 +382,40 @@ class TestConfig:
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
 
+    def test_bank_mission_patch_when_server_mission_empty(self):
+        p = HindsightMemoryProvider()
+        banks = SimpleNamespace(
+            get_bank_profile=AsyncMock(return_value=SimpleNamespace(mission="")),
+            update_bank=AsyncMock(return_value=SimpleNamespace(mission="Configured mission")),
+        )
+        p._client = SimpleNamespace(banks=banks)
+        p._bank_id = "test-bank"
+        p._bank_mission = "Configured mission"
+        p._timeout = 1
+
+        p._sync_bank_mission_if_empty()
+
+        banks.get_bank_profile.assert_called_once()
+        banks.update_bank.assert_called_once()
+        assert banks.update_bank.call_args.args[0] == "test-bank"
+        assert banks.update_bank.call_args.args[1].mission == "Configured mission"
+
+    def test_bank_mission_not_overwritten_when_server_has_mission(self):
+        p = HindsightMemoryProvider()
+        banks = SimpleNamespace(
+            get_bank_profile=AsyncMock(return_value=SimpleNamespace(mission="Existing mission")),
+            update_bank=AsyncMock(),
+        )
+        p._client = SimpleNamespace(banks=banks)
+        p._bank_id = "test-bank"
+        p._bank_mission = "Configured mission"
+        p._timeout = 1
+
+        p._sync_bank_mission_if_empty()
+
+        banks.get_bank_profile.assert_called_once()
+        banks.update_bank.assert_not_called()
+
     def test_config_from_env_fallback(self, tmp_path, monkeypatch):
         """When no config file exists, falls back to env vars."""
         monkeypatch.setattr(
@@ -715,6 +749,33 @@ class TestToolHandlers:
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
 
+    def test_recall_per_call_options_override_config(self, provider_with_config):
+        p = provider_with_config(
+            recall_tags=["default-tag"],
+            recall_tags_match="all",
+            recall_types=["world", "experience"],
+            recall_max_tokens=1024,
+        )
+        p.handle_tool_call(
+            "hindsight_recall",
+            {
+                "query": "pool health",
+                "types": ["observation"],
+                "tags": ["nas-health", "pool"],
+                "tags_match": "all_strict",
+                "query_timestamp": "2026-06-15T12:00:00Z",
+                "budget": "high",
+                "max_tokens": 2048,
+            },
+        )
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["types"] == ["observation"]
+        assert call_kwargs["tags"] == ["nas-health", "pool"]
+        assert call_kwargs["tags_match"] == "all_strict"
+        assert call_kwargs["query_timestamp"] == "2026-06-15T12:00:00Z"
+        assert call_kwargs["budget"] == "high"
+        assert call_kwargs["max_tokens"] == 2048
+
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
         result = json.loads(provider.handle_tool_call(
@@ -854,6 +915,61 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_on_turn_start_prefetch_uses_current_message(self, provider):
+        captured = {}
+
+        async def _capture_recall(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(results=[SimpleNamespace(text="fresh current memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_capture_recall)
+
+        provider.on_turn_start(2, "current user question")
+        result = provider.prefetch("current user question")
+
+        assert "fresh current memory" in result
+        assert captured["query"] == "current user question"
+
+    def test_prefetch_replaces_stale_queued_result_with_current_turn(self, provider):
+        provider._prefetch_result = "- stale previous memory"
+        provider._prefetch_query = "previous user question"
+        provider._prefetch_turn_message = "previous user question"
+
+        async def _fresh_recall(**kwargs):
+            return SimpleNamespace(results=[SimpleNamespace(text="fresh current memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_fresh_recall)
+
+        provider.on_turn_start(2, "current user question")
+        result = provider.prefetch("current user question")
+
+        assert "fresh current memory" in result
+        assert "stale previous memory" not in result
+        assert provider._client.arecall.call_args.kwargs["query"] == "current user question"
+
+    def test_first_turn_prefetch_query_includes_profile_summary(
+        self, provider_with_config, tmp_path
+    ):
+        (tmp_path / "profile.yaml").write_text(
+            "description: Coding profile for Hermes runtime maintenance.\n",
+            encoding="utf-8",
+        )
+        p = provider_with_config()
+        captured = {}
+
+        async def _capture_recall(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(results=[SimpleNamespace(text="profile-scoped memory")])
+
+        p._client.arecall = AsyncMock(side_effect=_capture_recall)
+
+        p.on_turn_start(1, "why is recall stale?")
+        result = p.prefetch("why is recall stale?")
+
+        assert "profile-scoped memory" in result
+        assert "Profile summary: Coding profile for Hermes runtime maintenance." in captured["query"]
+        assert "Current user message: why is recall stale?" in captured["query"]
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1237,68 @@ class TestSyncTurn:
         assert "こんにちは" in raw_json
         assert "你好" in raw_json
         assert "👨‍👩‍👧‍👦" in raw_json
+
+    def test_sync_turn_redacts_secret_policy_before_retain(self, provider_with_config):
+        p = provider_with_config(retain_redaction_policy=["secrets"])
+
+        p.sync_turn(
+            "api_key=sk-testsecret1234567890 and password=hunter2",
+            "Use Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456",
+        )
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert "sk-testsecret1234567890" not in raw_json
+        assert "hunter2" not in raw_json
+        assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in raw_json
+        assert raw_json.count("[REDACTED]") >= 3
+        content = json.loads(raw_json)
+        assert content[0][0]["content"] == "User: api_key=[REDACTED] and password=[REDACTED]"
+        assert content[0][1]["content"] == "Assistant: Use Authorization: Bearer [REDACTED]"
+
+    def test_sync_turn_drops_noise_pattern_unless_durable_term_matches(self, provider_with_config):
+        p = provider_with_config(
+            retain_noise_patterns=[r"\bsensor\."],
+            retain_durable_terms=["automation"],
+        )
+
+        p.sync_turn("sensor.kitchen state changed to 71", "noted")
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+        assert p._sync_thread is None
+        p._client.aretain_batch.assert_not_called()
+
+        p.sync_turn("sensor.kitchen automation threshold changed", "saved")
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert "sensor.kitchen automation threshold changed" in raw_json
+
+    def test_sync_turn_caps_oversize_payload_to_recent_turns(self, provider_with_config):
+        p = provider_with_config(
+            retain_every_n_turns=3,
+            retain_max_payload_chars=450,
+            retain_oversize_policy="recent_turns",
+        )
+
+        p.sync_turn("old1-user " + ("x" * 350), "old1-asst")
+        p.sync_turn("old2-user " + ("y" * 350), "old2-asst")
+        p.sync_turn("recent-user", "recent-asst")
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        raw_json = item["content"]
+        assert len(raw_json) <= 450
+        assert "recent-user" in raw_json
+        assert "recent-asst" in raw_json
+        assert "old1-user" not in raw_json
+        assert "old2-user" not in raw_json
+        assert item["metadata"]["message_count"] == "2"
+        content = json.loads(raw_json)
+        assert len(content) == 1
 
 
 # ---------------------------------------------------------------------------

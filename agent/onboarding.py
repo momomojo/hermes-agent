@@ -203,22 +203,18 @@ def is_seen(config: Mapping[str, Any], flag: str) -> bool:
 def mark_seen(config_path: Path, flag: str) -> bool:
     """Persist ``onboarding.seen.<flag> = True`` to ``config_path``.
 
-    Uses the atomic YAML writer so a concurrent process can't observe a
-    partially-written file.  Returns True on success, False on any error
+    Runs the full read-modify-write cycle under the cross-process config
+    lock (``utils.locked_yaml_mutate``) so this write can't revert a
+    concurrent config edit.  Returns True on success, False on any error
     (including the config file being absent — onboarding is best-effort).
     """
     try:
-        import yaml
-        from utils import atomic_yaml_write
+        from utils import SKIP_WRITE, locked_yaml_mutate
     except Exception as e:  # pragma: no cover — dependency issue
-        logger.debug("onboarding: failed to import yaml/utils: %s", e)
+        logger.debug("onboarding: failed to import utils: %s", e)
         return False
 
-    try:
-        cfg: dict = {}
-        if config_path.exists():
-            with open(config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
+    def _mark(cfg: dict):
         if not isinstance(cfg.get("onboarding"), dict):
             cfg["onboarding"] = {}
         seen = cfg["onboarding"].get("seen")
@@ -226,9 +222,12 @@ def mark_seen(config_path: Path, flag: str) -> bool:
             seen = {}
             cfg["onboarding"]["seen"] = seen
         if seen.get(flag) is True:
-            return True  # already marked — nothing to do
+            return SKIP_WRITE  # already marked — nothing to do
         seen[flag] = True
-        atomic_yaml_write(config_path, cfg)
+        return None
+
+    try:
+        locked_yaml_mutate(config_path, _mark)
         return True
     except Exception as e:
         logger.debug("onboarding: failed to mark flag %s: %s", flag, e)

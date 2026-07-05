@@ -178,13 +178,13 @@ def get_archive_after_days() -> int:
 def get_prune_builtins() -> bool:
     """Whether the curator may prune (archive) bundled built-in skills too.
 
-    ON by default. When on, built-ins become curation candidates and are
+    OFF by default. When on, built-ins become curation candidates and are
     archived after the same inactivity period as agent-created skills, with a
     suppression list keeping them archived across `hermes update` re-seeds.
     Hub-installed skills are never pruned regardless of this flag.
     """
     cfg = _load_config()
-    return bool(cfg.get("prune_builtins", True))
+    return bool(cfg.get("prune_builtins", False))
 
 
 def get_consolidate() -> bool:
@@ -315,6 +315,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
         counts["checked"] += 1
         name = row["name"]
         if row.get("pinned"):
+            continue
+        if name in protected_names:
+            counts["protected_skipped"] += 1
             continue
 
         # A skill referenced by any cron job (incl. paused/disabled) is in
@@ -1173,6 +1176,59 @@ def _write_run_report(
     consolidated = classification["consolidated"]
     pruned = classification["pruned"]
 
+    protected_snapshot: Dict[str, Any] = {
+        "protected_names": [],
+        "references": [],
+        "by_name": {},
+        "count": 0,
+    }
+    try:
+        from tools.skill_reference_guard import collect_protected_references
+
+        protected_snapshot = collect_protected_references()
+    except Exception as e:
+        logger.debug("Curator protected-reference scan failed: %s", e, exc_info=True)
+        protected_snapshot = {
+            "protected_names": [],
+            "references": [],
+            "by_name": {},
+            "count": 0,
+            "error": str(e),
+        }
+
+    protected_names = set(protected_snapshot.get("protected_names") or [])
+    blocked_mutations: List[Dict[str, Any]] = []
+    for tc in llm_meta.get("tool_calls", []) or []:
+        if not isinstance(tc, dict) or tc.get("name") != "skill_manage":
+            continue
+        raw = tc.get("arguments") or ""
+        args: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            args = raw
+        elif isinstance(raw, str):
+            try:
+                args = json.loads(raw)
+            except Exception:
+                continue
+        if not isinstance(args, dict):
+            continue
+        if args.get("action") != "delete":
+            continue
+        name = str(args.get("name") or "").strip()
+        if name and name in protected_names:
+            blocked_mutations.append(
+                {
+                    "skill": name,
+                    "action": "delete",
+                    "reason": "protected_reference",
+                    "references": (
+                        protected_snapshot.get("by_name", {}).get(name, [])
+                        if isinstance(protected_snapshot.get("by_name"), dict)
+                        else []
+                    ),
+                }
+            )
+
     # Rewrite cron job skill references. When the curator consolidates
     # skill X into umbrella Y, any cron job that lists X fails to load
     # it at run time — the scheduler skips it and the job runs without
@@ -1222,6 +1278,8 @@ def _write_run_report(
             "pruned_this_run": len(pruned),
             "state_transitions": len(transitions),
             "cron_jobs_rewritten": int(cron_rewrites.get("jobs_updated", 0)),
+            "protected_references_checked": int(protected_snapshot.get("count", 0) or 0),
+            "blocked_mutations": len(blocked_mutations),
             "tool_calls_total": sum(tc_counts.values()),
         },
         "tool_call_counts": tc_counts,
@@ -1232,6 +1290,8 @@ def _write_run_report(
         "added": added,
         "state_transitions": transitions,
         "cron_rewrites": cron_rewrites,
+        "protected_references": protected_snapshot,
+        "blocked_mutations": blocked_mutations,
         "llm_final": llm_meta.get("final", ""),
         "llm_summary": llm_meta.get("summary", ""),
         "llm_error": llm_meta.get("error"),
@@ -1294,9 +1354,34 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
     auto = p.get("auto_transitions") or {}
     lines.append("## Auto-transitions (pure, no LLM)\n")
     lines.append(f"- checked: {auto.get('checked', 0)}")
+    if "protected_skipped" in auto:
+        lines.append(f"- skipped protected references: {auto.get('protected_skipped', 0)}")
     lines.append(f"- marked stale: {auto.get('marked_stale', 0)}")
     lines.append(f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}")
     lines.append(f"- reactivated: {auto.get('reactivated', 0)}")
+    lines.append("")
+
+    protected = p.get("protected_references") or {}
+    protected_names = protected.get("protected_names") or []
+    blocked_mutations = p.get("blocked_mutations") or []
+    lines.append("## Protected skill references\n")
+    lines.append(f"- protected names checked: **{len(protected_names)}**")
+    if protected.get("error"):
+        lines.append(f"- scan error: `{protected.get('error')}`")
+    if blocked_mutations:
+        lines.append(f"- blocked curator mutations: **{len(blocked_mutations)}**")
+        for entry in blocked_mutations[:25]:
+            lines.append(
+                f"  - `{entry.get('skill')}` `{entry.get('action')}` blocked "
+                "because a live reference still points at it"
+            )
+    else:
+        lines.append("- blocked curator mutations: **0**")
+    if protected_names:
+        sample = ", ".join(f"`{name}`" for name in protected_names[:25])
+        if len(protected_names) > 25:
+            sample += f", … and {len(protected_names) - 25} more"
+        lines.append(f"- names: {sample}")
     lines.append("")
 
     # LLM pass numbers
@@ -1625,7 +1710,10 @@ def run_curator_review(
         llm_meta: Dict[str, Any] = {}
         try:
             candidate_list = _render_candidate_list()
-            if "No agent-created skills" in candidate_list:
+            if (
+                "No agent-created skills" in candidate_list
+                or "No unprotected agent-created skills" in candidate_list
+            ):
                 final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
                 llm_meta = {
                     "final": "",

@@ -333,6 +333,36 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
+def _log_memory_injection(clean: str) -> None:
+    """Append one JSONL record per injected memory block.
+
+    Feeds the monthly Recall Utilization Rate review (memory gap analysis
+    2026-06-10): the injected block is ephemeral — never persisted with the
+    session — so injection time is the only place it can be observed. Best
+    effort: never let telemetry break the hot path.
+    """
+    try:
+        import json as _json
+        import os as _os
+        import time as _time
+
+        log_dir = _os.path.join(
+            _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")), "logs"
+        )
+        _os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "profile": _os.environ.get("HERMES_PROFILE", "default"),
+            "chars": len(clean),
+            "items": clean.count("\n- ") + (1 if clean.lstrip().startswith("- ") else 0),
+            "head": clean[:200],
+        }
+        with open(_os.path.join(log_dir, "recall-utilization.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("recall-utilization logging failed", exc_info=True)
+
+
 def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note."""
     if not raw_context or not raw_context.strip():
@@ -340,6 +370,7 @@ def build_memory_context_block(raw_context: str) -> str:
     clean = sanitize_context(raw_context)
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")
+    _log_memory_injection(clean)
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
