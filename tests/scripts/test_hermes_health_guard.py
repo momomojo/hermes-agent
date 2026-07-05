@@ -180,6 +180,38 @@ def test_provider_health_unparseable_updated_treated_as_no_output():
     assert "state file missing/unreadable" in failures[0]
 
 
+def test_runtime_compile_success_is_silent(monkeypatch):
+    guard = _load_health_guard_module()
+    seen = []
+
+    def fake_run(cmd, *, timeout=20.0):
+        seen.append((cmd, timeout))
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(guard, "_run", fake_run)
+    assert guard._check_runtime_compile() == []
+    assert seen == [
+        (
+            [str(guard.PYTHON), "-m", "compileall", "-q", *guard.COMPILEALL_TARGETS],
+            guard.COMPILEALL_TIMEOUT_SECONDS,
+        )
+    ]
+
+
+def test_runtime_compile_failure_pages_concisely(monkeypatch):
+    guard = _load_health_guard_module()
+
+    def fake_run(cmd, *, timeout=20.0):
+        return {"ok": False, "stdout": "", "stderr": "IndentationError: unexpected indent"}
+
+    monkeypatch.setattr(guard, "_run", fake_run)
+    failures = guard._check_runtime_compile()
+    assert failures == [
+        "runtime compile gate failed: python -m compileall hermes_cli agent gateway plugins: "
+        "IndentationError: unexpected indent"
+    ]
+
+
 # ── managed-layer drift ─────────────────────────────────────────────────────
 
 

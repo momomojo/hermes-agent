@@ -47,6 +47,26 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _record_no_agent_watchdog(job: dict, *, status: str, output: str = "", error: str | None = None) -> str:
+    """Record no-agent watchdog metadata without letting ledger errors break alerts."""
+    try:
+        from cron.watchdog_ledger import record_watchdog_result
+
+        metadata = record_watchdog_result(job, status=status, output=output, error=error)
+    except Exception as exc:
+        logger.debug("Job '%s': watchdog ledger write failed: %s", job.get("id", "?"), exc)
+        return ""
+
+    reason = metadata.get("reason") or "unknown"
+    path = metadata.get("path") or ""
+    changed = metadata.get("changed")
+    changed_text = "yes" if changed else "no"
+    line = f"**Watchdog ledger:** changed={changed_text}, reason={reason}"
+    if path:
+        line += f", path={path}"
+    return line + "\n"
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 

@@ -81,6 +81,8 @@ PROVIDER_HEALTH_PAGE_STATES = {"down", "critical", "error"}
 # Cap per-lane detail in failure lines — sentinel details can embed whole
 # tracebacks/HTTP bodies and huge alert strings drown the pager.
 PROVIDER_HEALTH_DETAIL_MAX_CHARS = 160
+COMPILEALL_TARGETS = ("hermes_cli", "agent", "gateway", "plugins")
+COMPILEALL_TIMEOUT_SECONDS = float(os.environ.get("HERMES_HEALTH_COMPILE_TIMEOUT_S", "60.0"))
 
 # Managed-layer drift: an uncommitted path in the ~/.hermes git overlay older
 # than this survived the 04:15 nightly autocommit, so the autocommit is
@@ -376,6 +378,27 @@ def _check_launchd_jobs() -> list[str]:
         if m and m.group(1) not in ("0",):
             failures.append(f"launchd job failed: {job} (last exit {m.group(1)})")
     return failures
+
+
+def _check_runtime_compile() -> list[str]:
+    """Page when the live runtime checkout cannot be byte-compiled.
+
+    A syntax error in committed Python can crash the gateway before the
+    dispatcher even starts. Gateway state usually catches the symptom, but this
+    names the source-class directly and is independent of launchd restart
+    behavior.
+    """
+    result = _run(
+        [str(PYTHON), "-m", "compileall", "-q", *COMPILEALL_TARGETS],
+        timeout=COMPILEALL_TIMEOUT_SECONDS,
+    )
+    if result["ok"]:
+        return []
+    detail = (result.get("stderr") or result.get("stdout") or "compileall failed").strip()
+    detail = re.sub(r"\s+", " ", detail)
+    if len(detail) > 220:
+        detail = detail[:217].rstrip() + "..."
+    return [f"runtime compile gate failed: python -m compileall {' '.join(COMPILEALL_TARGETS)}: {detail}"]
 
 
 def _provider_sentinel_registered() -> bool:
@@ -801,6 +824,7 @@ def collect_health() -> dict[str, Any]:
     failures.extend(kanban_flow.get("failures") or [])
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
+    failures.extend(_check_runtime_compile())
     failures.extend(_check_launchd_jobs())
     failures.extend(_check_provider_health())
     failures.extend(_check_managed_layer_drift())

@@ -16,6 +16,7 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
@@ -5552,6 +5553,22 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
 
     return lines
+
+
+def _format_runtime_status_timestamp(value) -> str:
+    """Return a compact local-time timestamp for gateway_state platform rows."""
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:32]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _set_platform_unauthorized_dm_behavior(platform_key: str, behavior: str) -> None:
