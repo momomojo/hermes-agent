@@ -6605,7 +6605,7 @@ def _update_config_for_provider(
 
     clear_model_endpoint_credentials(model_cfg)
 
-        config["model"] = model_cfg
+    config["model"] = model_cfg
 
     locked_yaml_mutate(config_path, _apply, sort_keys=False)
     return config_path
