@@ -1153,7 +1153,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             message += f" Content absorbed into '{absorbed_target}'."
         return {"success": True, "message": message, "_archived": True}
 
-    shutil.rmtree(skill_dir)
+    ok, archive_msg = False, ""
+    try:
+        from tools import skill_usage
 
         ok, archive_msg = skill_usage.archive_skill(name)
     except Exception:
@@ -1163,7 +1165,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if not ok:
         return {"success": False, "error": archive_msg}
 
-    message = f"Skill '{name}' deleted."
+    message = f"Skill '{name}' archived ({archive_msg})."
     if is_consolidation:
         message += f" Content absorbed into '{absorbed_target}'."
 

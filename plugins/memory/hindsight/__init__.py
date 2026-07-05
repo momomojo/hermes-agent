@@ -30,6 +30,8 @@ Or via $HERMES_HOME/hindsight/config.json (profile-scoped), falling back to
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import atexit
 import importlib
