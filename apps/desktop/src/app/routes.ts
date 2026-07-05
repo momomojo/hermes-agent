@@ -3,7 +3,6 @@ export const NEW_CHAT_ROUTE = '/'
 export const SETTINGS_ROUTE = '/settings'
 export const COMMAND_CENTER_ROUTE = '/command-center'
 export const SKILLS_ROUTE = '/skills'
-export const KANBAN_ROUTE = '/kanban'
 export const MESSAGING_ROUTE = '/messaging'
 export const ARTIFACTS_ROUTE = '/artifacts'
 export const CRON_ROUTE = '/cron'
@@ -17,7 +16,6 @@ export type AppView =
   | 'chat'
   | 'command-center'
   | 'cron'
-  | 'kanban'
   | 'messaging'
   | 'profiles'
   | 'settings'
@@ -29,7 +27,6 @@ export type AppRouteId =
   | 'artifacts'
   | 'command-center'
   | 'cron'
-  | 'kanban'
   | 'messaging'
   | 'new'
   | 'profiles'
@@ -48,7 +45,6 @@ export const APP_ROUTES = [
   { id: 'settings', path: SETTINGS_ROUTE, view: 'settings' },
   { id: 'command-center', path: COMMAND_CENTER_ROUTE, view: 'command-center' },
   { id: 'skills', path: SKILLS_ROUTE, view: 'skills' },
-  { id: 'kanban', path: KANBAN_ROUTE, view: 'kanban' },
   { id: 'messaging', path: MESSAGING_ROUTE, view: 'messaging' },
   { id: 'artifacts', path: ARTIFACTS_ROUTE, view: 'artifacts' },
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },

@@ -1197,14 +1197,6 @@ export function DesktopController() {
           <Route
             element={
               <Suspense fallback={null}>
-                <KanbanView />
-              </Suspense>
-            }
-            path="kanban"
-          />
-          <Route
-            element={
-              <Suspense fallback={null}>
                 <MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />
               </Suspense>
             }

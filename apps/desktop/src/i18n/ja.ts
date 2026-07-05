@@ -993,7 +993,6 @@ export const ja = defineLocale({
       newChat: { title: '新しいセッション', detail: '新しいセッションを開始' },
       settings: { title: '設定', detail: 'Hermes デスクトップを設定' },
       skills: { title: 'スキルとツール', detail: 'スキル、ツールセット、プロバイダーを有効化' },
-      kanban: { title: 'Kanban', detail: 'オーケストレーションされたタスクと引き継ぎを表示' },
       messaging: { title: 'メッセージング', detail: 'Telegram、Slack、Discord などを設定' },
       artifacts: { title: 'アーティファクト', detail: '生成された出力を閲覧' }
     },
@@ -1414,7 +1413,6 @@ export const ja = defineLocale({
     nav: {
       'new-session': '新しいセッション',
       skills: 'スキルとツール',
-      kanban: 'Kanban',
       messaging: 'メッセージング',
       artifacts: 'アーティファクト'
     },

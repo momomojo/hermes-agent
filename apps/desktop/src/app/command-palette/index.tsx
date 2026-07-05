@@ -26,7 +26,6 @@ import {
   type IconComponent,
   Info,
   KeyRound,
-  Layers3,
   MessageCircle,
   Monitor,
   Moon,
@@ -65,7 +64,6 @@ import {
   ARTIFACTS_ROUTE,
   COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
-  KANBAN_ROUTE,
   MESSAGING_ROUTE,
   NEW_CHAT_ROUTE,
   PROFILES_ROUTE,
@@ -363,14 +361,6 @@ export function CommandPalette() {
             keywords: ['tools', 'toolsets'],
             label: cc.nav.skills.title,
             run: go(SKILLS_ROUTE)
-          },
-          {
-            action: 'nav.kanban',
-            icon: Layers3,
-            id: 'nav-kanban',
-            keywords: ['board', 'tasks', 'orchestration'],
-            label: cc.nav.kanban.title,
-            run: go(KANBAN_ROUTE)
           },
           {
             action: 'nav.messaging',

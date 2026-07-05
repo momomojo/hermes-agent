@@ -965,7 +965,6 @@ export const zhHant = defineLocale({
       newChat: { title: '新工作階段', detail: '開始新的工作階段' },
       settings: { title: '設定', detail: '設定 Hermes 桌面端' },
       skills: { title: '技能與工具', detail: '啟用技能、工具集和提供方' },
-      kanban: { title: '看板', detail: '檢視協調任務和交接' },
       messaging: { title: '訊息平台', detail: '設定 Telegram、Slack、Discord 等' },
       artifacts: { title: '成品', detail: '瀏覽產生的輸出' }
     },
@@ -1367,7 +1366,6 @@ export const zhHant = defineLocale({
     nav: {
       'new-session': '新工作階段',
       skills: '技能與工具',
-      kanban: '看板',
       messaging: '訊息平台',
       artifacts: '成品'
     },
