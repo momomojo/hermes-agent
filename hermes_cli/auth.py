@@ -46,7 +46,14 @@ import httpx
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    SKIP_WRITE,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+    locked_yaml_mutate,
+)
 
 logger = logging.getLogger(__name__)
 
