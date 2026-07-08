@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -237,6 +238,29 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+
+
+class LiveConfigApplyGateError(RuntimeError):
+    """Raised when a live-fleet config write needs a judge-gated apply."""
+
+
+_LIVE_CONFIG_APPLY_AUTHORIZED: ContextVar[bool] = ContextVar(
+    "_LIVE_CONFIG_APPLY_AUTHORIZED", default=False
+)
+
+# Narrowly scoped to the model/routing controls covered by the aux-pin
+# post-mortem. Benign local preferences and temp HERMES_HOME writes stay on the
+# ordinary config path; fleet-impacting routing applies on the default Hermes
+# root must go through ``hermes config apply --verdict ...``.
+_JUDGE_GATED_LIVE_CONFIG_ROOT_KEYS = frozenset(
+    {
+        "auxiliary",
+        "custom_providers",
+        "fallback_model",
+        "model",
+        "models",
+    }
+)
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -605,6 +629,99 @@ def get_config_path() -> Path:
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"
+
+
+def _platform_default_hermes_root() -> Path:
+    """Return the platform-native Hermes root, ignoring HERMES_HOME overrides."""
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = (
+            Path(local_appdata)
+            if local_appdata
+            else Path(os.path.expanduser("~")) / "AppData" / "Local"
+        )
+        return base / "hermes"
+    return Path(os.path.expanduser("~")) / ".hermes"
+
+
+def _is_default_live_fleet_config_path(config_path: str | Path | None = None) -> bool:
+    """True when ``config_path`` lives under the platform default Hermes root."""
+    path = Path(config_path) if config_path is not None else get_config_path()
+    live_root = _platform_default_hermes_root()
+    try:
+        path.resolve().relative_to(live_root.resolve())
+    except (OSError, ValueError):
+        return False
+    return (
+        (live_root / "state" / "judge-ledger.jsonl").exists()
+        or (live_root / "kanban.db").exists()
+    )
+
+
+def _guarded_live_config_root_key(dotted_key: str) -> str | None:
+    root_key = str(dotted_key or "").split(".", 1)[0].strip()
+    if root_key in _JUDGE_GATED_LIVE_CONFIG_ROOT_KEYS:
+        return root_key
+    return None
+
+
+def _changed_guarded_live_config_roots(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> list[str]:
+    sentinel = object()
+    changed: list[str] = []
+    for key in sorted(_JUDGE_GATED_LIVE_CONFIG_ROOT_KEYS):
+        if before.get(key, sentinel) != after.get(key, sentinel):
+            changed.append(key)
+    return changed
+
+
+def _format_live_config_gate_error(keys: list[str]) -> str:
+    rendered = ", ".join(sorted(set(keys)))
+    return (
+        "live-fleet config key(s) require a judge-gated apply: "
+        f"{rendered}. Use `hermes config apply --verdict <id> --change <slug> "
+        "(--title <exact-title> | --scope <phrase>) <key> <value>`."
+    )
+
+
+def _require_live_config_apply_authorized_for_keys(
+    keys: list[str],
+    *,
+    config_path: str | Path | None = None,
+) -> None:
+    guarded = [key for key in keys if key in _JUDGE_GATED_LIVE_CONFIG_ROOT_KEYS]
+    if (
+        guarded
+        and _is_default_live_fleet_config_path(config_path)
+        and not _LIVE_CONFIG_APPLY_AUTHORIZED.get()
+    ):
+        raise LiveConfigApplyGateError(_format_live_config_gate_error(guarded))
+
+
+def require_live_config_apply_authorized_for_key(
+    dotted_key: str,
+    *,
+    config_path: str | Path | None = None,
+) -> None:
+    """Refuse ungated writes to fleet-impacting config keys on the live root."""
+    root_key = _guarded_live_config_root_key(dotted_key)
+    if root_key:
+        _require_live_config_apply_authorized_for_keys(
+            [root_key], config_path=config_path
+        )
+
+
+@contextlib.contextmanager
+def authorized_live_config_apply():
+    """Allow one validated judge-gated apply path to mutate guarded live keys."""
+    token = _LIVE_CONFIG_APPLY_AUTHORIZED.set(True)
+    try:
+        yield
+    finally:
+        _LIVE_CONFIG_APPLY_AUTHORIZED.reset(token)
+
 
 def get_project_root() -> Path:
     """Get the project installation directory."""
@@ -5512,6 +5629,13 @@ def save_config(config: Dict[str, Any], *, expected_state: Any = _EXPECTED_STATE
                     _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
                 )
 
+            changed_guarded_roots = _changed_guarded_live_config_roots(
+                raw_existing, normalized
+            )
+            _require_live_config_apply_authorized_for_keys(
+                changed_guarded_roots, config_path=config_path
+            )
+
             # Build optional commented-out sections for features that are off by
             # default or only relevant when explicitly configured.
             parts = []
@@ -6224,6 +6348,19 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
+def _coerce_config_value(value: str):
+    """Coerce CLI config values to the scalar types config set has used."""
+    if value.lower() in {'true', 'yes', 'on'}:
+        return True
+    if value.lower() in {'false', 'no', 'off'}:
+        return False
+    if value.isdigit():
+        return int(value)
+    if value.replace('.', '', 1).isdigit():
+        return float(value)
+    return value
+
+
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
     if is_managed():
@@ -6251,14 +6388,12 @@ def set_config_value(key: str, value: str):
     config_path = get_config_path()
 
     # Convert value to appropriate type
-    if value.lower() in {'true', 'yes', 'on'}:
-        value = True
-    elif value.lower() in {'false', 'no', 'off'}:
-        value = False
-    elif value.isdigit():
-        value = int(value)
-    elif value.replace('.', '', 1).isdigit():
-        value = float(value)
+    value = _coerce_config_value(value)
+    try:
+        require_live_config_apply_authorized_for_key(key, config_path=config_path)
+    except LiveConfigApplyGateError as exc:
+        print(f"✗ Config set refused: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     # Read the raw user config (not merged with defaults, to avoid dumping
     # all default values back to the file), apply the key, and write —
@@ -6287,6 +6422,48 @@ def set_config_value(key: str, value: str):
     print(f"✓ Set {key} = {value} in {config_path}")
 
 
+def apply_config_value(args) -> None:
+    """Apply a config value through the judge-gated live-change path."""
+    if is_managed():
+        managed_error("apply configuration values")
+        return
+    title = getattr(args, "title", None)
+    scope = getattr(args, "scope", None)
+    if not (str(title or "").strip() or str(scope or "").strip()):
+        print(
+            "Usage: hermes config apply --verdict <id> --change <slug> "
+            "(--title <exact-title> | --scope <phrase>) <key> <value>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from hermes_cli.config_apply_gate import apply_gated_config_value
+    from hermes_cli.judge_gate import JudgeGateError
+
+    try:
+        result = apply_gated_config_value(
+            getattr(args, "key"),
+            _coerce_config_value(getattr(args, "value")),
+            verdict_id=getattr(args, "verdict"),
+            change=getattr(args, "change"),
+            expected_title=title,
+            expected_scope=scope,
+            ledger_path=getattr(args, "ledger", None),
+            board=getattr(args, "kanban_board", None),
+        )
+    except (JudgeGateError, ValueError) as exc:
+        print(f"✗ Config apply refused: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    print(
+        f"✓ Applied {getattr(args, 'key')} under judge verdict "
+        f"{result.verdict.id} in {result.config_path}"
+    )
+    print(f"✓ Backup: {result.backup_dir}")
+    if result.future_verification_task_id:
+        print(f"✓ Future-condition verification card: {result.future_verification_task_id}")
+
+
 # =============================================================================
 # Command handler
 # =============================================================================
@@ -6313,6 +6490,9 @@ def config_command(args):
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
         set_config_value(key, value)
+
+    elif subcmd == "apply":
+        apply_config_value(args)
     
     elif subcmd == "path":
         print(get_config_path())

@@ -34,6 +34,33 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     )
     config_set.add_argument("value", nargs="?", help="Value to set")
 
+    # config apply
+    config_apply = config_subparsers.add_parser(
+        "apply",
+        help="Apply a judge-gated configuration value",
+        description=(
+            "Apply one config.yaml value only after a matching APPROVE verdict "
+            "exists in the judge ledger. Creates a verdict-bound backup first."
+        ),
+    )
+    config_apply.add_argument(
+        "--verdict", required=True, help="Judge verdict id or ledger ts"
+    )
+    config_apply.add_argument(
+        "--change", required=True, help="Short change slug for backup naming"
+    )
+    config_apply.add_argument("--title", help="Exact expected judge-ledger title")
+    config_apply.add_argument(
+        "--scope",
+        help="Required phrase that must appear in the verdict title or detail",
+    )
+    config_apply.add_argument("--ledger", help="Override judge-ledger JSONL path")
+    config_apply.add_argument(
+        "--kanban-board", help="Board for future-condition verification cards"
+    )
+    config_apply.add_argument("key", help="Configuration key (e.g., model.default)")
+    config_apply.add_argument("value", help="Value to set")
+
     # config path
     config_subparsers.add_parser("path", help="Print config file path")
 
