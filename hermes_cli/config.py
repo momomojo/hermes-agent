@@ -6543,11 +6543,15 @@ _COMMENTED_SECTIONS = """
 """
 
 
+_CONFIG_SAVE_UNCHECKED = object()
+
+
 def save_config(
     config: Dict[str, Any],
     *,
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    expected_state: Any = _CONFIG_SAVE_UNCHECKED,
 ):
     """Save configuration to ~/.hermes/config.yaml.\n
 
@@ -6597,11 +6601,9 @@ def save_config(
         if raw_existing:
             normalized = _preserve_env_ref_templates(
                 normalized,
-                extra_content="".join(parts) if parts else None,
-                **write_kwargs,
+                raw_existing,
+                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
             )
-            _secure_file(config_path)
-            _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
         # Strip schema-default values so the user's custom settings are not
         # silently reset on every save.  Keys the user explicitly set (paths
@@ -6636,6 +6638,18 @@ def save_config(
             fb_is_valid = bool(fb.get("provider") and fb.get("model"))
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
+
+        write_kwargs = {}
+        if expected_state is not _CONFIG_SAVE_UNCHECKED:
+            write_kwargs["expected_state"] = expected_state
+        atomic_yaml_write(
+            config_path,
+            normalized,
+            extra_content="".join(parts) if parts else None,
+            **write_kwargs,
+        )
+        _secure_file(config_path)
+        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 @contextlib.contextmanager
 def config_update():

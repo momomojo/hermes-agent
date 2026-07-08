@@ -23,8 +23,13 @@ from plugins.memory.hindsight import (
     RETAIN_SCHEMA,
     _load_config,
     _build_embedded_profile_env,
+    _cap_turn_payload,
     _normalize_observation_scopes,
     _normalize_retain_tags,
+    _redact_home_codes,
+    _redact_medical_phi,
+    _redact_secrets,
+    _regex_search,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
@@ -214,6 +219,28 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
 def test_normalize_retain_tags_accepts_json_array_string():
     value = json.dumps(["agent:fakeassistantname", "source_system:hermes-agent"])
     assert _normalize_retain_tags(value) == ["agent:fakeassistantname", "source_system:hermes-agent"]
+
+
+def test_retain_safety_helpers_handle_enabled_knobs():
+    assert _regex_search(r"ignore\s+me", "please IGNORE me")
+    assert not _regex_search("[", "bad pattern should not raise")
+
+    secret_text = "password=banana Authorization: Bearer abcdefghijk"
+    assert "banana" not in _redact_secrets(secret_text)
+    assert "abcdefghijk" not in _redact_secrets(secret_text)
+
+    assert "1234" not in _redact_home_codes("door code: 1234")
+    phi = _redact_medical_phi("MRN: 12345 DOB: 12/27/2000 patient name: Jane Doe jane@example.com")
+    assert "12345" not in phi
+    assert "jane@example.com" not in phi
+
+    turn = json.dumps([
+        {"role": "user", "content": "x" * 200},
+        {"role": "assistant", "content": "y" * 200},
+    ])
+    capped = _cap_turn_payload([turn], max_payload_chars=120, oversize_policy="recent_turns")
+    assert len("[" + ",".join(capped) + "]") <= 120
+    assert "[truncated]" in capped[0]
 
 
 def test_normalize_observation_scopes_empty_is_none():

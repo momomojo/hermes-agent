@@ -436,6 +436,18 @@ def test_get_platform_tools_keeps_enabled_mcp_servers_with_explicit_builtin_sele
     assert "web-search-prime" in enabled
 
 
+def test_get_platform_tools_drops_retired_messaging_passthrough():
+    config = {
+        "platform_toolsets": {"cli": ["web", "terminal", "messaging"]},
+    }
+
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert "web" in enabled
+    assert "terminal" in enabled
+    assert "messaging" not in enabled
+
+
 def test_get_platform_tools_no_mcp_sentinel_excludes_all_mcp_servers():
     """The 'no_mcp' sentinel in platform_toolsets excludes all MCP servers."""
     config = {
@@ -1237,6 +1249,21 @@ def test_save_platform_tools_preserves_mcp_server_names():
     saved = config["platform_toolsets"]["cli"]
     assert "custom-mcp" in saved
     assert "another-mcp" in saved
+
+
+def test_save_platform_tools_clears_retired_messaging_passthrough():
+    config = {
+        "platform_toolsets": {
+            "cli": ["web", "terminal", "messaging", "custom-mcp"]
+        }
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", {"web", "browser"})
+
+    saved = config["platform_toolsets"]["cli"]
+    assert "messaging" not in saved
+    assert "custom-mcp" in saved
 
 
 def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():

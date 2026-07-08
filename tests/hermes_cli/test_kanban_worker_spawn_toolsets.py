@@ -45,6 +45,7 @@ platform_toolsets:
     - delegation
     - file
     - memory
+    - messaging
     - session_search
     - skills
     - terminal
@@ -87,6 +88,7 @@ agent:
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
+    assert "messaging" not in pinned
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):

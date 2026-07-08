@@ -507,6 +507,140 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+def _normalize_string_list(value: Any) -> List[str]:
+    """Normalize a config string/list into non-empty strings."""
+    return _normalize_retain_tags(value)
+
+
+def _redact_labeled_value(match: re.Match[str]) -> str:
+    quote = match.groupdict().get("quote") or ""
+    return f"{match.group('label')}{match.group('sep')}{quote}{_REDACTED}{quote}"
+
+
+def _redact_secrets(text: str) -> str:
+    redacted = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, text)
+    redacted = _AUTH_BEARER_RE.sub(
+        lambda m: f"{m.group('label')}{m.group('sep')}Bearer {_REDACTED}",
+        redacted,
+    )
+    redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_labeled_value, redacted)
+    redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", redacted)
+    return _COMMON_SECRET_RE.sub(_REDACTED, redacted)
+
+
+def _redact_home_codes(text: str) -> str:
+    return _HOME_CODE_RE.sub(_redact_labeled_value, text)
+
+
+def _redact_medical_phi(text: str) -> str:
+    redacted = _MEDICAL_LABELED_IDENTIFIER_RE.sub(_redact_labeled_value, text)
+    redacted = _EMAIL_RE.sub(_REDACTED, redacted)
+    redacted = _SSN_RE.sub(_REDACTED, redacted)
+    return _PHONE_RE.sub(_REDACTED, redacted)
+
+
+def _regex_search(pattern: str, text: str) -> bool:
+    try:
+        return re.search(pattern, text, re.IGNORECASE) is not None
+    except re.error as exc:
+        logger.warning("Invalid retain_noise_patterns entry %r: %s", pattern, exc)
+        return False
+
+
+def _payload_for_turns(turns: List[str]) -> str:
+    return "[" + ",".join(turns) + "]"
+
+
+def _truncate_text_with_marker(text: str, keep_chars: int) -> str:
+    if keep_chars <= 0:
+        return ""
+    if len(text) <= keep_chars:
+        return text
+    marker = "...[truncated] "
+    if keep_chars <= len(marker):
+        return text[-keep_chars:]
+    return marker + text[-(keep_chars - len(marker)):]
+
+
+def _turn_with_content_budget(messages: List[Dict[str, Any]], keep_chars: int) -> str:
+    remaining = max(0, keep_chars)
+    copied: List[Dict[str, Any]] = [
+        dict(msg) if isinstance(msg, dict) else {"content": str(msg)}
+        for msg in messages
+    ]
+    content_indexes = [
+        index for index, msg in enumerate(copied)
+        if isinstance(msg.get("content"), str)
+    ]
+    allocations = {index: 0 for index in content_indexes}
+    for index in reversed(content_indexes):
+        original = copied[index].get("content", "")
+        take = min(len(original), remaining)
+        allocations[index] = take
+        remaining -= take
+
+    for index in content_indexes:
+        copied[index]["content"] = _truncate_text_with_marker(
+            copied[index].get("content", ""),
+            allocations[index],
+        )
+    return json.dumps(copied, ensure_ascii=False)
+
+
+def _truncate_turn_to_payload(turn: str, max_payload_chars: int) -> str | None:
+    try:
+        messages = json.loads(turn)
+    except Exception:
+        return None
+    if not isinstance(messages, list):
+        return None
+
+    def payload_with_budget(keep_chars: int) -> str:
+        return _payload_for_turns([_turn_with_content_budget(messages, keep_chars)])
+
+    if len(payload_with_budget(0)) > max_payload_chars:
+        return None
+
+    total_content_chars = sum(
+        len(msg.get("content", ""))
+        for msg in messages
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+    )
+    low = 0
+    high = total_content_chars
+    best = _turn_with_content_budget(messages, 0)
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = _turn_with_content_budget(messages, mid)
+        if len(_payload_for_turns([candidate])) <= max_payload_chars:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _cap_turn_payload(turns: List[str], max_payload_chars: int, oversize_policy: str) -> List[str]:
+    if max_payload_chars <= 0 or len(_payload_for_turns(turns)) <= max_payload_chars:
+        return list(turns)
+    if oversize_policy != "recent_turns":
+        oversize_policy = "recent_turns"
+
+    capped: List[str] = []
+    for turn in reversed(turns):
+        candidate = [turn] + capped
+        if len(_payload_for_turns(candidate)) <= max_payload_chars:
+            capped = candidate
+            continue
+        if capped:
+            break
+        truncated = _truncate_turn_to_payload(turn, max_payload_chars)
+        if truncated is not None:
+            capped = [truncated]
+        break
+    return capped
+
+
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
 
 

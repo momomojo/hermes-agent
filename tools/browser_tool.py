@@ -1626,6 +1626,32 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
     return True
 
 
+def _registry_session_id(session_info: Dict[str, Any], session_key: str) -> str:
+    return str(
+        session_info.get("bb_session_id")
+        or session_info.get("session_name")
+        or session_key
+    )
+
+
+def _drop_browser_registry_session(
+    session_key: str,
+    session_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort browser session registry removal for a closed backend."""
+    try:
+        from tools.browser_session_registry import close_sessions
+
+        if session_info is None:
+            with _cleanup_lock:
+                session_info = dict(_active_sessions.get(session_key, {}))
+        if not session_info:
+            return
+        close_sessions(session_id=_registry_session_id(session_info, session_key))
+    except Exception as exc:
+        logger.debug("browser session registry cleanup failed: %s", exc)
+
+
 def _reap_orphaned_browser_sessions():
     """Scan for orphaned agent-browser daemon processes from previous runs.
 

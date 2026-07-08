@@ -41,6 +41,10 @@ _warned_invalid_platform_toolsets: Set[str] = set()
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
+# Retired platform_toolsets entries that older configs may still contain.
+# They are intentionally not preserved as custom/MCP passthrough names.
+_RETIRED_PASSTHROUGH_TOOLSETS = {"messaging"}
+
 
 # ─── UI Helpers (shared with setup.py) ────────────────────────────────────────
 
@@ -1623,6 +1627,7 @@ def _get_platform_tools(
         if ts not in configurable_keys
         and ts not in plugin_ts_keys
         and ts not in platform_default_keys
+        and ts not in _RETIRED_PASSTHROUGH_TOOLSETS
     }
 
     # MCP servers are expected to be available on all platforms by default.
@@ -1721,6 +1726,7 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
         entry for entry in existing_toolsets
         if entry not in configurable_keys and entry not in platform_default_keys
     }
+    preserved_entries -= _RETIRED_PASSTHROUGH_TOOLSETS
     # Opening `hermes tools` is the user's opt-in to reconfigure tools, so treat
     # saving from the picker as consent to clear the "no_mcp" sentinel. The
     # picker has no checkbox for no_mcp, so without this users who once set it
