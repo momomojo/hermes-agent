@@ -146,14 +146,10 @@ def _pid_alive(pid: Any) -> bool:
     if value <= 0:
         return False
     try:
-        os.kill(value, 0)
-        return True
-    except ProcessLookupError:
+        import psutil  # type: ignore
+    except Exception:
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return bool(psutil.pid_exists(value))
 
 
 def _profile_names() -> list[str]:
@@ -256,10 +252,20 @@ def _disabled_platforms(profile: str | None) -> set[str]:
     }
 
 
+def _launchd_gui_target(label: str) -> str | None:
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        return None
+    return f"gui/{getuid()}/{label}"
+
+
 def _launchd_service_pid(profile: str | None) -> int | None:
     """Live pid from launchd for the profile's gateway service, or None."""
     label = "ai.hermes.gateway" if not profile or profile == "default" else f"ai.hermes.gateway-{profile}"
-    result = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=10)
+    target = _launchd_gui_target(label)
+    if target is None:
+        return None
+    result = _run(["launchctl", "print", target], timeout=10)
     if not result["ok"]:
         return None
     m = re.search(r"^\s*pid = (\d+)", result["stdout"], re.MULTILINE)
@@ -370,7 +376,10 @@ def _check_launchd_jobs() -> list[str]:
     """One failure line per critical launchd job whose last run exited nonzero."""
     failures: list[str] = []
     for job in CRITICAL_LAUNCHD_JOBS:
-        result = _run(["launchctl", "print", f"gui/{os.getuid()}/{job}"], timeout=10)
+        target = _launchd_gui_target(job)
+        if target is None:
+            continue
+        result = _run(["launchctl", "print", target], timeout=10)
         if not result["ok"]:
             failures.append(f"launchd job missing: {job}")
             continue
