@@ -113,6 +113,14 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            # Worker network egress is opt-in per profile via
+            # HERMES_CODEX_WORKER_NETWORK (profile .env). Default stays
+            # false: a kanban worker's sandbox has no business on the
+            # network unless the profile's card lanes need to push
+            # branches / open PRs / install packages (codex-coding).
+            worker_network = spawn_env.get(
+                "HERMES_CODEX_WORKER_NETWORK", ""
+            ).strip().lower() in ("1", "true", "yes")
             app_server_args.extend(
                 [
                     "-c",
@@ -120,7 +128,8 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    "sandbox_workspace_write.network_access="
+                    + ("true" if worker_network else "false"),
                 ]
             )
 
