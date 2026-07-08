@@ -1,6 +1,8 @@
 """Shared utility functions for hermes-agent."""
 
+import contextlib
 import errno
+import hashlib
 import json
 import logging
 import os

@@ -6543,11 +6543,15 @@ _COMMENTED_SECTIONS = """
 """
 
 
+_EXPECTED_STATE_UNSET = object()
+
+
 def save_config(
     config: Dict[str, Any],
     *,
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+    expected_state: Any = _EXPECTED_STATE_UNSET,
 ):
     """Save configuration to ~/.hermes/config.yaml.\n
 
@@ -6557,85 +6561,99 @@ def save_config(
     contaminated with schema defaults on every save, which makes future
     default changes invisible to users.
     """
-    with _CONFIG_LOCK:
-        if is_managed():
-            managed_error("save configuration")
-            return
-        # Managed scope: strip any leaf the managed layer pins, so a bulk write
-        # (wizard / programmatic save) never persists a user value that would
-        # silently lose to managed on the next load. Single-key `config set`
-        # hard-rejects (see set_config_value); this is the mechanical safety net
-        # for bulk writes so the unmanaged remainder still lands.
-        from hermes_cli import managed_scope
+    from utils import atomic_yaml_write, config_file_lock
 
-        managed_keys = managed_scope.managed_config_keys()
-        if managed_keys:
-            config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
-            if _stripped:
-                print(
-                    f"Note: {len(_stripped)} managed setting(s) were not saved "
-                    f"(managed by your administrator): {', '.join(sorted(_stripped))}",
-                    file=sys.stderr,
+    config_path = get_config_path()
+    # Lock order: config_file_lock before _CONFIG_LOCK, matching
+    # config_update(), so same-process callers cannot deadlock.
+    with config_file_lock(config_path):
+        with _CONFIG_LOCK:
+            if is_managed():
+                managed_error("save configuration")
+                return
+            # Managed scope: strip any leaf the managed layer pins, so a bulk write
+            # (wizard / programmatic save) never persists a user value that would
+            # silently lose to managed on the next load. Single-key `config set`
+            # hard-rejects (see set_config_value); this is the mechanical safety net
+            # for bulk writes so the unmanaged remainder still lands.
+            from hermes_cli import managed_scope
+
+            managed_keys = managed_scope.managed_config_keys()
+            if managed_keys:
+                config, _stripped = _strip_dotted_keys(copy.deepcopy(config), managed_keys)
+                if _stripped:
+                    print(
+                        f"Note: {len(_stripped)} managed setting(s) were not saved "
+                        f"(managed by your administrator): {', '.join(sorted(_stripped))}",
+                        file=sys.stderr,
+                    )
+
+            ensure_hermes_home()
+            # Compute explicit user paths BEFORE any normalisation --------
+            # _normalize_max_turns_config may inject agent.max_turns from
+            # DEFAULT_CONFIG; using the raw dict preserves which paths the
+            # user actually set so _strip_default_values can keep them.
+            _raw_for_paths = read_raw_config()
+            explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
+                _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
+            )
+            # ----------------------------------------------------------------
+
+            current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+            normalized = current_normalized
+            raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
+            if raw_existing:
+                normalized = _preserve_env_ref_templates(
+                    normalized,
+                    raw_existing,
+                    _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
                 )
-        from utils import atomic_yaml_write
 
-        ensure_hermes_home()
-        config_path = get_config_path()
-        # Compute explicit user paths BEFORE any normalisation --------
-        # _normalize_max_turns_config may inject agent.max_turns from
-        # DEFAULT_CONFIG; using the raw dict preserves which paths the
-        # user actually set so _strip_default_values can keep them.
-        _raw_for_paths = read_raw_config()
-        explicit_raw_paths: Optional[Set[Tuple[str, ...]]] = (
-            _explicit_config_paths(_raw_for_paths) if _raw_for_paths else None
-        )
-        # ----------------------------------------------------------------
+            # Strip schema-default values so the user's custom settings are not
+            # silently reset on every save.  Keys the user explicitly set (paths
+            # from the raw pre-normalisation config) are always preserved.
+            effective_preserve_keys: Set[Tuple[str, ...]] = {("_config_version",)}
+            if explicit_raw_paths:
+                effective_preserve_keys.update(explicit_raw_paths)
+            if preserve_keys:
+                effective_preserve_keys.update(preserve_keys)
 
-        current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-        normalized = current_normalized
-        raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
-        if raw_existing:
-            normalized = _preserve_env_ref_templates(
+            if strip_defaults and effective_preserve_keys:
+                # _preserve_env_ref_templates may return Any; cast for type-checker.
+                from typing import cast as _cast
+                normalized = _cast(Dict[str, Any], normalized)
+                normalized = _strip_default_values(
+                    normalized,  # type: ignore[arg-type]
+                    DEFAULT_CONFIG,
+                    preserve_keys=effective_preserve_keys,
+                )
+
+            # Build optional commented-out sections for features that are off by
+            # default or only relevant when explicitly configured.
+            parts = []
+            sec = normalized.get("security", {})
+            if not sec or sec.get("redact_secrets") is None:
+                parts.append(_SECURITY_COMMENT)
+            fb = normalized.get("fallback_model", {})
+            fb_is_valid = False
+            if isinstance(fb, list):
+                fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
+            elif isinstance(fb, dict):
+                fb_is_valid = bool(fb.get("provider") and fb.get("model"))
+            if not fb_is_valid:
+                parts.append(_FALLBACK_COMMENT)
+
+            write_kwargs: Dict[str, Any] = {}
+            if expected_state is not _EXPECTED_STATE_UNSET:
+                write_kwargs["expected_state"] = expected_state
+            atomic_yaml_write(
+                config_path,
                 normalized,
                 extra_content="".join(parts) if parts else None,
                 **write_kwargs,
             )
             _secure_file(config_path)
             _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
-
-        # Strip schema-default values so the user's custom settings are not
-        # silently reset on every save.  Keys the user explicitly set (paths
-        # from the raw pre-normalisation config) are always preserved.
-        effective_preserve_keys: Set[Tuple[str, ...]] = {("_config_version",)}
-        if explicit_raw_paths:
-            effective_preserve_keys.update(explicit_raw_paths)
-        if preserve_keys:
-            effective_preserve_keys.update(preserve_keys)
-
-        if strip_defaults and effective_preserve_keys:
-            # _preserve_env_ref_templates may return Any; cast for type-checker.
-            from typing import cast as _cast
-            normalized = _cast(Dict[str, Any], normalized)
-            normalized = _strip_default_values(
-                normalized,  # type: ignore[arg-type]
-                DEFAULT_CONFIG,
-                preserve_keys=effective_preserve_keys,
-            )
-
-        # Build optional commented-out sections for features that are off by
-        # default or only relevant when explicitly configured.
-        parts = []
-        sec = normalized.get("security", {})
-        if not sec or sec.get("redact_secrets") is None:
-            parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_model", {})
-        fb_is_valid = False
-        if isinstance(fb, list):
-            fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
-        elif isinstance(fb, dict):
-            fb_is_valid = bool(fb.get("provider") and fb.get("model"))
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
 
 @contextlib.contextmanager
 def config_update():
