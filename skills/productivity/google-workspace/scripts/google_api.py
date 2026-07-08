@@ -42,15 +42,12 @@ HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 
+# Least-privilege default for the shared helper: gmail.modify covers read,
+# label/archive, draft, and send workflows. Profiles that require additional
+# Workspace APIs should re-issue a profile-specific token instead of expanding
+# this bundled default for everyone.
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents",
 ]
 
 

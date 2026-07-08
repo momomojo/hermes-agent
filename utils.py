@@ -1,14 +1,18 @@
 """Shared utility functions for hermes-agent."""
 
+import contextlib
 import errno
+import hashlib
 import json
 import logging
 import os
 import shutil
 import stat
+import sys
 import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Callable, Optional, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -108,6 +112,182 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     return real_path
 
 
+# ─── Config Write Locking ─────────────────────────────────────────────────────
+#
+# atomic_yaml_write makes individual writes crash-safe, but two concurrent
+# read-modify-write cycles still race last-writer-wins: both read the same
+# config.yaml, each applies its own edit, and whichever os.replace lands
+# second silently drops the other's change.  The helpers below add the
+# missing serialization, mirroring the kanban _cross_process_init_lock
+# pattern (hermes_cli/kanban_db.py): an advisory lock on a sidecar file
+# (flock on POSIX, msvcrt byte-range on Windows) held across the FULL
+# read→edit→os.replace cycle, plus an mtime+hash stale-write guard as a
+# backstop against writers that don't take the lock (older binaries,
+# manual edits mid-cycle).
+
+_IS_WINDOWS = sys.platform == "win32"
+
+# Sentinel distinguishing "no stale check requested" from "file was absent
+# at read time" (where the snapshot itself is None).
+_STATE_UNCHECKED = object()
+
+# Returned by a locked_yaml_mutate() mutate callback to skip the write
+# entirely (e.g. the value is already set).
+SKIP_WRITE = object()
+
+
+class ConfigWriteConflictError(RuntimeError):
+    """Config file changed on disk between read and write.
+
+    Raised by the stale-write guard when a concurrent writer (one not
+    holding the config lock) modified the file mid read-modify-write
+    cycle.  Persisting anyway would silently revert that writer's change.
+    """
+
+
+def file_write_state(path: Union[str, Path]) -> "tuple | None":
+    """Snapshot (mtime_ns, size, sha256) of *path*, or ``None`` if absent.
+
+    Capture this at read time and pass it as ``expected_state`` to
+    :func:`atomic_yaml_write` to detect writes that raced the cycle.
+    Follows symlinks, matching :func:`atomic_replace` semantics.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, digest.hexdigest())
+
+
+def config_lock_path(path: Union[str, Path]) -> Path:
+    """Sidecar lock file guarding read-modify-write cycles on *path*.
+
+    For ``~/.hermes/config.yaml`` this is ``~/.hermes/.config.lock``; for a
+    profile's ``~/.hermes/profiles/<p>/config.yaml`` it is
+    ``~/.hermes/profiles/<p>/.config.lock`` — one lock per config file, so
+    profiles don't serialize against each other or against global config.
+    """
+    path = Path(path)
+    return path.parent / f".{path.stem}.lock"
+
+
+class _ConfigLockState:
+    """Per-lock-path state: thread gate + re-entrancy depth + OS handle."""
+
+    __slots__ = ("thread_lock", "depth", "handle")
+
+    def __init__(self) -> None:
+        self.thread_lock = threading.RLock()
+        self.depth = 0
+        self.handle = None
+
+
+_CONFIG_LOCK_STATES: "dict[str, _ConfigLockState]" = {}
+_CONFIG_LOCK_REGISTRY_GUARD = threading.Lock()
+
+
+def _reset_config_locks_after_fork() -> None:
+    """Drop inherited lock state in a forked child.
+
+    A child forked while the parent holds a config lock inherits a registry
+    whose depth>0 entry would make the child skip the flock and write inside
+    the parent's critical section.  Resetting forces the child to acquire
+    fresh (it blocks until the parent releases).  The inherited handle is
+    abandoned, not closed here — the parent's fd keeps the flock alive, and
+    closing one duplicate of a shared open-file description doesn't release
+    it anyway.
+    """
+    global _CONFIG_LOCK_STATES, _CONFIG_LOCK_REGISTRY_GUARD
+    _CONFIG_LOCK_REGISTRY_GUARD = threading.Lock()
+    _CONFIG_LOCK_STATES = {}
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_config_locks_after_fork)
+
+
+@contextlib.contextmanager
+def config_file_lock(path: Union[str, Path]):
+    """Advisory cross-process lock for a config read-modify-write cycle.
+
+    Hold this across the FULL cycle (read → edit → os.replace), not just
+    the write — locking only the write still loses updates because both
+    writers read the same starting state.
+
+    Re-entrant within a thread (``save_config`` may run inside a caller's
+    locked cycle); distinct threads in one process serialize on a per-path
+    RLock, and distinct processes serialize on the sidecar file lock.
+    """
+    lock_path = config_lock_path(path)
+    key = str(lock_path)
+    with _CONFIG_LOCK_REGISTRY_GUARD:
+        state = _CONFIG_LOCK_STATES.setdefault(key, _ConfigLockState())
+    with state.thread_lock:
+        if state.depth == 0:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            try:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    # Byte-range lock on the first byte; seek explicitly
+                    # because msvcrt.locking starts at the file position.
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except BaseException:
+                handle.close()
+                raise
+            state.handle = handle
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                handle = state.handle
+                state.handle = None
+                try:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+
+
+def _replace_with_guard(tmp_path: str, path: Path, expected_state: Any) -> str:
+    """Atomically swap *tmp_path* onto *path*, enforcing the stale guard.
+
+    The re-stat happens immediately before ``os.replace``; the residual
+    window is closed by callers holding :func:`config_file_lock` — the
+    guard exists to catch writers that bypass the lock.
+    """
+    if expected_state is not _STATE_UNCHECKED:
+        current = file_write_state(path)
+        if current != expected_state:
+            raise ConfigWriteConflictError(
+                f"{path} changed on disk since it was read; aborting write to "
+                f"avoid reverting the concurrent change (re-read and retry)"
+            )
+    return atomic_replace(tmp_path, path)
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,
@@ -177,6 +357,22 @@ def atomic_json_write(
         raise
 
 
+class IndentDumper(yaml.SafeDumper):
+    """PyYAML dumper that indents list items under mapping keys (2-space).
+
+    Default PyYAML emits "indentless" sequences — list items start at the
+    same column as their parent mapping key.  ``ruamel.yaml`` (used by
+    :func:`atomic_roundtrip_yaml_update`) emits 2-space-indented sequences.
+    Mixing both styles in the same ``config.yaml`` produces a file that
+    stricter parsers like ``js-yaml`` reject with ``bad indentation of a
+    mapping entry``.  Forcing ``indentless=False`` aligns the two
+    serializers so all write paths emit byte-identical layouts (#31999).
+    """
+
+    def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
+        return super().increase_indent(flow, False)
+
+
 def atomic_yaml_write(
     path: Union[str, Path],
     data: Any,
@@ -184,6 +380,7 @@ def atomic_yaml_write(
     default_flow_style: bool = False,
     sort_keys: bool = False,
     extra_content: str | None = None,
+    expected_state: Any = _STATE_UNCHECKED,
 ) -> None:
     """Write YAML data to a file atomically.
 
@@ -198,6 +395,11 @@ def atomic_yaml_write(
         sort_keys: Whether to sort dict keys (default False).
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
+        expected_state: Stale-write guard for read-modify-write callers —
+            pass the :func:`file_write_state` snapshot captured when the
+            file was read (``None`` if it was absent).  If the file
+            changed since, raises :class:`ConfigWriteConflictError`
+            instead of replacing.  Omit for plain overwrites.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,13 +413,27 @@ def atomic_yaml_write(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=default_flow_style, sort_keys=sort_keys)
+            # allow_unicode=True writes emoji/kaomoji (e.g. personalities, skin
+            # cursors) as real UTF-8 instead of fragile escape sequences. Without
+            # it, PyYAML emits astral-plane chars as `\UXXXXXXXX` (8-digit) escapes
+            # inside multi-line double-quoted strings wrapped with `\`
+            # continuations — a structure that stricter/non-PyYAML parsers and
+            # hand-edits routinely break into unclosed quotes, corrupting the whole
+            # config (GitHub #51356).
+            yaml.dump(
+                data,
+                f,
+                Dumper=IndentDumper,
+                default_flow_style=default_flow_style,
+                sort_keys=sort_keys,
+                allow_unicode=True,
+            )
             if extra_content:
                 f.write(extra_content)
             f.flush()
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
-        real_path = atomic_replace(tmp_path, path)
+        real_path = _replace_with_guard(tmp_path, path, expected_state)
         _restore_file_mode(real_path, original_mode)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
@@ -233,6 +449,8 @@ def atomic_roundtrip_yaml_update(
     path: Union[str, Path],
     key_path: str,
     value: Any,
+    *,
+    max_attempts: int = 3,
 ) -> None:
     """Update one dotted YAML key while preserving comments and readable text.
 
@@ -240,6 +458,13 @@ def atomic_roundtrip_yaml_update(
     user-edited config files where comments, ordering, quoting, and Unicode
     should survive a single setting mutation.  Writes still use the same temp
     file + fsync + atomic replace pattern.
+
+    The full read-modify-write cycle runs under :func:`config_file_lock`,
+    so concurrent updaters serialize instead of losing each other's keys.
+    If a non-locking writer still lands mid-cycle (stale-write guard), the
+    cycle re-reads and re-applies up to *max_attempts* times — safe because
+    setting one dotted key is idempotent — then raises
+    :class:`ConfigWriteConflictError`.
     """
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
@@ -253,44 +478,113 @@ def atomic_roundtrip_yaml_update(
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            config = yaml_rt.load(f) or CommentedMap()
-    else:
-        config = CommentedMap()
+    with config_file_lock(path):
+        for attempt in range(max_attempts):
+            snapshot = file_write_state(path)
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    config = yaml_rt.load(f) or CommentedMap()
+            else:
+                config = CommentedMap()
 
-    if not isinstance(config, CommentedMap):
-        config = CommentedMap(config)
+            if not isinstance(config, CommentedMap):
+                config = CommentedMap(config)
 
-    current = config
-    keys = key_path.split(".")
-    for key in keys[:-1]:
-        next_value = current.get(key)
-        if not isinstance(next_value, CommentedMap):
-            next_value = CommentedMap()
-            current[key] = next_value
-        current = next_value
-    current[keys[-1]] = value
+            current = config
+            keys = key_path.split(".")
+            for key in keys[:-1]:
+                next_value = current.get(key)
+                if not isinstance(next_value, CommentedMap):
+                    next_value = CommentedMap()
+                    current[key] = next_value
+                current = next_value
+            current[keys[-1]] = value
 
-    original_mode = _preserve_file_mode(path)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent),
-        prefix=f".{path.stem}_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(config, f)
-            f.flush()
-            os.fsync(f.fileno())
-        real_path = atomic_replace(tmp_path, path)
-        _restore_file_mode(real_path, original_mode)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+            original_mode = _preserve_file_mode(path)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix=f".{path.stem}_",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    yaml_rt.dump(config, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                real_path = _replace_with_guard(tmp_path, path, snapshot)
+                _restore_file_mode(real_path, original_mode)
+                return
+            except BaseException as exc:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                if (
+                    isinstance(exc, ConfigWriteConflictError)
+                    and attempt < max_attempts - 1
+                ):
+                    continue
+                raise
+
+
+def locked_yaml_mutate(
+    path: Union[str, Path],
+    mutate: Callable[[dict], Any],
+    *,
+    sort_keys: bool = False,
+    default_flow_style: bool = False,
+    extra_content: "str | None" = None,
+    max_attempts: int = 3,
+) -> Optional[dict]:
+    """Run a full read→modify→write cycle on a YAML mapping file, safely.
+
+    Serializes the WHOLE cycle under :func:`config_file_lock` (not just the
+    write) so two concurrent updates compose instead of last-writer-wins,
+    and verifies the stale-write guard before replacing in case a
+    non-locking writer raced anyway — in which case the cycle re-reads and
+    re-applies *mutate*, up to *max_attempts* times.
+
+    *mutate* receives the parsed dict (``{}`` if the file is absent or
+    unparseable, matching the raw-read behavior of the call sites this
+    replaces).  It edits in place, or returns a replacement dict, or
+    returns :data:`SKIP_WRITE` to abort without writing (e.g. the value is
+    already set).  Because of the retry loop it must be safe to call more
+    than once.
+
+    Returns the dict that was written, or ``None`` when skipped.
+    """
+    path = Path(path)
+    with config_file_lock(path):
+        for attempt in range(max_attempts):
+            snapshot = file_write_state(path)
+            data: dict = {}
+            if path.exists():
+                try:
+                    with path.open(encoding="utf-8") as f:
+                        data = yaml.safe_load(f) or {}
+                except Exception:
+                    data = {}
+                if not isinstance(data, dict):
+                    data = {}
+            result = mutate(data)
+            if result is SKIP_WRITE:
+                return None
+            if result is not None:
+                data = result
+            try:
+                atomic_yaml_write(
+                    path,
+                    data,
+                    sort_keys=sort_keys,
+                    default_flow_style=default_flow_style,
+                    extra_content=extra_content,
+                    expected_state=snapshot,
+                )
+                return data
+            except ConfigWriteConflictError:
+                if attempt == max_attempts - 1:
+                    raise
+    return None
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
@@ -309,6 +603,34 @@ def safe_json_loads(text: str, default: Any = None) -> Any:
         return default
 
 
+# ── Fast YAML loading ────────────────────────────────────────────────────
+#
+# PyYAML's pure-Python SafeLoader is ~8x slower than the libyaml-backed
+# ``CSafeLoader`` C extension. Startup parses config.yaml and every plugin
+# manifest with the slow path, costing ~0.9s of cold-start time. The C loader
+# is a true drop-in for ``safe_load`` (same restricted tag set), so prefer it
+# and fall back to the pure-Python loader only when libyaml isn't compiled in.
+_fast_yaml_loader = None
+
+
+def _get_fast_yaml_loader():
+    global _fast_yaml_loader
+    if _fast_yaml_loader is None:
+        _fast_yaml_loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return _fast_yaml_loader
+
+
+def fast_safe_load(stream: Any) -> Any:
+    """``yaml.safe_load`` using the libyaml C loader when available.
+
+    Accepts the same inputs as ``yaml.safe_load`` (a ``str``/``bytes`` document
+    or a readable file object) and returns the same parsed structure. Falls
+    back to PyYAML's pure-Python ``SafeLoader`` when ``CSafeLoader`` isn't
+    available, so behavior is identical everywhere — only the speed differs.
+    """
+    return yaml.load(stream, Loader=_get_fast_yaml_loader())
+
+
 # ─── Environment Variable Helpers ─────────────────────────────────────────────
 
 
@@ -319,6 +641,17 @@ def env_int(key: str, default: int = 0) -> int:
         return default
     try:
         return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def env_float(key: str, default: float = 0.0) -> float:
+    """Read an environment variable as a float, with fallback."""
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except (ValueError, TypeError):
         return default
 

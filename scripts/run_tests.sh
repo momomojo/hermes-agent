@@ -19,12 +19,17 @@
 #   scripts/run_tests.sh tests/agent/               # discover only here
 #   scripts/run_tests.sh tests/agent/ tests/acp/    # multiple roots
 #   scripts/run_tests.sh tests/foo.py               # single file
-#   scripts/run_tests.sh tests/foo.py -- --tb=long  # path + pytest args
-#   scripts/run_tests.sh -- -v --tb=long            # pytest args only
+#   scripts/run_tests.sh tests/foo.py -q            # path + bare pytest flag
+#   scripts/run_tests.sh tests/foo.py -v --tb=long  # bare flags "just work"
+#   scripts/run_tests.sh -k 'pattern'               # value flags pass through too
+#   scripts/run_tests.sh tests/foo.py -- --tb=long  # explicit '--' still works
 #
-# Everything after a literal '--' is passed through to each per-file
-# pytest invocation. Positional path arguments before '--' override
-# the default discovery root (tests/).
+# Bare pytest flags (anything starting with '-' that isn't one of this
+# runner's own options: -j/--jobs, --paths, --slice, --file-timeout, etc.)
+# are forwarded to each per-file pytest invocation automatically — no '--'
+# separator required. The explicit '--' form still works and stacks with
+# bare flags. Positional path arguments override the default discovery
+# root (tests/).
 
 set -euo pipefail
 
@@ -61,19 +66,32 @@ fi
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
+# HERMES_HOME must be set before pytest collection starts; conftest.py's
+# per-test fixture is too late for collection-time imports that log on import.
+TEST_HERMES_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-test-home.XXXXXX")"
+mkdir -p "$TEST_HERMES_HOME"/{logs,sessions,cron,memories,skills,plugins}
+cleanup() {
+  rm -rf "$TEST_HERMES_HOME"
+}
+trap cleanup EXIT
+
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env; HERMES_HOME=$TEST_HERMES_HOME)"
 
 cd "$REPO_ROOT"
 
-exec env -i \
+env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  HERMES_HOME="$TEST_HERMES_HOME" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONDONTWRITEBYTECODE=1 \
+  ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+rc=$?
+exit "$rc"

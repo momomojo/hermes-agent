@@ -366,7 +366,18 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
 # Worker aliveness / crash detection
 # ---------------------------------------------------------------------------
 
-def test_pid_alive_helper():
+def test_pid_alive_helper(monkeypatch):
+    from gateway import status as gateway_status
+
+    real_pid_exists = gateway_status._pid_exists
+
+    def fake_pid_exists(pid):
+        if int(pid) == 2 ** 30:
+            return False
+        return real_pid_exists(pid)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", fake_pid_exists)
+
     # Our own pid is alive.
     assert kb._pid_alive(os.getpid())
     # PID 0 / None / negative.
@@ -1701,6 +1712,68 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
         conn.close()
 
 
+def test_relative_age_renders_coarse_buckets():
+    """Freshness helper turns epoch seconds into coarse human ages, and
+    degrades safely on missing / future timestamps."""
+    now = 1_000_000
+    assert kb._relative_age(now, now) == "just now"
+    assert kb._relative_age(now - 30, now) == "just now"
+    assert kb._relative_age(now - 5 * 60, now) == "5m ago"
+    assert kb._relative_age(now - 18 * 3600, now) == "18h ago"
+    assert kb._relative_age(now - 2 * 86400, now) == "2d ago"
+    # Clock skew across machines/profiles must not claim "in the future".
+    assert kb._relative_age(now + 500, now) == "just now"
+    # Missing / unparseable timestamps render empty so callers can append
+    # unconditionally.
+    assert kb._relative_age(None, now) == ""
+    # Defensive: an unparseable value (e.g. a stray string) renders empty
+    # rather than raising.
+    assert kb._relative_age("garbage", now) == ""  # type: ignore[arg-type]
+
+
+def test_build_worker_context_stamps_parent_freshness(kanban_home):
+    """Parent handoffs carry a relative age + a 'verify against source'
+    frame so a worker doesn't read a day-old result as live state.
+
+    This is the multi-agent staleness gap: an orchestrator + sibling
+    workers leave reports/handoffs that the next worker reads as current
+    truth. The age stamp is the signal that prompts re-verification.
+    """
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="research", assignee="researcher")
+        child = kb.create_task(
+            conn, title="write", assignee="writer", parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(
+            conn, parent,
+            result="done",
+            summary="meeting ingest workflow finished; pipeline ready",
+        )
+        # Backdate the parent's completion to 18h ago — both the task row
+        # and its completed run row, which is where build_worker_context
+        # reads the handoff timestamp from.
+        old = int(time.time()) - 18 * 3600
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at = ? WHERE id = ?", (old, parent),
+            )
+            conn.execute(
+                "UPDATE task_runs SET ended_at = ? WHERE task_id = ?",
+                (old, parent),
+            )
+
+        ctx = kb.build_worker_context(conn, child)
+        # The handoff still appears...
+        assert "meeting ingest workflow finished" in ctx
+        # ...now stamped with its age and framed as a point-in-time snapshot.
+        assert "completed 18h ago" in ctx
+        assert "point-in-time snapshots, not live state" in ctx
+    finally:
+        conn.close()
+
+
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
     """An existing 'running' task from before task_runs existed should
     get a synthesized run row so subsequent operations (complete,
@@ -2030,6 +2103,49 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
         events = kb.list_events(conn, tid)
         comp = [e for e in events if e.kind == "completed"][0]
         assert comp.payload.get("summary") is None
+    finally:
+        conn.close()
+
+
+def test_completed_event_records_manual_provenance(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="manual", assignee="worker")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="operator verified",
+            completed_by="operator",
+        )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][0]
+        assert event.payload["completion_source"] == "manual"
+        assert event.payload["completed_by"] == "operator"
+        assert event.payload["run_id"] == event.run_id
+        assert event.payload["evidence_present"] is True
+    finally:
+        conn.close()
+
+
+def test_completed_event_records_worker_run_provenance(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker", assignee="ops")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="worker done",
+            expected_run_id=run_id,
+            completed_by="ops",
+            worker_session_id="sess_123",
+        )
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "completed"][0]
+        assert event.payload["completion_source"] == "worker"
+        assert event.payload["completed_by"] == "ops"
+        assert event.payload["worker_session_id"] == "sess_123"
+        assert event.payload["expected_run_id"] == run_id
     finally:
         conn.close()
 
@@ -2703,20 +2819,17 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
         conn.close()
 
 
-def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
-    """The dispatcher's _default_spawn must include --skills kanban-worker
-    in its argv so every worker loads the skill automatically, even if
-    the profile hasn't wired it into its default skills config.
+def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
+    """The dispatcher no longer auto-loads a bundled kanban skill.
+
+    The kanban lifecycle (formerly the kanban-worker/kanban-orchestrator
+    skills) is now injected into every worker's system prompt via
+    KANBAN_GUIDANCE, so _default_spawn must NOT append a `--skills` flag
+    when the task carries no per-task skills.
 
     We intercept Popen to capture the argv without actually spawning a
     hermes subprocess (which would hang trying to call an LLM).
     """
-    # Pretend the bundled kanban-worker skill resolves for this isolated
-    # HERMES_HOME — the fixture creates an empty tmpdir without the
-    # devops/kanban-worker tree, and _default_spawn gates the --skills
-    # flag on actual resolvability.
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
-
     captured = {}
 
     class FakeProc:
@@ -2742,10 +2855,8 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
         conn.close()
 
     cmd = captured["cmd"]
-    assert "--skills" in cmd, f"spawn argv missing --skills: {cmd}"
-    idx = cmd.index("--skills")
-    assert cmd[idx + 1] == "kanban-worker", (
-        f"expected 'kanban-worker', got {cmd[idx + 1]!r}"
+    assert "--skills" not in cmd, (
+        f"spawn argv should not auto-load any skill: {cmd}"
     )
     assert "--accept-hooks" in cmd, f"spawn argv missing --accept-hooks: {cmd}"
     assert cmd.index("--accept-hooks") < cmd.index("chat"), (
@@ -2983,10 +3094,141 @@ def test_create_task_skills_lists_all_toolset_typos(kanban_home):
         conn.close()
 
 
+def test_create_task_rejects_unknown_skill_when_profile_skills_initialized(kanban_home):
+    """Creation catches bad forced skills once the assignee has a skills dir."""
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="unknown skill"):
+            kb.create_task(
+                conn,
+                title="needs missing skill",
+                assignee="ops",
+                skills=["missing-skill"],
+            )
+
+        skill_dir = profile_home / "skills" / "present-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: present-skill\ndescription: test\n---\nUse it.\n",
+            encoding="utf-8",
+        )
+        tid = kb.create_task(
+            conn,
+            title="has skill",
+            assignee="ops",
+            skills=["present-skill"],
+        )
+        assert kb.get_task(conn, tid).skills == ["present-skill"]
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_legacy_task_with_missing_forced_skill(
+    kanban_home, all_assignees_spawnable
+):
+    """A drifted legacy card blocks pre-spawn instead of crashing a worker."""
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy", assignee="ops")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(["ghost-skill"]), tid),
+            )
+
+        res = kb.dispatch_once(conn)
+
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
+def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Every skill destined for --skills is checked before worker spawn.
+
+    This covers injected dispatcher skills, not only the task.skills column.
+    If the dispatcher would pass kanban-worker but the worker profile cannot
+    resolve it, the card must block without claiming or spawning.
+    """
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: True)
+
+    spawn_attempts = []
+
+    def fail_popen(*args, **kwargs):
+        spawn_attempts.append((args, kwargs))
+        raise AssertionError("dispatcher must block before spawning")
+
+    monkeypatch.setattr("subprocess.Popen", fail_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs worker skill", assignee="ops")
+
+        res = kb.dispatch_once(conn)
+
+        assert spawn_attempts == []
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        assert res.skill_blocked[0]["skills"] == ["kanban-worker"]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        events = kb.list_events(conn, tid)
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked
+        assert blocked[-1].payload["reason"].startswith(
+            "missing-skills:kanban-worker"
+        )
+        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
+def test_kanban_preflight_reports_missing_task_skill(kanban_home):
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy", assignee="ops")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(["ghost-skill"]), tid),
+            )
+        report = kb.preflight_skill_references(conn)
+        assert report["ok"] is False
+        assert report["missing"][0]["task_id"] == tid
+        assert report["missing"][0]["name"] == "ghost-skill"
+    finally:
+        conn.close()
+
+
 def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     """Dispatcher argv must carry one `--skills X` pair per task skill,
-    in addition to the built-in kanban-worker."""
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+    in declared order. No skill is auto-loaded anymore."""
     captured = {}
 
     class FakeProc:
@@ -3019,10 +3261,8 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     for i, tok in enumerate(cmd):
         if tok == "--skills" and i + 1 < len(cmd):
             skill_names.append(cmd[i + 1])
-    # kanban-worker first (built-in), then per-task extras in order.
-    assert skill_names[0] == "kanban-worker", skill_names
-    assert "translation" in skill_names
-    assert "github-code-review" in skill_names
+    # Only the per-task skills, in declared order — nothing auto-loaded.
+    assert skill_names == ["translation", "github-code-review"], skill_names
     # --skills must appear BEFORE the `chat` subcommand so argparse
     # attaches them to the top-level parser, not the subcommand.
     chat_idx = cmd.index("chat")
@@ -3034,9 +3274,9 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     )
 
 
-def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monkeypatch):
-    """If a task explicitly lists 'kanban-worker', we don't double-pass it."""
-    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
+    """Per-task skills are passed through verbatim — there is no built-in
+    kanban skill to dedupe against anymore."""
     captured = {}
 
     class FakeProc:
@@ -3052,7 +3292,7 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
     try:
         tid = kb.create_task(
             conn, title="dup", assignee="x",
-            skills=["kanban-worker", "translation"],
+            skills=["translation", "github-code-review"],
         )
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
@@ -3061,12 +3301,14 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
         conn.close()
 
     cmd = captured["cmd"]
-    worker_pairs = [
-        i for i, tok in enumerate(cmd)
-        if tok == "--skills" and i + 1 < len(cmd) and cmd[i + 1] == "kanban-worker"
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
     ]
-    assert len(worker_pairs) == 1, (
-        f"kanban-worker appeared {len(worker_pairs)} times in argv: {cmd}"
+    # Exactly the task's skills, once each, in order — no auto-loaded extras.
+    assert skill_names == ["translation", "github-code-review"], (
+        f"unexpected --skills in argv: {cmd}"
     )
 
 
@@ -4325,8 +4567,10 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         conn.close()
 
 
-def test_detect_crashed_workers_increments_counter(kanban_home):
+def test_detect_crashed_workers_increments_counter(kanban_home, monkeypatch):
     """A single crash increments the consecutive_failures counter."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
@@ -4479,6 +4723,17 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock, **_kwargs: {
+            "prev_pid": int(pid) if pid else None,
+            "host_local": bool(claim_lock),
+            "termination_attempted": False,
+            "terminated": False,
+            "sigkill": False,
+        },
+    )
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-dispatch", assignee="worker")

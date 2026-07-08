@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
+from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +69,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -314,6 +315,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--project", default=None,
+                          help="Link to a project (id or slug). Anchors the task's "
+                               "worktree under the project's primary repo with a "
+                               "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -330,8 +335,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
-                               "(repeatable). Appended to the built-in "
-                               "kanban-worker skill. Example: "
+                               "(repeatable). The kanban lifecycle is already "
+                               "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
@@ -554,6 +559,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
+    p_block.add_argument(
+        "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
+        help=(
+            "Typed block reason. 'dependency' waits in todo (auto-promoted "
+            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "Repeated same-kind re-blocks after unblock route the task to "
+            "triage to break unblock loops. Omit for a generic block."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -632,6 +647,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help=f"Auto-block a task after this many consecutive non-success attempts "
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
+
+    p_preflight = sub.add_parser(
+        "preflight",
+        help="Validate live Kanban skill references against assignee profiles",
+    )
+    p_preflight.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
@@ -945,6 +966,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
+            "preflight": _cmd_preflight,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
@@ -1223,21 +1245,6 @@ def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
 
-    # Seed bundled skills (e.g. kanban-worker) into the active profile so
-    # the kanban dispatcher can use them without a separate `hermes profile
-    # create` step.  This is best-effort — a missing or broken profile is
-    # not fatal to `kanban init`.
-    try:
-        profile_name = get_active_profile_name() or "default"
-        profile_dir = get_profile_dir(profile_name)
-        result = seed_profile_skills(profile_dir, quiet=True)
-        if result:
-            copied = result.get("copied", [])
-            if copied:
-                print(f"Seeded skill(s) into profile {profile_name}: {', '.join(copied)}")
-    except Exception:
-        pass  # best-effort
-
     print()
     # Enumerate profiles on disk so the user knows what assignees are
     # already addressable. Multica does this auto-detection on its
@@ -1335,6 +1342,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1461,8 +1469,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
-        # ``tasks.result`` is left NULL unless the caller explicitly passed
+        # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
@@ -1900,6 +1907,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                completion_source=(
+                    "worker" if _worker_run_id_for(tid) is not None else "manual"
+                ),
+                completed_by=_profile_author(),
+                worker_session_id=os.environ.get("HERMES_SESSION_ID"),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -1938,6 +1950,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
+    kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -1949,12 +1962,26 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 conn,
                 tid,
                 reason=reason,
+                kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+                # Report where the task actually landed — dependency blocks go
+                # to todo, and a tripped unblock-loop breaker routes to triage.
+                landed = kb.get_task(conn, tid)
+                where = landed.status if landed else "blocked"
+                suffix = f": {reason}" if reason else ""
+                if where == "todo":
+                    print(f"{tid} → todo (dependency wait){suffix}")
+                elif where == "triage":
+                    print(
+                        f"{tid} → triage (unblock loop detected — needs a "
+                        f"human decision){suffix}"
+                    )
+                else:
+                    print(f"Blocked {tid}{suffix}")
     return 0 if not failed else 1
 
 
@@ -2165,6 +2192,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skill_blocked": res.skill_blocked,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2181,6 +2209,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    if res.skill_blocked:
+        print("Blocked (missing skills):")
+        for entry in res.skill_blocked:
+            skills = ", ".join(entry.get("skills") or [])
+            print(
+                f"  - {entry.get('task_id')} -> {entry.get('assignee') or '-'} "
+                f"missing {skills or '(unknown)'}"
+            )
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -2204,6 +2240,32 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     return 0
+
+
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        report = kb.preflight_skill_references(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report.get("ok") else 1
+
+    print(
+        "KANBAN_PREFLIGHT "
+        f"ok={bool(report.get('ok'))} "
+        f"checked_tasks={report.get('checked_tasks', 0)}"
+    )
+    if report.get("error"):
+        print(f"error: {report['error']}", file=sys.stderr)
+    missing = report.get("missing") or []
+    if missing:
+        print("Missing forced skills:")
+        for item in missing:
+            print(
+                f"  - {item.get('task_id')} "
+                f"({item.get('profile') or item.get('assignee') or 'default'}): "
+                f"{item.get('name')} in {item.get('home') or '?'}"
+            )
+    return 0 if report.get("ok") else 1
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:

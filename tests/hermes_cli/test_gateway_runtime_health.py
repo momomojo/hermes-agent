@@ -11,6 +11,7 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
                 "telegram": {
                     "state": "fatal",
                     "error_message": "another poller is active",
+                    "updated_at": "2026-07-05T13:30:00Z",
                 }
             },
         },
@@ -18,7 +19,11 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
 
     lines = _runtime_health_lines()
 
-    assert "⚠ telegram: another poller is active" in lines
+    assert any(
+        line.startswith("⚠ telegram: fatal — another poller is active")
+        for line in lines
+    )
+    assert any("2026-07-05" in line for line in lines)
     assert "⚠ Last startup issue: telegram conflict" in lines
 
 

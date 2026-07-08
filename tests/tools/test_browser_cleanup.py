@@ -56,6 +56,7 @@ class TestBrowserCleanup:
                 "tools.browser_tool._run_browser_command",
                 return_value={"success": True},
             ) as mock_run,
+            patch("tools.browser_session_registry.close_sessions") as mock_close_sessions,
             patch("tools.browser_tool.os.path.exists", return_value=False),
         ):
             browser_tool.cleanup_browser("task-1")
@@ -64,6 +65,7 @@ class TestBrowserCleanup:
         assert "task-1" not in browser_tool._session_last_activity
         mock_stop.assert_called_once_with("task-1")
         mock_run.assert_called_once_with("task-1", "close", [], timeout=10)
+        mock_close_sessions.assert_called_once_with(session_id="sess-1")
 
     def test_cleanup_camofox_managed_persistence_skips_close(self):
         """When camofox mode + managed persistence, soft_cleanup fires instead of close."""

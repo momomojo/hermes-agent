@@ -416,7 +416,321 @@ class TestCooldown:
 
 
 # ---------------------------------------------------------------------------
-# Config integration (env overrides, round-trip)
+# Significance filter
+# ---------------------------------------------------------------------------
+#
+# _is_significant_event classifies events as significant (-> agent route)
+# or routine (-> silently dropped).  The filter inspects domain, device_class,
+# state values, and entity_id keywords.
+# ---------------------------------------------------------------------------
+
+
+def _sig_entity(entity_id, old="off", new="on", old_attrs=None, new_attrs=None):
+    """Shorthand: call _is_significant_event on an entity change."""
+    adapter = _make_adapter(significance_filter=True, watch_all=True, cooldown_seconds=0)
+    return adapter._is_significant_event(
+        entity_id,
+        old_state=old,
+        new_state=new,
+        old_attrs=old_attrs or {},
+        new_attrs=new_attrs or {},
+    )
+
+
+class TestSignificanceFilter:
+    """Each test calls _is_significant_event directly (pure method)."""
+
+    # -- Unavailable / unknown (always significant) --
+
+    def test_unavailable_transition(self):
+        assert _sig_entity("sensor.temp", old="22", new="unavailable")
+
+    def test_from_unavailable(self):
+        assert _sig_entity("light.x", old="unavailable", new="on")
+
+    def test_unknown_transition(self):
+        assert _sig_entity("binary_sensor.x", old="unknown", new="on")
+
+    # -- Security / safety domains --
+
+    def test_alarm_control_panel(self):
+        assert _sig_entity("alarm_control_panel.home", old="disarmed", new="armed_away")
+
+    def test_lock_state_change(self):
+        assert _sig_entity("lock.front_door", old="locked", new="unlocked")
+
+    # -- Binary sensor by device_class --
+
+    def test_smoke_detected(self):
+        assert _sig_entity("binary_sensor.smoke", new_attrs={"device_class": "smoke"})
+
+    def test_co_detected(self):
+        assert _sig_entity("binary_sensor.co", new_attrs={"device_class": "co"})
+
+    def test_gas_detected(self):
+        assert _sig_entity("binary_sensor.gas", new_attrs={"device_class": "gas"})
+
+    def test_motion_detected(self):
+        assert _sig_entity("binary_sensor.hallway_motion",
+                           new_attrs={"device_class": "motion"})
+
+    def test_door_sensor(self):
+        assert _sig_entity("binary_sensor.front_door",
+                           new_attrs={"device_class": "door"})
+
+    def test_window_sensor(self):
+        assert _sig_entity("binary_sensor.living_window",
+                           new_attrs={"device_class": "window"})
+
+    def test_presence_sensor(self):
+        assert _sig_entity("binary_sensor.living_presence",
+                           new_attrs={"device_class": "presence"})
+
+    def test_battery_low_binary_sensor(self):
+        assert _sig_entity("binary_sensor.sensor_battery",
+                           new_attrs={"device_class": "battery"})
+
+    def test_connectivity_binary_sensor(self):
+        assert _sig_entity("binary_sensor.router_online",
+                           new_attrs={"device_class": "connectivity"})
+
+    def test_plug_binary_sensor(self):
+        assert _sig_entity("binary_sensor.plug",
+                           new_attrs={"device_class": "plug"})
+
+    def test_routine_binary_sensor_no_device_class(self):
+        assert not _sig_entity("binary_sensor.routine",
+                               old="off", new="on",
+                               new_attrs={"friendly_name": "Routine Sensor"})
+
+    def test_routine_binary_sensor_unknown_device_class(self):
+        assert not _sig_entity("binary_sensor.carbon_dioxide",
+                               new_attrs={"device_class": "carbon_dioxide"})
+
+    # -- Person zone changes --
+
+    def test_person_state_change(self):
+        assert _sig_entity("person.mohib", old="home", new="away")
+
+    # -- Update availability --
+
+    def test_update_available(self):
+        assert _sig_entity("update.ha_core", old="off", new="on",
+                           new_attrs={"friendly_name": "Home Assistant Core Update"})
+
+    def test_update_no_update(self):
+        assert not _sig_entity("update.ha_core", old="on", new="off")
+
+    # -- User-action domains --
+
+    def test_light_on(self):
+        assert _sig_entity("light.living_room", old="off", new="on")
+
+    def test_switch_off(self):
+        assert _sig_entity("switch.plug", old="on", new="off")
+
+    def test_fan_speed_change(self):
+        assert _sig_entity("fan.ceiling", old="off", new="on")
+
+    def test_cover_open(self):
+        assert _sig_entity("cover.blinds", old="closed", new="open")
+
+    def test_climate_mode_change(self):
+        assert _sig_entity("climate.thermostat", old="off", new="heat")
+
+    # -- Media player --
+
+    def test_media_player_turned_on(self):
+        assert _sig_entity("media_player.tv", old="off", new="on")
+
+    # -- Sensor keywords --
+
+    def test_backup_sensor(self):
+        assert _sig_entity("sensor.last_backup", old="yesterday", new="today")
+
+    def test_wan_sensor(self):
+        assert _sig_entity("sensor.wan_status", old="down", new="up")
+
+    def test_alert_sensor(self):
+        assert _sig_entity("sensor.alert_count", old="3", new="4")
+
+    def test_alarm_sensor(self):
+        assert _sig_entity("sensor.alarm_panel", old="disarmed", new="armed")
+
+    def test_security_sensor(self):
+        assert _sig_entity("sensor.security_status", old="ok", new="intrusion")
+
+    def test_presence_sensor_keyword(self):
+        assert _sig_entity("sensor.presence_status", old="away", new="home")
+
+    def test_critical_sensor_keyword(self):
+        assert _sig_entity("sensor.critical_alerts", old="0", new="1")
+
+    def test_outage_sensor(self):
+        assert _sig_entity("sensor.outage_count", old="0", new="1")
+
+    def test_firmware_sensor(self):
+        assert _sig_entity("sensor.firmware_version", old="1.0", new="1.1")
+
+    # -- Battery percentage thresholds --
+
+    def test_battery_crosses_20_pct(self):
+        assert _sig_entity("sensor.device_battery", old="25", new="19")
+
+    def test_battery_crosses_10_pct(self):
+        assert _sig_entity("sensor.device_battery", old="12", new="9")
+
+    def test_battery_crosses_5_pct(self):
+        assert _sig_entity("sensor.device_battery", old="6", new="4")
+
+    def test_battery_stays_above_20(self):
+        assert not _sig_entity("sensor.device_battery", old="75", new="72")
+
+    def test_battery_goes_from_21_to_20_not_significant(self):
+        assert not _sig_entity("sensor.device_battery", old="21", new="20")
+
+    def test_battery_low_state(self):
+        assert _sig_entity("sensor.device_battery", old="15", new="low")
+
+    def test_battery_critical_state(self):
+        assert _sig_entity("sensor.device_battery", old="low", new="critical")
+
+    # -- Routine sensor updates (dropped) --
+
+    def test_routine_sensor_numeric(self):
+        assert not _sig_entity("sensor.temperature", old="22.5", new="23.1")
+
+    def test_routine_sensor_no_keyword(self):
+        assert not _sig_entity("sensor.uptime", old="100000", new="100001")
+
+    # -- Unknown domain (passed through) --
+
+    def test_unknown_domain(self):
+        assert _sig_entity("automation.morning_routine", old="off", new="on")
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: significance filter wired into _handle_ha_event
+#
+# These tests mock handle_message (same pattern as TestEventFilteringPipeline)
+# and verify the full pipeline with significance_filter enabled.
+# ---------------------------------------------------------------------------
+
+
+class TestSignificancePipeline:
+    @pytest.mark.asyncio
+    async def test_significance_blocks_routine_sensor(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("sensor.temperature", "22", "23",
+                        new_attrs={"friendly_name": "Temp"})
+        )
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_significance_passes_light_on(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("light.bedroom", "off", "on",
+                        new_attrs={"friendly_name": "Bedroom Light"})
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_significance_passes_unavailable(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("sensor.temp", "22", "unavailable",
+                        new_attrs={"friendly_name": "Temp"})
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_significance_passes_smoke_sensor(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("binary_sensor.smoke_alarm", "off", "on",
+                        new_attrs={"friendly_name": "Smoke",
+                                   "device_class": "smoke"})
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_significance_blocks_routine_update_off(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("update.ha_core", "on", "off",
+                        new_attrs={"friendly_name": "HA Core Update"})
+        )
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_significance_passes_update_available(self):
+        adapter = _make_adapter(
+            significance_filter=True, watch_all=True, cooldown_seconds=0,
+        )
+        await adapter._handle_ha_event(
+            _make_event("update.ha_core", "off", "on",
+                        new_attrs={"friendly_name": "HA Core Update"})
+        )
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_significance_disabled_by_default(self):
+        """Without significance_filter: true, the filter is skipped."""
+        adapter = _make_adapter(watch_all=True, cooldown_seconds=0)
+        await adapter._handle_ha_event(
+            _make_event("sensor.temp", "22", "23",
+                        new_attrs={"friendly_name": "Temp"})
+        )
+        adapter.handle_message.assert_called_once()  # passes through
+
+
+# ---------------------------------------------------------------------------
+# Significance filter config parsing
+# ---------------------------------------------------------------------------
+
+
+class TestSignificanceConfig:
+    def test_significance_filter_default_false(self):
+        config = PlatformConfig(enabled=True, token="tok")
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._significance_filter is False
+
+    def test_significance_filter_enabled(self):
+        config = PlatformConfig(
+            enabled=True, token="tok",
+            extra={"significance_filter": True},
+        )
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._significance_filter is True
+
+    def test_significance_filter_string_true(self):
+        config = PlatformConfig(
+            enabled=True, token="tok",
+            extra={"significance_filter": "true"},
+        )
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._significance_filter is True
+
+    def test_significance_filter_string_false(self):
+        """String false must not accidentally enable the filter."""
+        config = PlatformConfig(
+            enabled=True, token="tok",
+            extra={"significance_filter": "false"},
+        )
+        adapter = HomeAssistantAdapter(config)
+        assert adapter._significance_filter is False
 # ---------------------------------------------------------------------------
 
 

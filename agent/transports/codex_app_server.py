@@ -19,11 +19,14 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
@@ -74,7 +77,18 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
-        spawn_env = os.environ.copy()
+        # codex app-server is a model-driving CLI executor: it runs a
+        # model-chosen agentic loop that executes shell commands, so it
+        # legitimately needs LLM provider credentials (inherit_credentials=True)
+        # to authenticate against the model endpoint. But the previous
+        # `os.environ.copy()` also handed it every Tier-1 Hermes secret — gateway
+        # bot tokens, GitHub auth, Modal/Daytona infra tokens, the dashboard
+        # session token, AUXILIARY_* side-LLM keys, GATEWAY_RELAY_* auth — none
+        # of which a coding subprocess has any use for. Route through the
+        # centralized helper so Tier-1 + dynamic-internal secrets are always
+        # stripped while provider creds still flow, matching copilot_acp_client
+        # (#29157 sibling spawn-site gap).
+        spawn_env = hermes_subprocess_env(inherit_credentials=True)
         if env:
             spawn_env.update(env)
         if codex_home:
@@ -99,6 +113,14 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            # Worker network egress is opt-in per profile via
+            # HERMES_CODEX_WORKER_NETWORK (profile .env). Default stays
+            # false: a kanban worker's sandbox has no business on the
+            # network unless the profile's card lanes need to push
+            # branches / open PRs / install packages (codex-coding).
+            worker_network = spawn_env.get(
+                "HERMES_CODEX_WORKER_NETWORK", ""
+            ).strip().lower() in ("1", "true", "yes")
             app_server_args.extend(
                 [
                     "-c",
@@ -106,7 +128,8 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    "sandbox_workspace_write.network_access="
+                    + ("true" if worker_network else "false"),
                 ]
             )
 
@@ -121,6 +144,13 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            # Create a new session / process group so that when the codex
+            # app-server child (SkyComputerUse sandboxes, Rust worker threads)
+            # outlive the parent, they can be killed as a group in close()
+            # instead of being orphaned to pid 1. Prevents the sandbox-leak
+            # pattern: ~50 orphan SkyComputerUse processes found during the
+            # 2026-06-11 rc=0 protocol-violation burst.
+            preexec_fn=os.setsid,
         )
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
@@ -165,7 +195,12 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess to exit, escalating to kill."""
+        """Close stdin and kill the subprocess AND its children (sandbox processes).
+
+        Without process-group isolation (preexec_fn=os.setsid in __init__),
+        SIGKILL here orphans sandbox children to pid 1. With the process
+        group, killpg sends the signal to every process in the group.
+        """
         if self._closed:
             return
         self._closed = True
@@ -174,12 +209,21 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
+        # Process already dead — nothing to kill.
+        if self._proc.poll() is not None:
+            return
+        # Compute the process group once; if it fails the process vanished
+        # between the poll above and this call, just fall through.
         try:
-            self._proc.terminate()
+            pgid = os.getpgid(self._proc.pid)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
             self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
-                self._proc.kill()
+                os.killpg(pgid, signal.SIGKILL)
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass

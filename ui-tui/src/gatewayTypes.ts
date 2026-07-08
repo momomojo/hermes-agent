@@ -188,7 +188,12 @@ export interface ConfigVoiceConfig {
 }
 
 export interface ConfigFullResponse {
-  config?: { display?: ConfigDisplayConfig; voice?: ConfigVoiceConfig; paste_collapse_threshold?: number; paste_collapse_char_threshold?: number }
+  config?: {
+    display?: ConfigDisplayConfig
+    voice?: ConfigVoiceConfig
+    paste_collapse_threshold?: number
+    paste_collapse_char_threshold?: number
+  }
 }
 
 export interface ConfigMtimeResponse {
@@ -310,6 +315,7 @@ export interface SessionUndoResponse {
 }
 
 export interface SessionUsageResponse {
+  active_subagents?: number
   cache_read?: number
   cache_write?: number
   calls?: number
@@ -634,6 +640,7 @@ export type GatewayEvent =
     }
   | { payload?: { state?: 'idle' | 'listening' | 'transcribing' }; session_id?: string; type: 'voice.status' }
   | { payload?: { no_speech_limit?: boolean; text?: string }; session_id?: string; type: 'voice.transcript' }
+  | { payload?: { reason?: string }; session_id?: string; type: 'dashboard.new_session_requested' }
   | { payload: { line: string }; session_id?: string; type: 'gateway.stderr' }
   | {
       payload?: { level?: 'info' | 'warn' | 'error'; message?: string }
@@ -646,7 +653,17 @@ export type GatewayEvent =
       type: 'gateway.start_timeout'
     }
   | { payload?: { preview?: string }; session_id?: string; type: 'gateway.protocol_error' }
-  | { payload?: { text?: string; verbose?: boolean }; session_id?: string; type: 'reasoning.delta' | 'reasoning.available' }
+  | {
+      payload?: { text?: string; verbose?: boolean }
+      session_id?: string
+      type: 'reasoning.delta' | 'reasoning.available'
+    }
+  | {
+      payload: { count?: number; index?: number; label?: string; text?: string }
+      session_id?: string
+      type: 'moa.reference'
+    }
+  | { payload?: { aggregator?: string }; session_id?: string; type: 'moa.aggregating' }
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {

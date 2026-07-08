@@ -30,6 +30,43 @@ from typing import Optional
 from hermes_cli.fallback_config import get_fallback_chain
 
 
+def _normalize_reasoning_effort(reasoning: object = None) -> str:
+    return str(reasoning or "").strip().lower()
+
+
+def _validate_reasoning_effort(reasoning: object = None) -> tuple[str | None, str | None]:
+    normalized = _normalize_reasoning_effort(reasoning)
+    if not normalized:
+        return None, None
+
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+    if parse_reasoning_effort(normalized) is None:
+        valid = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        return None, f"hermes -z: --reasoning must be one of: {valid}\n"
+    return normalized, None
+
+
+def _resolve_reasoning_config(cfg: dict, reasoning: object = None) -> dict | None:
+    """Resolve explicit/config reasoning effort into AIAgent config."""
+    raw = _normalize_reasoning_effort(reasoning)
+    if not raw:
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
+        if isinstance(agent_cfg, dict):
+            raw = _normalize_reasoning_effort(agent_cfg.get("reasoning_effort", ""))
+
+    if not raw:
+        return None
+
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(raw)
+    if parsed is None:
+        valid = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        raise ValueError(f"invalid reasoning effort {raw!r}; expected one of: {valid}")
+    return parsed
+
+
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
     if not toolsets:
         return None
@@ -126,6 +163,7 @@ def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    reasoning: Optional[str] = None,
     toolsets: object = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
@@ -136,6 +174,8 @@ def run_oneshot(
             env var, then config.yaml's model.default / model.model.
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
+        reasoning: Optional reasoning effort override. Falls back to
+            config.yaml's agent.reasoning_effort.
         toolsets: Optional comma-separated string or iterable of toolsets.
 
     Returns the exit code.  Caller should sys.exit() with the return.
@@ -164,6 +204,10 @@ def run_oneshot(
     if toolsets_error:
         sys.stderr.write(toolsets_error)
         return 2
+    explicit_reasoning, reasoning_error = _validate_reasoning_effort(reasoning)
+    if reasoning_error:
+        sys.stderr.write(reasoning_error)
+        return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
@@ -178,14 +222,16 @@ def run_oneshot(
     devnull = open(os.devnull, "w", encoding="utf-8")
 
     response: Optional[str] = None
+    result: dict = {}
     failure: BaseException | None = None
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
-                response = _run_agent(
+                response, result = _run_agent(
                     prompt,
                     model=model,
                     provider=provider,
+                    reasoning=explicit_reasoning,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
@@ -213,16 +259,20 @@ def run_oneshot(
         real_stderr.flush()
         return 1
 
+    if response:
+        real_stdout.write(response)
+        if not response.endswith("\n"):
+            real_stdout.write("\n")
+        real_stdout.flush()
+
+    if (result.get("failed") or result.get("partial")) and not (response or "").strip():
+        return 2
+
     if not (response or "").strip():
         real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
         real_stderr.flush()
         return 1
 
-    assert response is not None  # narrowed by the empty-response guard above
-    real_stdout.write(response)
-    if not response.endswith("\n"):
-        real_stdout.write("\n")
-    real_stdout.flush()
     return 0
 
 
@@ -246,11 +296,12 @@ def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    reasoning: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-) -> str:
+) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns the final response string."""
+    run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -260,6 +311,7 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    reasoning_config = _resolve_reasoning_config(cfg, reasoning=reasoning)
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -344,6 +396,7 @@ def _run_agent(
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
+        reasoning_config=reasoning_config,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction
@@ -364,7 +417,8 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    result = agent.run_conversation(prompt)
+    return (result.get("final_response") or "", result)
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

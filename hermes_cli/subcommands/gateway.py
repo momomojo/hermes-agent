@@ -169,26 +169,26 @@ def build_gateway_parser(
         dest="start_now",
         action="store_true",
         default=None,
-        help=argparse.SUPPRESS,
+        help="Start the gateway service immediately after installing",
     )
     gateway_install.add_argument(
         "--no-start-now",
         dest="start_now",
         action="store_false",
-        help=argparse.SUPPRESS,
+        help="Do not start the gateway service after installing",
     )
     gateway_install.add_argument(
         "--start-on-login",
         dest="start_on_login",
         action="store_true",
         default=None,
-        help=argparse.SUPPRESS,
+        help="Enable the service to start automatically on login/boot",
     )
     gateway_install.add_argument(
         "--no-start-on-login",
         dest="start_on_login",
         action="store_false",
-        help=argparse.SUPPRESS,
+        help="Do not enable the service to start on login/boot",
     )
     gateway_install.add_argument(
         "--elevated-handoff",
@@ -209,6 +209,22 @@ def build_gateway_parser(
 
     # gateway list
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
+
+    # gateway converge
+    gateway_converge = gateway_subparsers.add_parser(
+        "converge",
+        help="Check or repair every installed macOS profile gateway LaunchAgent",
+    )
+    gateway_converge.add_argument(
+        "--check",
+        action="store_true",
+        help="Read-only convergence check (default)",
+    )
+    gateway_converge.add_argument(
+        "--apply",
+        action="store_true",
+        help="Restart each installed profile LaunchAgent and verify fresh PIDs",
+    )
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -280,6 +296,19 @@ def build_gateway_parser(
         help=(
             "A stable id for this gateway instance (kill-switch granularity). "
             "Defaults to gw-<hostname>."
+        ),
+    )
+    gateway_enroll.add_argument(
+        "--wake-url",
+        dest="wake_url",
+        default=None,
+        help=(
+            "Phase 5 §5.2 wake URL: a reachable URL the connector pokes "
+            "(payload-free GET) to wake this gateway when buffered work arrives "
+            "while it's idle/suspended, so it reconnects and drains. Persisted as "
+            "GATEWAY_RELAY_WAKE_URL in ~/.hermes/.env and forwarded at provision. "
+            "Optional — without it the gateway still drains whenever it next "
+            "reconnects on its own."
         ),
     )
     gateway_enroll.set_defaults(func=cmd_gateway_enroll)
