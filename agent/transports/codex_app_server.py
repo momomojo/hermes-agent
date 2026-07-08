@@ -19,12 +19,13 @@ from __future__ import annotations
 import json
 import os
 import queue
-import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+import psutil
 
 from tools.environments.local import hermes_subprocess_env
 
@@ -137,21 +138,23 @@ class CodexAppServerClient:
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=spawn_env,
-            # Create a new session / process group so that when the codex
-            # app-server child (SkyComputerUse sandboxes, Rust worker threads)
-            # outlive the parent, they can be killed as a group in close()
-            # instead of being orphaned to pid 1. Prevents the sandbox-leak
-            # pattern: ~50 orphan SkyComputerUse processes found during the
-            # 2026-06-11 rc=0 protocol-violation burst.
-            preexec_fn=os.setsid,
-        )
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+            "env": spawn_env,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            # Keep the app-server outside Hermes' own process group. close()
+            # still uses psutil below so teardown is cross-platform.
+            popen_kwargs["start_new_session"] = True
+
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
@@ -197,9 +200,8 @@ class CodexAppServerClient:
     def close(self, timeout: float = 3.0) -> None:
         """Close stdin and kill the subprocess AND its children (sandbox processes).
 
-        Without process-group isolation (preexec_fn=os.setsid in __init__),
-        SIGKILL here orphans sandbox children to pid 1. With the process
-        group, killpg sends the signal to every process in the group.
+        The app-server can spawn sandbox processes. Terminate the whole process
+        tree with psutil so teardown works on Windows, macOS and Linux.
         """
         if self._closed:
             return
@@ -212,21 +214,39 @@ class CodexAppServerClient:
         # Process already dead — nothing to kill.
         if self._proc.poll() is not None:
             return
-        # Compute the process group once; if it fails the process vanished
-        # between the poll above and this call, just fall through.
         try:
-            pgid = os.getpgid(self._proc.pid)
-        except ProcessLookupError:
+            root = psutil.Process(self._proc.pid)
+            targets = [root, *root.children(recursive=True)]
+        except psutil.NoSuchProcess:
             return
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-            self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except psutil.Error:
+            targets = []
+
+        if not targets:
             try:
-                os.killpg(pgid, signal.SIGKILL)
-                self._proc.wait(timeout=1.0)
+                self._proc.terminate()
+                self._proc.wait(timeout=timeout)
             except Exception:
                 pass
+            return
+
+        for proc in targets:
+            try:
+                proc.terminate()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                pass
+        _, alive = psutil.wait_procs(targets, timeout=timeout)
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=1.0)
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
