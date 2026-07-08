@@ -136,7 +136,7 @@ def test_default_spawn_skill_names_omits_worker_skill_when_dispatcher_lacks_it(
     ]
 
 
-def test_default_spawn_skill_names_requires_worker_skill_when_dispatcher_has_it(
+def test_default_spawn_skill_names_uses_only_task_skills_when_worker_skill_exists(
     monkeypatch,
     tmp_path,
 ):
@@ -151,5 +151,5 @@ def test_default_spawn_skill_names_requires_worker_skill_when_dispatcher_has_it(
     assert kb._kanban_worker_skill_available(root) is True
     assert kb._default_spawn_skill_names(
         "elias",
-        ["kanban-worker", "review-helper"],
-    ) == ["kanban-worker", "review-helper"]
+        ["review-helper", "review-helper", ""],
+    ) == ["review-helper"]

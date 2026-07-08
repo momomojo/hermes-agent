@@ -3157,26 +3157,24 @@ def test_dispatch_blocks_legacy_task_with_missing_forced_skill(
         conn.close()
 
 
-def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
+def test_dispatch_does_not_block_on_dispatcher_only_worker_skill(
     kanban_home, all_assignees_spawnable, monkeypatch
 ):
-    """Every skill destined for --skills is checked before worker spawn.
-
-    This covers injected dispatcher skills, not only the task.skills column.
-    If the dispatcher would pass kanban-worker but the worker profile cannot
-    resolve it, the card must block without claiming or spawning.
-    """
+    """The legacy root worker skill is not an implicit --skills requirement."""
     profile_home = kanban_home / "profiles" / "ops"
     (profile_home / "skills").mkdir(parents=True)
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _home: True)
 
     spawn_attempts = []
 
-    def fail_popen(*args, **kwargs):
-        spawn_attempts.append((args, kwargs))
-        raise AssertionError("dispatcher must block before spawning")
+    class FakeProc:
+        pid = 4321
 
-    monkeypatch.setattr("subprocess.Popen", fail_popen)
+    def fake_popen(*args, **kwargs):
+        spawn_attempts.append((args, kwargs))
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     conn = kb.connect()
     try:
@@ -3184,24 +3182,19 @@ def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
 
         res = kb.dispatch_once(conn)
 
-        assert spawn_attempts == []
-        assert res.spawned == []
-        assert res.skill_blocked
-        assert res.skill_blocked[0]["task_id"] == tid
-        assert res.skill_blocked[0]["skills"] == ["kanban-worker"]
+        assert len(spawn_attempts) == 1
+        assert res.spawned
+        assert res.skill_blocked == []
+        cmd = spawn_attempts[0][0][0]
+        assert "--skills" not in cmd
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        assert task.claim_lock is None
-        assert task.worker_pid is None
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.worker_pid == 4321
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
         events = kb.list_events(conn, tid)
-        blocked = [e for e in events if e.kind == "blocked"]
-        assert blocked
-        assert blocked[-1].payload["reason"].startswith(
-            "missing-skills:kanban-worker"
-        )
-        assert any(e.kind == "missing_skills_auto_blocked" for e in events)
+        assert not any(e.kind == "missing_skills_auto_blocked" for e in events)
     finally:
         conn.close()
 
@@ -3227,6 +3220,8 @@ def test_dispatch_review_missing_skill_blocks_with_synthesized_run(
         assert res.skill_blocked[0]["skills"] == ["sdlc-review"]
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        assert task.block_recurrences == 1
         assert task.claim_lock is None
         assert task.current_run_id is None
         run = conn.execute(
@@ -3241,6 +3236,49 @@ def test_dispatch_review_missing_skill_blocks_with_synthesized_run(
         blocked = [e for e in events if e.kind == "blocked"]
         assert blocked
         assert blocked[-1].run_id == run["id"]
+        auto_blocked = [
+            e for e in events if e.kind == "missing_skills_auto_blocked"
+        ]
+        assert auto_blocked
+        assert auto_blocked[-1].payload["review"] is True
+    finally:
+        conn.close()
+
+
+def test_dispatch_review_missing_skill_repeat_routes_to_triage(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    profile_home = kanban_home / "profiles" / "alice"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review loop", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review',
+                       block_kind = 'capability',
+                       block_recurrences = 1
+                 WHERE id = ?
+                """,
+                (tid,),
+            )
+
+        res = kb.dispatch_once(conn)
+
+        assert res.spawned == []
+        assert res.skill_blocked
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_kind == "capability"
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+        events = kb.list_events(conn, tid)
+        loop_events = [e for e in events if e.kind == "block_loop_detected"]
+        assert loop_events
+        assert loop_events[-1].payload["kind"] == "capability"
         auto_blocked = [
             e for e in events if e.kind == "missing_skills_auto_blocked"
         ]
