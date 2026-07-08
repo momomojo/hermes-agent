@@ -3571,9 +3571,7 @@ def _launchd_domain_for_label(label: str) -> str:
     for the active profile. Fleet convergence must probe each profile label
     independently or a loaded default gateway can mask an unloaded profile.
     """
-    uid = os.getuid()
-    gui_domain = f"gui/{uid}"
-    user_domain = f"user/{uid}"
+    gui_domain, user_domain = _launchd_user_domains()
     for domain in (gui_domain, user_domain):
         try:
             subprocess.run(
@@ -3601,10 +3599,7 @@ def _launchd_domain_for_label(label: str) -> str:
 
 
 def _launchd_pid_for_label(label: str, domain: str | None = None) -> int | None:
-    domains = [domain] if domain else [
-        f"gui/{os.getuid()}",
-        f"user/{os.getuid()}",
-    ]
+    domains = [domain] if domain else list(_launchd_user_domains())
     for candidate in domains:
         if not candidate:
             continue
@@ -3801,6 +3796,12 @@ def launchd_converge_all_gateways(*, check_only: bool = True) -> bool:
 _resolved_launchd_domain: str | None = None
 
 
+def _launchd_user_domains() -> tuple[str, str]:
+    """Return the gui/user launchd domains for the current macOS user."""
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    return f"gui/{uid}", f"user/{uid}"
+
+
 def _launchd_domain() -> str:
     """Return the launchd domain that actually manages the gateway service.
 
@@ -3817,10 +3818,8 @@ def _launchd_domain() -> str:
     if _resolved_launchd_domain is not None:
         return _resolved_launchd_domain
 
-    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     label = get_launchd_label()
-    gui_domain = f"gui/{uid}"
-    user_domain = f"user/{uid}"
+    gui_domain, user_domain = _launchd_user_domains()
 
     # 1. Probe gui/<uid> first — in Aqua sessions the service is loaded here.
     try:
