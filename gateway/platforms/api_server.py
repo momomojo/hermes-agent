@@ -40,6 +40,8 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -1166,7 +1168,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -1193,6 +1195,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+                "session_chat_audio": {"method": "POST", "path": "/api/sessions/{session_id}/chat/audio"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
         })
@@ -1578,6 +1581,136 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             headers=headers,
         )
+
+    @staticmethod
+    def _shortcut_audio_format(value: Any) -> str:
+        requested = str(value or "wav").strip().lower().lstrip(".")
+        return requested if requested in {"wav", "mp3"} else "wav"
+
+    @staticmethod
+    def _shortcut_audio_content_type(audio_format: str) -> str:
+        return {
+            "mp3": "audio/mpeg",
+            "wav": "audio/wav",
+        }.get(audio_format, "audio/wav")
+
+    @staticmethod
+    def _shortcut_audio_text_header(text: str) -> str:
+        safe = re.sub(r"[\r\n\x00]+", " ", text or "").strip()
+        return safe.encode("latin-1", "ignore").decode("latin-1")[:512]
+
+    async def _synthesize_moxie_shortcut_audio(
+        self,
+        text: str,
+        *,
+        audio_format: str = "wav",
+        speed: str = "1.50",
+    ) -> bytes:
+        script = Path(os.getenv("HERMES_MOXIE_TTS_SCRIPT", str(Path.home() / ".hermes/scripts/moxie_tts.py")))
+        if not script.exists():
+            raise RuntimeError("Moxie TTS script unavailable")
+        audio_format = self._shortcut_audio_format(audio_format)
+        with tempfile.TemporaryDirectory(prefix="jarvis-moxie-") as tmp_dir:
+            root = Path(tmp_dir)
+            input_path = root / "input.txt"
+            output_path = root / f"speech.{audio_format}"
+            input_path.write_text(text, encoding="utf-8")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--format",
+                audio_format,
+                "--voice",
+                "moxie_original",
+                "--speed",
+                str(speed or "1.50"),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                detail = (stderr or stdout).decode("utf-8", "replace").strip()
+                raise RuntimeError((detail or "Moxie TTS failed")[:240])
+            if not output_path.exists() or output_path.stat().st_size <= 0:
+                raise RuntimeError("Moxie TTS produced no audio")
+            return output_path.read_bytes()
+
+    async def _handle_session_chat_audio(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/audio — Jarvis text plus Moxie audio."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        system_prompt = body.get("system_message") or body.get("instructions")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            return web.json_response(_openai_error("system_message must be string", code="invalid_system_message"), status=400)
+
+        direct_text = body.get("text", body.get("speak_text"))
+        usage: Dict[str, Any] = {}
+        if direct_text is not None:
+            if not isinstance(direct_text, str) or not direct_text.strip():
+                return web.json_response(_openai_error("text must be a non-empty string", code="invalid_text"), status=400)
+            final_response = direct_text.strip()
+            effective_session_id = session_id
+        else:
+            user_message, err = _session_chat_user_message(body)
+            if err is not None:
+                return err
+            history = self._conversation_history_for_session(session_id)
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+            effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+            final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+
+        audio_format = self._shortcut_audio_format(body.get("audio_format") or body.get("format"))
+        speed = str(body.get("speed") or "1.50")
+        headers = {
+            "X-Hermes-Session-Id": effective_session_id or session_id,
+            "X-Hermes-Audio-Text": self._shortcut_audio_text_header(final_response),
+        }
+        if gateway_session_key:
+            headers["X-Hermes-Session-Key"] = gateway_session_key
+        try:
+            audio = await self._synthesize_moxie_shortcut_audio(final_response, audio_format=audio_format, speed=speed)
+        except Exception as exc:
+            logger.warning("[api_server] Jarvis Moxie audio synthesis failed: %s", exc.__class__.__name__)
+            return web.json_response(
+                {
+                    "object": "hermes.session.chat.audio_fallback",
+                    "session_id": effective_session_id or session_id,
+                    "audio_available": False,
+                    "message": {"role": "assistant", "content": final_response},
+                    "usage": usage,
+                    "fallback": {
+                        "type": "text",
+                        "reason": "audio_synthesis_failed",
+                    },
+                },
+                headers=headers,
+            )
+
+        headers["Content-Type"] = self._shortcut_audio_content_type(audio_format)
+        headers["X-Hermes-Audio-Format"] = audio_format
+        return web.Response(body=audio, headers=headers)
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
@@ -4176,6 +4309,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
+            self._app.router.add_post("/api/sessions/{session_id}/chat/audio", self._handle_session_chat_audio)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)

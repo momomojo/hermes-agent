@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -47,6 +48,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post("/api/sessions/{session_id}/chat/audio", adapter._handle_session_chat_audio)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
 
@@ -67,11 +69,16 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
+    assert features["audio_api"] is True
     assert features["realtime_voice"] is False
     assert data["endpoints"]["sessions"] == {"method": "GET", "path": "/api/sessions"}
     assert data["endpoints"]["session_chat_stream"] == {
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
+    }
+    assert data["endpoints"]["session_chat_audio"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/chat/audio",
     }
 
 
@@ -272,6 +279,110 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
     _, kwargs = mock_run.call_args
     assert kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_audio_requires_auth(auth_adapter, session_db):
+    session_id = session_db.create_session("audio-auth-session", "api_server")
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(f"/api/sessions/{session_id}/chat/audio", json={"text": "hello"})
+
+    assert resp.status == 401
+
+
+@pytest.mark.asyncio
+async def test_session_chat_audio_returns_wav_for_agent_reply(auth_adapter, session_db):
+    session_id = session_db.create_session("audio-session", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "Jarvis answer.", "session_id": session_id}, {"total_tokens": 3}))
+    mock_tts = AsyncMock(return_value=b"RIFF....WAVEfmt ")
+    app = _create_session_app(auth_adapter)
+
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch.object(auth_adapter, "_synthesize_moxie_shortcut_audio", mock_tts),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/audio",
+                json={"message": "what needs me?", "audio_format": "wav"},
+                headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "jarvis"},
+            )
+            body = await resp.read()
+
+    assert resp.status == 200, body
+    assert resp.headers["Content-Type"].startswith("audio/wav")
+    assert resp.headers["X-Hermes-Session-Id"] == session_id
+    assert resp.headers["X-Hermes-Session-Key"] == "jarvis"
+    assert resp.headers["X-Hermes-Audio-Format"] == "wav"
+    assert resp.headers["X-Hermes-Audio-Text"] == "Jarvis answer."
+    assert body == b"RIFF....WAVEfmt "
+    _, kwargs = mock_run.call_args
+    assert kwargs["gateway_session_key"] == "jarvis"
+    mock_tts.assert_awaited_once_with("Jarvis answer.", audio_format="wav", speed="1.50")
+
+
+@pytest.mark.asyncio
+async def test_session_chat_audio_falls_back_to_text_without_token_leak(auth_adapter, session_db):
+    session_id = session_db.create_session("audio-fallback-session", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "Fallback text.", "session_id": session_id}, {"total_tokens": 3}))
+    mock_tts = AsyncMock(side_effect=RuntimeError("synthesis failed"))
+    app = _create_session_app(auth_adapter)
+
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch.object(auth_adapter, "_synthesize_moxie_shortcut_audio", mock_tts),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/audio",
+                json={"message": "what needs me?"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            data = await resp.json()
+            raw = await resp.text()
+
+    assert resp.status == 200
+    assert data["object"] == "hermes.session.chat.audio_fallback"
+    assert data["audio_available"] is False
+    assert data["message"]["content"] == "Fallback text."
+    assert data["fallback"]["reason"] == "audio_synthesis_failed"
+    assert "sk-test" not in raw
+
+
+@pytest.mark.asyncio
+async def test_moxie_shortcut_audio_helper_cleans_tempdir(auth_adapter, tmp_path, monkeypatch):
+    record_path = tmp_path / "tts-tempdir.txt"
+    fake_script = tmp_path / "fake_moxie_tts.py"
+    fake_script.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "import argparse",
+                "import os",
+                "from pathlib import Path",
+                "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--input', required=True)",
+                "parser.add_argument('--output', required=True)",
+                "parser.add_argument('--format', required=True)",
+                "parser.add_argument('--voice')",
+                "parser.add_argument('--speed')",
+                "args = parser.parse_args()",
+                "Path(os.environ['FAKE_TTS_TMP_RECORD']).write_text(str(Path(args.output).parent), encoding='utf-8')",
+                "Path(args.output).write_bytes(b'RIFF....WAVEfmt ')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MOXIE_TTS_SCRIPT", str(fake_script))
+    monkeypatch.setenv("FAKE_TTS_TMP_RECORD", str(record_path))
+
+    audio = await auth_adapter._synthesize_moxie_shortcut_audio("hello", audio_format="wav", speed="1.50")
+
+    tempdir = record_path.read_text(encoding="utf-8")
+    assert audio.startswith(b"RIFF")
+    assert not Path(tempdir).exists()
 
 
 @pytest.mark.asyncio
