@@ -7070,22 +7070,10 @@ def _default_spawn_skill_names(
     assignee: Optional[str],
     skills: Optional[Iterable[str]],
 ) -> list[str]:
-    """Return skill names that must resolve before production worker spawn.
-
-    `_default_spawn` no longer auto-loads kanban lifecycle skills via
-    `--skills`; the lifecycle is prompt-injected. Fleet installs may still use
-    the `kanban-worker` skill as a runtime ABI/reference package, so when the
-    dispatcher has that skill, block a profile that cannot resolve it before
-    spawning a worker that will fail at startup.
-    """
-    del assignee  # reserved for future profile-specific dispatch rules
+    """Return per-task skill names that production spawn will pass to --skills."""
+    del assignee  # Reserved for future profile-specific dispatch rules.
     names: list[str] = []
     seen: set[str] = set()
-    from hermes_constants import get_default_hermes_root
-
-    if _kanban_worker_skill_available(get_default_hermes_root()):
-        names.append("kanban-worker")
-        seen.add("kanban-worker")
     for item in skills or []:
         name = str(item or "").strip()
         if not name or name in seen:
@@ -7209,65 +7197,24 @@ def _dispatch_once_locked(
             "cannot load required skill(s)"
         )
         if not dry_run:
-            blocked = False
-            if review:
-                with write_txn(conn):
-                    cur = conn.execute(
-                        """
-                        UPDATE tasks
-                           SET status        = 'blocked',
-                               claim_lock    = NULL,
-                               claim_expires = NULL,
-                               worker_pid    = NULL,
-                               block_kind    = NULL
-                         WHERE id = ?
-                           AND status = 'review'
-                        """,
-                        (task_id,),
-                    )
-                    if cur.rowcount == 1:
-                        run_id = _synthesize_ended_run(
-                            conn,
-                            task_id,
-                            outcome="blocked",
-                            summary=reason,
-                        )
-                        _append_event(
-                            conn,
-                            task_id,
-                            "blocked",
-                            {"reason": reason, "kind": None, "recurrences": 1},
-                            run_id=run_id,
-                        )
-                        blocked = True
-            if not blocked:
-                blocked = block_task(conn, task_id, reason=reason)
-            if blocked:
-                with write_txn(conn):
-                    _append_event(
-                        conn,
-                        task_id,
-                        "missing_skills_auto_blocked",
-                        {
-                            "assignee": assignee,
-                            "missing": missing,
-                            "skills": names,
-                            "review": bool(review),
-                        },
-                    )
-            else:
-                with write_txn(conn):
-                    _append_event(
-                        conn,
-                        task_id,
-                        "missing_skills_auto_block_failed",
-                        {
-                            "assignee": assignee,
-                            "missing": missing,
-                            "skills": names,
-                            "review": bool(review),
-                        },
-                    )
+            blocked = block_task(conn, task_id, reason=reason, kind="capability")
+            event_kind = (
+                "missing_skills_auto_blocked"
+                if blocked
+                else "missing_skills_auto_block_failed"
+            )
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    event_kind,
+                    {
+                        "assignee": assignee,
+                        "missing": missing,
+                        "skills": names,
+                        "review": bool(review),
+                    },
+                )
         result.skill_blocked.append(
             {
                 "task_id": task_id,

@@ -3206,6 +3206,80 @@ def test_dispatch_blocks_missing_injected_spawn_skill_before_claim(
         conn.close()
 
 
+def test_dispatch_review_missing_skill_blocks_with_synthesized_run(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    profile_home = kanban_home / "profiles" / "alice"
+    (profile_home / "skills").mkdir(parents=True)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review needs skill", assignee="alice")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+
+        res = kb.dispatch_once(conn)
+
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert res.skill_blocked[0]["task_id"] == tid
+        assert res.skill_blocked[0]["skills"] == ["sdlc-review"]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        run = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run is not None
+        assert run["status"] == "blocked"
+        assert run["outcome"] == "blocked"
+        assert "missing-skills:sdlc-review" in run["summary"]
+        events = kb.list_events(conn, tid)
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked
+        assert blocked[-1].run_id == run["id"]
+        auto_blocked = [
+            e for e in events if e.kind == "missing_skills_auto_blocked"
+        ]
+        assert auto_blocked
+        assert auto_blocked[-1].payload["review"] is True
+    finally:
+        conn.close()
+
+
+def test_dispatch_missing_skill_records_auto_block_failure_event(
+    kanban_home,
+    all_assignees_spawnable,
+    monkeypatch,
+):
+    profile_home = kanban_home / "profiles" / "ops"
+    (profile_home / "skills").mkdir(parents=True)
+    monkeypatch.setattr(kb, "block_task", lambda *args, **kwargs: False)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="missing skill", assignee="ops")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(["ghost-skill"]), tid),
+            )
+
+        res = kb.dispatch_once(conn)
+
+        assert res.spawned == []
+        assert res.skill_blocked
+        assert kb.get_task(conn, tid).status == "ready"
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "missing_skills_auto_block_failed" for e in events)
+        assert not any(e.kind == "missing_skills_auto_blocked" for e in events)
+    finally:
+        conn.close()
+
+
 def test_kanban_preflight_reports_missing_task_skill(kanban_home):
     profile_home = kanban_home / "profiles" / "ops"
     (profile_home / "skills").mkdir(parents=True)
