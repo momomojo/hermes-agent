@@ -10,6 +10,9 @@ Each route defines:
   - events: which event types to accept (header-based filtering)
   - secret: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
+  - action: optional built-in zero-LLM action. Currently supports
+    "github_ci_repair_card" for idempotent Kanban repair cards from
+    GitHub workflow/check failures.
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
@@ -549,6 +552,70 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Build a unique delivery ID
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+        # ── Idempotency ─────────────────────────────────────────
+        # Skip duplicate deliveries (webhook retries).
+        now = time.time()
+        if not self._record_delivery_id(delivery_id, now):
+            logger.info(
+                "[webhook] Skipping duplicate delivery %s", delivery_id
+            )
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
+        builtin_action = (
+            route_config.get("action")
+            or route_config.get("builtin_action")
+            or route_config.get("mode")
+        )
+        if builtin_action == "github_ci_repair_card":
+            try:
+                from hermes_cli.kanban_ci_repair import (
+                    handle_github_ci_repair_webhook,
+                )
+
+                result = handle_github_ci_repair_webhook(
+                    payload=payload,
+                    event_type=event_type,
+                    route_config=route_config,
+                    route_name=route_name,
+                    delivery_id=delivery_id,
+                    profile=profile if isinstance(profile, str) else None,
+                )
+            except Exception:
+                logger.exception(
+                    "[webhook] github_ci_repair_card action failed route=%s "
+                    "delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "GitHub CI repair action failed",
+                        "delivery_id": delivery_id,
+                    },
+                    status=500,
+                )
+            return web.json_response(
+                {
+                    "route": route_name,
+                    "event": event_type,
+                    **result,
+                },
+                status=200,
+            )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -583,27 +650,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
-        now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
