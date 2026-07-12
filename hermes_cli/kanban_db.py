@@ -7899,6 +7899,58 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _worker_route_snapshot(task: Task, profile_home: str) -> Optional[Dict[str, str]]:
+    """Resolve the exact model route that will be passed to a worker process."""
+    import yaml
+
+    config_path = Path(profile_home) / "config.yaml"
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    model_cfg = data.get("model") if isinstance(data, dict) else {}
+    agent_cfg = data.get("agent") if isinstance(data, dict) else {}
+    model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+    agent_cfg = agent_cfg if isinstance(agent_cfg, dict) else {}
+    model = str(task.model_override or model_cfg.get("default") or model_cfg.get("model") or "").strip()
+    provider = str(model_cfg.get("provider") or "").strip()
+    effort = str(agent_cfg.get("reasoning_effort") or "").strip()
+    if not model or not provider or not effort:
+        return None
+    return {
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
+        "attribution": "dispatcher_pre_spawn",
+    }
+
+
+def _persist_worker_route_snapshot(db_path: Path, run_id: int, snapshot: Dict[str, str]) -> None:
+    """Transactionally bind a route snapshot to the run before process spawn."""
+    conn = sqlite3.connect(str(db_path), timeout=15)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RuntimeError(f"kanban run {run_id} disappeared before spawn")
+        try:
+            metadata = json.loads(row[0]) if row[0] else {}
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["route_snapshot"] = snapshot
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND status = 'running'",
+            (json.dumps(metadata, sort_keys=True, separators=(",", ":")), run_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"kanban run {run_id} is not running at spawn")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7968,6 +8020,15 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+        route_snapshot = _worker_route_snapshot(task, env["HERMES_HOME"])
+        if route_snapshot:
+            _persist_worker_route_snapshot(
+                kanban_db_path(board=board),
+                task.current_run_id,
+                route_snapshot,
+            )
+            env["HERMES_KANBAN_MODEL"] = route_snapshot["model"]
+            env["HERMES_KANBAN_REASONING_EFFORT"] = route_snapshot["reasoning_effort"]
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
