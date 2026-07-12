@@ -7913,7 +7913,10 @@ def _worker_route_snapshot(task: Task, profile_home: str) -> Optional[Dict[str, 
     provider = str(model_cfg.get("provider") or "").strip()
     effort = str(agent_cfg.get("reasoning_effort") or "").strip()
     if not model or not provider or not effort:
-        return None
+        raise RuntimeError(
+            f"cannot capture exact route for kanban run {task.current_run_id}: "
+            f"provider={provider!r} model={model!r} effort={effort!r}"
+        )
     return {
         "provider": provider,
         "model": model,
@@ -8021,14 +8024,13 @@ def _default_spawn(
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
         route_snapshot = _worker_route_snapshot(task, env["HERMES_HOME"])
-        if route_snapshot:
-            _persist_worker_route_snapshot(
-                kanban_db_path(board=board),
-                task.current_run_id,
-                route_snapshot,
-            )
-            env["HERMES_KANBAN_MODEL"] = route_snapshot["model"]
-            env["HERMES_KANBAN_REASONING_EFFORT"] = route_snapshot["reasoning_effort"]
+        _persist_worker_route_snapshot(
+            kanban_db_path(board=board),
+            task.current_run_id,
+            route_snapshot,
+        )
+        env["HERMES_KANBAN_MODEL"] = route_snapshot["model"]
+        env["HERMES_KANBAN_REASONING_EFFORT"] = route_snapshot["reasoning_effort"]
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the

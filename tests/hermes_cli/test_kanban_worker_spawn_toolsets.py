@@ -38,6 +38,9 @@ def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path)
     profile.mkdir(parents=True)
     profile.joinpath("config.yaml").write_text(
         """
+model:
+  provider: openai-codex
+  default: gpt-5.6-terra
 platform_toolsets:
   cli:
     - clarify
@@ -53,6 +56,7 @@ platform_toolsets:
 toolsets:
   - hermes-cli
 agent:
+  reasoning_effort: medium
   disabled_toolsets: []
 """.lstrip(),
         encoding="utf-8",
@@ -63,6 +67,8 @@ agent:
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    events = []
+    monkeypatch.setattr(kb, "_persist_worker_route_snapshot", lambda *args, **kwargs: events.append("persist"))
 
     captured = {}
 
@@ -73,6 +79,7 @@ agent:
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
+        events.append("popen")
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -82,6 +89,9 @@ agent:
     pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
+    assert events == ["persist", "popen"]
+    assert captured["env"]["HERMES_KANBAN_MODEL"] == "gpt-5.6-terra"
+    assert captured["env"]["HERMES_KANBAN_REASONING_EFFORT"] == "medium"
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]

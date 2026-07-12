@@ -23,9 +23,10 @@ def test_worker_route_snapshot_uses_profile_default_and_task_override(tmp_path):
     assert kb._worker_route_snapshot(task, str(tmp_path))["model"] == "gpt-5.6-sol"
 
 
-def test_worker_route_snapshot_omits_incomplete_route(tmp_path):
+def test_worker_route_snapshot_fails_closed_when_incomplete(tmp_path):
     (tmp_path / "config.yaml").write_text("model:\n  default: gpt-5.6-terra\n")
-    assert kb._worker_route_snapshot(SimpleNamespace(current_run_id=9, model_override=None), str(tmp_path)) is None
+    with pytest.raises(RuntimeError, match="cannot capture exact route"):
+        kb._worker_route_snapshot(SimpleNamespace(current_run_id=9, model_override=None), str(tmp_path))
 
 
 def test_persist_worker_route_snapshot_merges_metadata_transactionally(tmp_path):
