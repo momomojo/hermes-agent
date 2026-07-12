@@ -31,8 +31,11 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.secret_prompt import masked_secret_prompt
+from hermes_constants import get_default_hermes_root
 
 logger = logging.getLogger(__name__)
+
+_JUDGE_VERDICT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 # Track which (config_path, mtime_ns, size) tuples we've already warned about
 # so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
@@ -7557,7 +7560,59 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
-def set_config_value(key: str, value: str):
+def validate_config_write_verdict(verdict_id: Optional[str]) -> None:
+    """Validate a judge ledger verdict id before mutating ``config.yaml``.
+
+    The local fleet governance lane keeps the append-only judge ledger outside
+    the Hermes source tree and exposes ``scripts/judge_gate_check.py`` as the
+    read-only resolver.  ``hermes config set`` is an operator-facing
+    config.yaml write wrapper, so require an explicit verdict id there instead
+    of allowing a pre-verdict config mutation to slip through by convention.
+    """
+    if not verdict_id:
+        raise ValueError(
+            "config.yaml mutations require --verdict <id>; resolve an APPROVE "
+            "entry first with scripts/judge_gate_check.py"
+        )
+    verdict_id = str(verdict_id).strip()
+    if not _JUDGE_VERDICT_ID_RE.fullmatch(verdict_id):
+        raise ValueError(
+            "--verdict must be a 12-character lowercase hex judge ledger id"
+        )
+
+    hermes_root = get_default_hermes_root()
+    checker = hermes_root / "scripts" / "judge_gate_check.py"
+    if not checker.exists():
+        raise ValueError(f"judge verdict checker not found: {checker}")
+
+    env = os.environ.copy()
+    env.setdefault("HERMES_ROOT", str(hermes_root))
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(checker), "--verdict-id", verdict_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("judge verdict validation timed out") from exc
+    except OSError as exc:
+        raise ValueError(f"failed to run judge verdict checker: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+        suffix = f": {detail[0]}" if detail else ""
+        raise ValueError(f"judge verdict {verdict_id} is not valid{suffix}")
+
+
+def set_config_value(
+    key: str,
+    value: str,
+    *,
+    verdict_id: Optional[str] = None,
+    require_verdict: bool = False,
+):
     """Set a configuration value."""
     if is_managed():
         managed_error("set configuration values")
@@ -7596,7 +7651,12 @@ def set_config_value(key: str, value: str):
         print(f"✓ Set {key} in {get_env_path()}")
         return
     
-    # Otherwise it goes to config.yaml
+    # Otherwise it goes to config.yaml. Operator-facing CLI mutations require
+    # a judge verdict id so approved fleet config changes are mechanically
+    # linked to the append-only ledger before the lock wrapper writes.
+    if require_verdict:
+        validate_config_write_verdict(verdict_id)
+
     config_path = get_config_path()
     user_config = {}
     if config_path.exists():
@@ -7677,14 +7737,23 @@ def config_command(args):
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
         if not key or value is None:
-            print("Usage: hermes config set <key> <value>")
+            print("Usage: hermes config set <key> <value> --verdict <id>")
             print()
             print("Examples:")
-            print("  hermes config set model anthropic/claude-sonnet-4")
-            print("  hermes config set terminal.backend docker")
+            print("  hermes config set model anthropic/claude-sonnet-4 --verdict abcdef123456")
+            print("  hermes config set terminal.backend docker --verdict abcdef123456")
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
-        set_config_value(key, value)
+        try:
+            set_config_value(
+                key,
+                value,
+                verdict_id=getattr(args, 'verdict', None),
+                require_verdict=True,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
     
     elif subcmd == "path":
         print(get_config_path())

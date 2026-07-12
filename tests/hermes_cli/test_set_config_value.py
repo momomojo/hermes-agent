@@ -157,11 +157,95 @@ class TestFalsyValues:
             config_command(args)
 
     def test_config_command_accepts_empty_string(self, _isolated_hermes_home):
-        """config set KEY '' should not exit — it should set the value."""
-        args = argparse.Namespace(config_command="set", key="model", value="")
+        """config set KEY '' with a valid verdict should set the value."""
+        scripts = _isolated_hermes_home / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "judge_gate_check.py").write_text(
+            "import sys\n"
+            "sys.exit(0 if sys.argv[-1] == 'abcdef123456' else 1)\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            config_command="set",
+            key="model",
+            value="",
+            verdict="abcdef123456",
+        )
         config_command(args)
         config = _read_config(_isolated_hermes_home)
         assert "model" in config
+
+
+class TestConfigSetVerdictGate:
+    """CLI config.yaml writes must carry a judge verdict id."""
+
+    def _write_checker(self, home, accepted="abcdef123456"):
+        scripts = home / "scripts"
+        scripts.mkdir(exist_ok=True)
+        checker = scripts / "judge_gate_check.py"
+        checker.write_text(
+            "import sys\n"
+            f"sys.exit(0 if sys.argv[-1] == {accepted!r} else 1)\n",
+            encoding="utf-8",
+        )
+        return checker
+
+    def test_config_yaml_cli_mutation_requires_verdict(self, _isolated_hermes_home, capsys):
+        args = argparse.Namespace(
+            config_command="set",
+            key="model",
+            value="gpt-4o",
+            verdict=None,
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            config_command(args)
+
+        assert exc.value.code == 1
+        assert "config.yaml mutations require --verdict <id>" in capsys.readouterr().out
+        assert _read_config(_isolated_hermes_home) == ""
+
+    def test_config_yaml_cli_mutation_rejects_invalid_verdict(self, _isolated_hermes_home, capsys):
+        self._write_checker(_isolated_hermes_home)
+        args = argparse.Namespace(
+            config_command="set",
+            key="model",
+            value="gpt-4o",
+            verdict="deadbeef0000",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            config_command(args)
+
+        assert exc.value.code == 1
+        assert "judge verdict deadbeef0000 is not valid" in capsys.readouterr().out
+        assert _read_config(_isolated_hermes_home) == ""
+
+    def test_config_yaml_cli_mutation_accepts_valid_verdict(self, _isolated_hermes_home):
+        self._write_checker(_isolated_hermes_home)
+        args = argparse.Namespace(
+            config_command="set",
+            key="model",
+            value="gpt-4o",
+            verdict="abcdef123456",
+        )
+
+        config_command(args)
+
+        assert "gpt-4o" in _read_config(_isolated_hermes_home)
+
+    def test_env_cli_mutation_does_not_require_verdict(self, _isolated_hermes_home):
+        args = argparse.Namespace(
+            config_command="set",
+            key="OPENROUTER_API_KEY",
+            value="sk-test",
+            verdict=None,
+        )
+
+        config_command(args)
+
+        assert "OPENROUTER_API_KEY=sk-test" in _read_env(_isolated_hermes_home)
+        assert _read_config(_isolated_hermes_home) == ""
 
 
 # ---------------------------------------------------------------------------
