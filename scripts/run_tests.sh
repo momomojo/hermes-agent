@@ -37,21 +37,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Activate venv ───────────────────────────────────────────────────────────
-VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
+# ── Select a test-capable Python ────────────────────────────────────────────
+PYTHON=""
+for candidate in \
+  "$REPO_ROOT/venv/bin/python" \
+  "$REPO_ROOT/.venv/bin/python" \
+  "${VIRTUAL_ENV:-}/bin/python" \
+  "$HOME/.hermes/hermes-agent/venv/bin/python"; do
+  [ -x "$candidate" ] || continue
+  if "$candidate" -c 'import pytest' >/dev/null 2>&1; then
+    PYTHON="$candidate"
     break
   fi
 done
 
-if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+if [ -z "$PYTHON" ]; then
+  echo "error: no Python interpreter with pytest available; run 'uv sync --locked --extra all --extra dev'" >&2
   exit 1
 fi
-
-PYTHON="$VENV/bin/python"
 
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────

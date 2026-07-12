@@ -277,3 +277,45 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     # Discovery found the probe file (2 tests), proving the positional path
     # was consumed as a root, not forwarded to pytest as a bad flag.
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
+
+
+def test_collection_uses_temp_hermes_home_not_live_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collection-time imports use a scrubbed, disposable Hermes home."""
+    live_home = tmp_path / "live-hermes-home"
+    (live_home / "logs").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(live_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "must-not-leak")
+    probe_dir = tmp_path / "collection_probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "collection_handoff.json"
+    (probe_dir / "test_collection_home_probe.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            from pathlib import Path
+
+            observed_home = Path(os.environ["HERMES_HOME"])
+            (observed_home / "logs").mkdir(parents=True, exist_ok=True)
+            (observed_home / "logs" / "collection_probe.json").write_text("collected")
+            Path({str(handoff)!r}).write_text(json.dumps({{
+                "hermes_home": str(observed_home),
+                "kanban_task": os.environ.get("HERMES_KANBAN_TASK"),
+            }}))
+
+            def test_probe_passes():
+                assert True
+            """
+        ).strip()
+        + "\n"
+    )
+    proc = _run_runner(probe_dir, "-q")
+    assert proc.returncode == 0, proc.stdout
+    data = json.loads(handoff.read_text())
+    assert data["hermes_home"] != str(live_home)
+    assert data["kanban_task"] is None
+    assert not Path(data["hermes_home"]).exists()
+    assert not (live_home / "logs" / "collection_probe.json").exists()

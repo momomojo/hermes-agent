@@ -205,7 +205,12 @@ def _resolve_python(repo_root: Path) -> str:
                     return str(candidate_path)
             except (subprocess.TimeoutExpired, OSError):
                 continue
-    return sys.executable
+    checked = ", ".join(str(path) for path in candidate_pythons)
+    raise RuntimeError(
+        "no Python interpreter with pytest available; checked: "
+        f"{checked}. Install the development environment with "
+        "`uv sync --locked --extra all --extra dev`."
+    )
 
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
@@ -346,6 +351,8 @@ def _run_one_file(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    test_home_root: Path,
+    python_executable: str,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -372,8 +379,14 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    cmd = [python_executable, "-m", "pytest", str(file), *pytest_args]
+    hermes_home = _prepare_hermes_home(
+        test_home_root,
+        _safe_home_label(file, repo_root),
+    )
+    pytest_env = _build_pytest_env(hermes_home)
+    pytest_env["PYTHONDONTWRITEBYTECODE"] = "1"
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -383,7 +396,7 @@ def _run_one_file(
         stderr=subprocess.STDOUT,
         text=True,
         # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        env=pytest_env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -993,25 +1006,37 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file,
-                file,
-                pytest_passthrough,
-                repo_root,
-                args.file_timeout,
-                test_home_root,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    try:
+        python_executable = _resolve_python(repo_root)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    test_home_root = Path(tempfile.mkdtemp(prefix="hermes-pytest-homes."))
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures: List[Future] = []
+            for file in files:
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file,
+                    file,
+                    pytest_passthrough,
+                    repo_root,
+                    args.file_timeout,
+                    test_home_root,
+                    python_executable,
+                )
+                fut.add_done_callback(
+                    lambda f, file=file, t0=t0: _on_done(file, t0, f)
+                )
+                futures.append(fut)
+            # ThreadPoolExecutor.__exit__ waits too; explicit iteration keeps
+            # exception handling and completion ordering obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+    finally:
+        shutil.rmtree(test_home_root, ignore_errors=True)
 
     elapsed = time.monotonic() - started
     print()
