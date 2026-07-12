@@ -176,7 +176,11 @@ def test_report_records_protected_reference_scan(curator_env):
 
     assert "protected_references" in payload
     assert "kanban-worker" in payload["protected_references"]["protected_names"]
+    assert payload["protected_references"]["bounded"] is True
+    assert "references" in payload["protected_references"]
     assert payload["blocked_mutations"][0]["skill"] == "kanban-worker"
+    assert "references" in payload["blocked_mutations"][0]
+    assert payload["blocked_mutations"][0]["reference_count"] >= 1
     assert "Protected skill references" in md
     assert "blocked curator mutations" in md
 

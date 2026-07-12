@@ -1216,16 +1216,19 @@ def _write_run_report(
             continue
         name = str(args.get("name") or "").strip()
         if name and name in protected_names:
+            name_references = (
+                protected_snapshot.get("by_name", {}).get(name, [])
+                if isinstance(protected_snapshot.get("by_name"), dict)
+                else []
+            )
             blocked_mutations.append(
                 {
                     "skill": name,
                     "action": "delete",
                     "reason": "protected_reference",
-                    "references": (
-                        protected_snapshot.get("by_name", {}).get(name, [])
-                        if isinstance(protected_snapshot.get("by_name"), dict)
-                        else []
-                    ),
+                    "references": name_references[:3],
+                    "reference_count": len(name_references),
+                    "references_truncated": len(name_references) > 3,
                 }
             )
 
@@ -1236,17 +1239,17 @@ def _write_run_report(
     # references in-place keeps scheduled jobs working across
     # consolidation passes. Best-effort: never let a cron-module issue
     # break the curator.
+    consolidated_map = {
+        e["name"]: e["into"]
+        for e in consolidated
+        if isinstance(e, dict) and e.get("name") and e.get("into")
+    }
+    pruned_names = [
+        e["name"] for e in pruned
+        if isinstance(e, dict) and e.get("name")
+    ]
     cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
     try:
-        consolidated_map = {
-            e["name"]: e["into"]
-            for e in consolidated
-            if isinstance(e, dict) and e.get("name") and e.get("into")
-        }
-        pruned_names = [
-            e["name"] for e in pruned
-            if isinstance(e, dict) and e.get("name")
-        ]
         if consolidated_map or pruned_names:
             from cron.jobs import rewrite_skill_refs as _rewrite_cron_refs
             cron_rewrites = _rewrite_cron_refs(
@@ -1259,6 +1262,29 @@ def _write_run_report(
             "rewrites": [],
             "jobs_updated": 0,
             "jobs_scanned": 0,
+            "error": str(e),
+        }
+
+    try:
+        from tools.skill_reference_guard import (
+            collect_protected_references,
+            summarize_protected_references,
+        )
+        # Report current state after any cron/Kanban migrations, not the stale
+        # pre-mutation snapshot used to enforce the safety gate above.
+        protected_snapshot = collect_protected_references()
+        protected_names = set(protected_snapshot.get("protected_names") or [])
+        protected_report = summarize_protected_references(protected_snapshot)
+    except Exception as e:
+        protected_report = {
+            "protected_names": sorted(protected_names),
+            "references": [],
+            "by_name": {},
+            "count": len(protected_names),
+            "reference_count": 0,
+            "summary_by_name": {},
+            "bounded": True,
+            "references_truncated": False,
             "error": str(e),
         }
 
@@ -1290,7 +1316,7 @@ def _write_run_report(
         "added": added,
         "state_transitions": transitions,
         "cron_rewrites": cron_rewrites,
-        "protected_references": protected_snapshot,
+        "protected_references": protected_report,
         "blocked_mutations": blocked_mutations,
         "llm_final": llm_meta.get("final", ""),
         "llm_summary": llm_meta.get("summary", ""),
@@ -1363,9 +1389,10 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
 
     protected = p.get("protected_references") or {}
     protected_names = protected.get("protected_names") or []
+    protected_count = int(protected.get("count", len(protected_names)) or 0)
     blocked_mutations = p.get("blocked_mutations") or []
     lines.append("## Protected skill references\n")
-    lines.append(f"- protected names checked: **{len(protected_names)}**")
+    lines.append(f"- protected names checked: **{protected_count}**")
     if protected.get("error"):
         lines.append(f"- scan error: `{protected.get('error')}`")
     if blocked_mutations:
