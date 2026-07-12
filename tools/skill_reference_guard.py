@@ -378,6 +378,68 @@ def collect_protected_references() -> dict[str, Any]:
         "references": refs,
         "by_name": by_name,
         "count": len(by_name),
+        "reference_count": len(refs),
+    }
+
+
+def summarize_protected_references(
+    snapshot: dict[str, Any], *, sample_limit: int = 3, name_limit: int = 25
+) -> dict[str, Any]:
+    """Return a globally bounded, aggregation-first diagnostic view."""
+    limit = max(0, int(sample_limit))
+    max_names = max(0, int(name_limit))
+    raw_by_name = snapshot.get("by_name")
+    if not isinstance(raw_by_name, dict):
+        raw_by_name = {}
+    all_names = sorted(str(name) for name in raw_by_name)
+    ranked_names = sorted(
+        all_names,
+        key=lambda name: (-len(raw_by_name.get(name) or []), name),
+    )
+    selected_names = ranked_names[:max_names]
+    summaries: dict[str, dict[str, Any]] = {}
+    for name in selected_names:
+        refs = [ref for ref in (raw_by_name.get(name) or []) if isinstance(ref, dict)]
+        by_source: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        for ref in refs:
+            source = str(ref.get("source") or "unknown")
+            by_source[source] = by_source.get(source, 0) + 1
+            if ref.get("status"):
+                status = str(ref["status"])
+                by_status[status] = by_status.get(status, 0) + 1
+        samples = [dict(ref) for ref in refs[:limit]]
+        summaries[str(name)] = {
+            "total": len(refs),
+            "by_source": dict(sorted(by_source.items())),
+            "by_status": dict(sorted(by_status.items())),
+            "samples": samples,
+            "omitted": max(0, len(refs) - len(samples)),
+        }
+    reference_count = sum(
+        len([ref for ref in (raw_by_name.get(name) or []) if isinstance(ref, dict)])
+        for name in all_names
+    )
+    sampled_by_name = {
+        name: list(item["samples"]) for name, item in summaries.items()
+    }
+    sampled_references = [
+        ref for refs in sampled_by_name.values() for ref in refs
+    ]
+    return {
+        "protected_names": sorted(summaries),
+        "references": sampled_references,
+        "by_name": sampled_by_name,
+        "count": len(all_names),
+        "reference_count": reference_count,
+        "summary_by_name": summaries,
+        "bounded": True,
+        "sample_limit": limit,
+        "name_limit": max_names,
+        "protected_names_truncated": len(all_names) > len(summaries),
+        "names_omitted": max(0, len(all_names) - len(summaries)),
+        "references_truncated": reference_count > len(sampled_references),
+        **({"error": snapshot["error"]} if snapshot.get("error") else {}),
     }
 
 
