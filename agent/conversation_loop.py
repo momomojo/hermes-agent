@@ -58,6 +58,7 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.prompt_builder import FRONTIER_EXECUTION_GUIDANCE
 from agent.retry_utils import adaptive_rate_limit_backoff, jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -326,6 +327,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
+        _restore_instruction_profile(agent, session_row, stored_prompt)
         agent._cached_system_prompt = stored_prompt
         return
     if stored_prompt:
@@ -420,6 +422,38 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         return False
 
     return True
+
+
+def _restore_instruction_profile(agent, session_row: dict, prompt: str) -> None:
+    """Restore prompt-density state before any later compression rebuild.
+
+    New sessions persist the resolved profile in ``model_config``. Legacy rows
+    predate that field, so only the unmistakable compact frontier block maps to
+    lean; every other historical prompt fails closed to full.
+    """
+    stored_config = session_row.get("model_config")
+    if isinstance(stored_config, str):
+        try:
+            stored_config = json.loads(stored_config)
+        except (TypeError, ValueError):
+            stored_config = None
+    stored_profile = (
+        stored_config.get("instruction_profile")
+        if isinstance(stored_config, dict)
+        else None
+    )
+    if stored_profile in {"lean", "standard", "full"}:
+        resolved_profile = stored_profile
+    elif FRONTIER_EXECUTION_GUIDANCE in prompt:
+        resolved_profile = "lean"
+    else:
+        resolved_profile = "full"
+    agent._instruction_profile = resolved_profile
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        # Rotating compression persists this snapshot into the child session.
+        # Keep it synchronized so a later process restores the same profile.
+        init_config["instruction_profile"] = resolved_profile
 
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:

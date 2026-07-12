@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    FRONTIER_EXECUTION_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -110,6 +111,65 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     return base
 
 
+def _tool_use_enforcement_enabled(agent: Any) -> bool:
+    """Resolve the legacy tool-use toggle for the active model.
+
+    Model switches invalidate the system prompt, so auto/list modes must be
+    recomputed against the active model instead of cached independently.
+    """
+    enforce = agent._tool_use_enforcement
+    if enforce is True or (
+        isinstance(enforce, str)
+        and enforce.lower() in {"true", "always", "yes", "on"}
+    ):
+        return True
+    if enforce is False or (
+        isinstance(enforce, str)
+        and enforce.lower() in {"false", "never", "no", "off"}
+    ):
+        return False
+    model_lower = (agent.model or "").lower()
+    if isinstance(enforce, list):
+        return any(
+            pattern.lower() in model_lower
+            for pattern in enforce
+            if isinstance(pattern, str)
+        )
+    return any(pattern in model_lower for pattern in TOOL_USE_ENFORCEMENT_MODELS)
+
+
+def _frontier_execution_guidance(agent: Any) -> str:
+    """Build compact lean guidance while honoring independent toggles."""
+    enforce_tools = _tool_use_enforcement_enabled(agent)
+    complete_tasks = getattr(agent, "_task_completion_guidance", True)
+    parallel_calls = getattr(agent, "_parallel_tool_call_guidance", True)
+    if enforce_tools and complete_tasks and parallel_calls:
+        return FRONTIER_EXECUTION_GUIDANCE
+
+    guidance = ["# Execution discipline"]
+    if enforce_tools:
+        guidance.append(
+            "Use tools for real evidence; never fabricate results. Retrieve "
+            "missing context with tools; ask only when materially required "
+            "information cannot be retrieved."
+        )
+    if complete_tasks:
+        guidance.append(
+            "Complete the requested deliverable rather than stopping at a plan, "
+            "stub, or promise. Verify the result against every requirement "
+            "before finalizing."
+        )
+    if parallel_calls:
+        guidance.append(
+            "Batch independent tool calls, but resolve prerequisites before "
+            "dependent actions."
+        )
+    if len(guidance) == 1:
+        return ""
+    guidance.append("Preserve existing safety and side-effect scope requirements.")
+    return "\n".join(guidance)
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
@@ -170,7 +230,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # path is blocked) are not model-family specific.  Gated only by
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
-    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+    _instruction_profile = getattr(agent, "_instruction_profile", "full")
+    if (
+        _instruction_profile != "lean"
+        and getattr(agent, "_task_completion_guidance", True)
+        and agent.valid_tool_names
+    ):
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
@@ -181,8 +246,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # round-trips and the resent-context cost that compounds over a long
     # conversation.  Gated by config.yaml ``agent.parallel_tool_call_guidance``
     # (default True) and only injected when tools are actually loaded.
-    if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
+    if (
+        _instruction_profile != "lean"
+        and getattr(agent, "_parallel_tool_call_guidance", True)
+        and agent.valid_tool_names
+    ):
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    if _instruction_profile == "lean" and agent.valid_tool_names:
+        frontier_guidance = _frontier_execution_guidance(agent)
+        if frontier_guidance:
+            stable_parts.append(frontier_guidance)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
@@ -229,20 +303,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     #   false — never inject
     #   list  — custom model-name substrings to match
     if agent.valid_tool_names:
-        _enforce = agent._tool_use_enforcement
-        _inject = False
-        if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
-            _inject = True
-        elif _enforce is False or (isinstance(_enforce, str) and _enforce.lower() in {"false", "never", "no", "off"}):
-            _inject = False
-        elif isinstance(_enforce, list):
-            model_lower = (agent.model or "").lower()
-            _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
-        else:
-            # "auto" or any unrecognised value — use hardcoded defaults
-            model_lower = (agent.model or "").lower()
-            _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
-        if _inject:
+        _inject = _tool_use_enforcement_enabled(agent)
+        if _inject and _instruction_profile != "lean":
             stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()
             # Google model operational guidance (conciseness, absolute
@@ -254,7 +316,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Also applied to xAI Grok — same failure modes (claims completion
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+            if (
+                _instruction_profile == "full"
+                and ("gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower)
+            ):
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])

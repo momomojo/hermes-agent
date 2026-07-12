@@ -1509,6 +1509,159 @@ class TestToolUseEnforcementConfig:
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
 
+class TestInstructionProfile:
+    def _make_agent(self, model, instruction_profile="auto", **agent_config):
+        config = {
+            "instruction_profile": instruction_profile,
+            "tool_use_enforcement": "auto",
+        }
+        config.update(agent_config)
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": config},
+            ),
+        ):
+            agent = AIAgent(
+                model=model,
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+            return agent
+
+    def test_lean_replaces_long_execution_blocks(self):
+        from agent.prompt_builder import (
+            FRONTIER_EXECUTION_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            PARALLEL_TOOL_CALL_GUIDANCE,
+            TASK_COMPLETION_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+        )
+
+        agent = self._make_agent("openai/gpt-5.6-codex")
+        prompt = agent._build_system_prompt()
+
+        assert agent._instruction_profile == "lean"
+        assert agent._session_init_model_config["instruction_profile"] == "lean"
+        assert FRONTIER_EXECUTION_GUIDANCE in prompt
+        assert TASK_COMPLETION_GUIDANCE not in prompt
+        assert PARALLEL_TOOL_CALL_GUIDANCE not in prompt
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
+
+    def test_standard_omits_only_long_openai_block(self):
+        from agent.prompt_builder import (
+            FRONTIER_EXECUTION_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            TASK_COMPLETION_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+        )
+
+        agent = self._make_agent("openai/gpt-5.4")
+        prompt = agent._build_system_prompt()
+
+        assert agent._instruction_profile == "standard"
+        assert TASK_COMPLETION_GUIDANCE in prompt
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
+        assert FRONTIER_EXECUTION_GUIDANCE not in prompt
+
+    def test_full_preserves_exact_historical_guidance_order(self):
+        from agent.prompt_builder import (
+            FRONTIER_EXECUTION_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            PARALLEL_TOOL_CALL_GUIDANCE,
+            TASK_COMPLETION_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+        )
+
+        agent = self._make_agent("openai/gpt-5.6", instruction_profile="full")
+        prompt = agent._build_system_prompt()
+
+        assert agent._instruction_profile == "full"
+        historical_guidance = [
+            TASK_COMPLETION_GUIDANCE,
+            PARALLEL_TOOL_CALL_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+        ]
+        assert all(prompt.count(block) == 1 for block in historical_guidance)
+        assert sorted(historical_guidance, key=prompt.index) == historical_guidance
+        assert FRONTIER_EXECUTION_GUIDANCE not in prompt
+
+    def test_lean_honors_disabled_task_completion_guidance(self):
+        agent = self._make_agent(
+            "openai/gpt-5.6", task_completion_guidance=False
+        )
+        prompt = agent._build_system_prompt()
+
+        assert "Complete the requested deliverable" not in prompt
+        assert "Verify the result against every requirement" not in prompt
+        assert "Use tools for real evidence" in prompt
+        assert "Batch independent tool calls" in prompt
+
+    def test_lean_honors_disabled_parallel_tool_call_guidance(self):
+        agent = self._make_agent(
+            "openai/gpt-5.6", parallel_tool_call_guidance=False
+        )
+        prompt = agent._build_system_prompt()
+
+        assert "Batch independent tool calls" not in prompt
+        assert "Use tools for real evidence" in prompt
+        assert "Complete the requested deliverable" in prompt
+
+    def test_lean_honors_disabled_tool_use_enforcement(self):
+        agent = self._make_agent(
+            "openai/gpt-5.6", tool_use_enforcement=False
+        )
+        prompt = agent._build_system_prompt()
+
+        assert "Use tools for real evidence" not in prompt
+        assert "Retrieve missing context with tools" not in prompt
+        assert "Complete the requested deliverable" in prompt
+        assert "Batch independent tool calls" in prompt
+
+    def test_full_recomputes_auto_tool_enforcement_after_model_switch(self):
+        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+
+        agent = self._make_agent("openai/gpt-5.6", instruction_profile="full")
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in agent._build_system_prompt()
+
+        setattr(agent, "model", "anthropic/claude-opus-4.8")
+        agent._invalidate_system_prompt()
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in agent._build_system_prompt()
+
+        setattr(agent, "model", "openai/gpt-5.6")
+        agent._invalidate_system_prompt()
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in agent._build_system_prompt()
+
+    def test_profile_is_fixed_for_prompt_rebuilds(self):
+        from agent.prompt_builder import FRONTIER_EXECUTION_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+
+        agent = self._make_agent("openai/gpt-5.6")
+        first_prompt = agent._build_system_prompt()
+        agent.model = "vendor/unknown-model"
+        agent._invalidate_system_prompt()
+        rebuilt_prompt = agent._build_system_prompt()
+
+        assert agent._instruction_profile == "lean"
+        assert FRONTIER_EXECUTION_GUIDANCE in first_prompt
+        assert "# Execution discipline" in rebuilt_prompt
+        assert "Complete the requested deliverable" in rebuilt_prompt
+        assert "Batch independent tool calls" in rebuilt_prompt
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in rebuilt_prompt
+
+
 class TestTaskCompletionGuidance:
     """Tests for the universal task-completion / no-fabrication guidance
     (config.yaml ``agent.task_completion_guidance``).

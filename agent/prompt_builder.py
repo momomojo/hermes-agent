@@ -297,6 +297,38 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
+
+def resolve_instruction_profile(configured_profile: object, model: str) -> str:
+    """Resolve the session-stable system-prompt instruction profile."""
+    if not isinstance(configured_profile, str):
+        return "full"
+
+    profile = configured_profile.lower().strip()
+    if profile in {"lean", "standard", "full"}:
+        return profile
+    if profile != "auto":
+        return "full"
+
+    model_lower = (model or "").lower()
+    if "gpt-5.6" in model_lower or "gpt-5.5" in model_lower:
+        return "lean"
+    if "gpt-5.4" in model_lower or "gpt-5.3-codex" in model_lower:
+        return "standard"
+    if "deepseek-v4-flash" in model_lower:
+        return "full"
+    return "full"
+
+
+FRONTIER_EXECUTION_GUIDANCE = (
+    "# Execution discipline\n"
+    "Use tools for real evidence; never fabricate results. Complete the requested "
+    "deliverable rather than stopping at a plan, stub, or promise. Batch independent "
+    "tool calls, but resolve prerequisites before dependent actions. Verify the result "
+    "against every requirement before finalizing, while preserving existing safety and "
+    "side-effect scope requirements. Retrieve missing context with tools; ask only when "
+    "materially required information cannot be retrieved."
+)
+
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
 #   1. Stopping after a stub: writing a tiny file or running one command

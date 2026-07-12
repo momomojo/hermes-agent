@@ -58,6 +58,50 @@ class TestStoredPromptReuse:
         # No warnings on the happy path
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
+    def test_restores_persisted_profile_for_later_compression_rebuild(self):
+        """A fresh agent must not rebuild a restored full prompt as lean."""
+        stored = "Historical full prompt"
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": stored,
+            "model_config": '{"instruction_profile": "full"}',
+        }
+        agent = _make_agent(session_db=db)
+        agent.model = "openai/gpt-5.6"
+        agent._instruction_profile = "lean"
+        agent._session_init_model_config = {"instruction_profile": "lean"}
+        agent._build_system_prompt.side_effect = (
+            lambda _message=None: f"rebuilt:{agent._instruction_profile}"
+        )
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+        assert agent._cached_system_prompt == stored
+        assert agent._instruction_profile == "full"
+        assert agent._session_init_model_config["instruction_profile"] == "full"
+
+        agent._cached_system_prompt = None
+        rebuilt = agent._build_system_prompt(None)
+        assert rebuilt == "rebuilt:full"
+
+    def test_legacy_restored_prompt_fails_closed_to_full_for_rebuild(self):
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "Historical prompt without profile metadata",
+            "model_config": '{"max_iterations": 90}',
+        }
+        agent = _make_agent(session_db=db)
+        agent._instruction_profile = "lean"
+        agent._session_init_model_config = {"instruction_profile": "lean"}
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert agent._instruction_profile == "full"
+        assert agent._session_init_model_config["instruction_profile"] == "full"
+
     def test_present_row_with_unicode_preserved(self):
         """Non-ASCII bytes in the stored prompt are not mangled."""
         stored = "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊"

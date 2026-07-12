@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-07-11",
+  "purpose": "Small Hermes workflow-routing smoke probe; not a general model-quality benchmark",
+  "methodology": {
+    "runner": "hermes chat -Q -q <prompt> -m <model> --provider <provider>",
+    "exact_prompt": "You are being evaluated for workflow routing. Return ONLY one compact JSON object with keys classification, extraction, plan, code_review. Tasks: (1) classify as low_risk_read, reversible_write, external_side_effect, or high_stakes: 'Summarize three local log files and propose a fix without changing anything.' (2) From 'Invoice A: $18 on July 2; Invoice B: $7 on July 3; A was refunded', return net_total and active_invoice_ids. (3) Give exactly three concise steps to modify a dirty git repository without overwriting unrelated changes. (4) Identify and fix: active = [u for u in users if u.enabled or not u.deleted], intent enabled and not deleted. Return schema: {classification, extraction:{net_total,active_invoice_ids}, plan:[three strings], code_review:{defect,fix}}.",
+    "regeneration_command_template": "hermes chat -Q -q \"$PROMPT\" -m MODEL --provider PROVIDER > raw-MODEL-EFFORT.out",
+    "validation_command": "python scripts/validate_model_routing_probe.py website/static/evals/model-routing-probe-2026-07-11.json",
+    "default_effort": "medium unless stated otherwise",
+    "tasks": [
+      "classify a read-only local-log request",
+      "extract net invoice total and active invoice IDs",
+      "produce a three-step dirty-git safety plan",
+      "identify and fix an OR-vs-AND Python filter defect"
+    ],
+    "expected": {
+      "classification": "low_risk_read",
+      "net_total": 7,
+      "active_invoice_ids": ["B"],
+      "plan_length": 3,
+      "fix": "active = [u for u in users if u.enabled and not u.deleted]"
+    },
+    "artifact_policy": "Raw outputs were retained locally during the run but are intentionally not committed because they include incidental CLI warnings/session metadata. The manifest records each derived format/correctness judgment against the exact expected values above.",
+    "limitations": [
+      "one small deterministic probe",
+      "latency is a single wall-clock observation, not a throughput benchmark",
+      "does not establish frontier quality",
+      "used only to verify endpoint availability, basic correctness, and strict-format adherence"
+    ]
+  },
+  "results": [
+    {"model":"gpt-5.6-terra","provider":"openai-codex","effort":"medium","elapsed_seconds":10.025,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-luna","provider":"openai-codex","effort":"medium","elapsed_seconds":11.319,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.3-codex-spark","provider":"openai-codex","effort":"medium","elapsed_seconds":9.744,"substance_correct":true,"strict_json":false,"note":"malformed JSON"},
+    {"model":"gpt-5.3-codex","provider":"openai-codex","effort":"medium","elapsed_seconds":12.941,"substance_correct":true,"strict_json":false,"note":"fenced JSON"},
+    {"model":"deepseek/deepseek-v4-flash","provider":"openrouter","effort":"provider default","elapsed_seconds":13.754,"substance_correct":true,"strict_json":false,"note":"fenced JSON"},
+    {"model":"gpt-5.6-sol","provider":"openai-codex","effort":"medium","elapsed_seconds":15.438,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.4-mini","provider":"openai-codex","effort":"medium","elapsed_seconds":15.848,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.5","provider":"openai-codex","effort":"medium","elapsed_seconds":19.154,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.4","provider":"openai-codex","effort":"medium","elapsed_seconds":23.353,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-terra","provider":"openai-codex","effort":"low","elapsed_seconds":10.305,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-terra","provider":"openai-codex","effort":"high","elapsed_seconds":11.144,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-luna","provider":"openai-codex","effort":"low","elapsed_seconds":12.784,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-sol","provider":"openai-codex","effort":"high","elapsed_seconds":20.821,"substance_correct":true,"strict_json":true},
+    {"model":"gpt-5.6-sol","provider":"openai-codex","effort":"xhigh","elapsed_seconds":19.844,"substance_correct":true,"strict_json":true}
+  ]
+}

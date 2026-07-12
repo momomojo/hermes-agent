@@ -1307,6 +1307,31 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 
 ## Tool-Use Enforcement
 
+### Instruction density profiles
+
+Hermes resolves `agent.instruction_profile` once when an agent session is
+constructed. The resolved value remains fixed for the session, including
+system-prompt rebuilds after context compression, so the cached prompt prefix
+does not change mid-conversation.
+
+```yaml
+agent:
+  instruction_profile: "auto"   # "auto" | "lean" | "standard" | "full"
+```
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | `gpt-5.6*` and `gpt-5.5*` use `lean`; `gpt-5.4*` and `gpt-5.3-codex*` use `standard`; `deepseek-v4-flash` and unknown models use `full`. |
+| `"lean"` | Replaces the task-completion, tool-enforcement, parallel-call, and long OpenAI execution blocks with one compact execution-discipline block. |
+| `"standard"` | Keeps task-completion, parallel-call, and tool-enforcement guidance, but omits the long OpenAI execution block. |
+| `"full"` | Preserves the previous prompt assembly behavior. |
+
+The compact block still requires real tool evidence, a complete deliverable,
+no fabricated results, batched independent calls, prerequisite resolution,
+verification, and clarification only when material missing information cannot
+be retrieved. Safety, memory, skills, profile, computer-use, and platform
+guidance are unaffected by instruction density.
+
 Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.
 
 ```yaml

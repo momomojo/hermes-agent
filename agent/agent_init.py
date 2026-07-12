@@ -1312,6 +1312,16 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Resolve instruction density exactly once for the session.  Prompt assembly
+    # and compression rebuilds reuse this frozen value so model/config changes
+    # cannot mutate the cached system-prompt prefix mid-conversation.
+    from agent.prompt_builder import resolve_instruction_profile
+    agent._instruction_profile = resolve_instruction_profile(
+        _agent_section.get("instruction_profile", "auto"),
+        agent.model,
+    )
+    agent._session_init_model_config["instruction_profile"] = agent._instruction_profile
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the

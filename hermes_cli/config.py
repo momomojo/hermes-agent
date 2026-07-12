@@ -939,6 +939,12 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Model-aware system-prompt instruction density.  Resolved once when an
+        # agent/session is constructed to preserve prompt-cache stability.
+        # Values: auto | lean | standard | full.  Auto uses lean for frontier
+        # GPT-5.5/5.6 models, standard for GPT-5.4 and GPT-5.3 Codex, and full
+        # for DeepSeek v4 Flash and unknown models (backward compatibility).
+        "instruction_profile": "auto",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false

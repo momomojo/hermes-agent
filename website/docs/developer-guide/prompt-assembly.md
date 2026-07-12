@@ -295,6 +295,21 @@ In other words:
 
 ## Why prompt assembly is split this way
 
+### Model-aware instruction density
+
+`agent.instruction_profile` is resolved during `AIAgent` initialization and
+stored on the agent as a session-stable value. Prompt assembly reads that
+frozen value rather than re-resolving against the current model or config.
+This is important for model switches and compression rebuilds: neither may
+silently change the system-prompt instruction density inside an existing
+conversation.
+
+The `full` path retains the historical guidance ordering and text. `standard`
+removes only the long OpenAI execution-discipline block. `lean` substitutes a
+single compact frontier execution block for the overlapping task-completion,
+parallel-tool-call, tool-enforcement, and OpenAI execution blocks. All other
+stable, context, and volatile prompt segments remain assembled normally.
+
 The architecture is intentionally optimized to:
 
 - preserve provider-side prompt caching

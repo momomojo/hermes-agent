@@ -6,6 +6,7 @@ import logging
 import sys
 
 import pytest
+from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -26,6 +27,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    resolve_instruction_profile,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -34,7 +36,37 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
-from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("openai/gpt-5.6", "lean"),
+        ("openai/gpt-5.6-codex", "lean"),
+        ("openai/gpt-5.5", "lean"),
+        ("openai/gpt-5.4", "standard"),
+        ("openai/gpt-5.3-codex", "standard"),
+        ("deepseek/deepseek-v4-flash", "full"),
+        ("anthropic/claude-opus-4.8", "full"),
+        ("vendor/unknown-model", "full"),
+    ],
+)
+def test_resolve_instruction_profile_auto_mapping(model, expected):
+    assert resolve_instruction_profile("auto", model) == expected
+
+
+@pytest.mark.parametrize("profile", ["lean", "standard", "full"])
+def test_resolve_instruction_profile_explicit_override(profile):
+    assert resolve_instruction_profile(profile.upper(), "openai/gpt-5.6") == profile
+
+
+def test_resolve_instruction_profile_invalid_value_is_backward_compatible():
+    assert resolve_instruction_profile("unexpected", "openai/gpt-5.6") == "full"
+
+
+@pytest.mark.parametrize("profile", [True, False, None, [], {}, ["lean"]])
+def test_resolve_instruction_profile_malformed_non_string_fails_closed(profile):
+    assert resolve_instruction_profile(profile, "openai/gpt-5.6") == "full"
 
 
 # =========================================================================
@@ -1644,5 +1676,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
