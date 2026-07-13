@@ -135,6 +135,22 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) is None
 
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            "profiles/radulator/scripts/tests/test_kanban_decision_bridge.py",
+            "desktop-build/tests/plugins/test_disk_cleanup_plugin.py",
+        ],
+    )
+    def test_shared_home_durable_source_not_tracked(
+        self, _isolate_env, relative_path
+    ):
+        dg = _load_lib()
+        p = _isolate_env / relative_path
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.
@@ -383,6 +399,35 @@ class TestStaleTestEntryMigration:
         assert len(prompt) == 0
         assert source.exists()
 
+    @pytest.mark.parametrize(
+        "relative_path",
+        [
+            "profiles/radulator/scripts/tests/test_kanban_decision_bridge.py",
+            "desktop-build/tests/plugins/test_disk_cleanup_plugin.py",
+        ],
+    )
+    def test_quick_skips_shared_home_durable_source(
+        self, _isolate_env, relative_path
+    ):
+        dg = _load_lib()
+        source = _isolate_env / relative_path
+        source.parent.mkdir(parents=True)
+        source.write_text("x")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(source),
+            "category": "test",
+            "timestamp": "2026-07-11T03:21:02+00:00",
+            "size": 1,
+        }]))
+
+        summary = dg.quick()
+        assert summary["deleted"] == 0
+        assert source.exists()
+        assert json.loads(tracked_file.read_text()) == []
+
 
 class TestTrackForgetQuick:
     def test_track_then_quick_deletes_test(self, _isolate_env):
@@ -546,6 +591,27 @@ class TestPostToolCallHook:
             args={"path": str(p), "content": "x"},
             result="OK",
             task_id="t2", session_id="s2",
+        )
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
+    def test_write_file_shared_profile_test_source_not_tracked(self, _isolate_env):
+        pi = _load_plugin_init()
+        p = (
+            _isolate_env
+            / "profiles"
+            / "radulator"
+            / "scripts"
+            / "tests"
+            / "test_kanban_decision_bridge.py"
+        )
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        pi._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": str(p), "content": "x"},
+            result="OK",
+            task_id="t3", session_id="s3",
         )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
