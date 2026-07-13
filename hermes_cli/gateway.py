@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -4121,6 +4122,14 @@ def _spawn_detached_gateway() -> bool:
     return True
 
 
+def _codex_sandbox_blocks_detached_gateway() -> bool:
+    """Return True when a detached child would inherit Codex's no-bind sandbox."""
+
+    return os.getenv("CODEX_SANDBOX") == "seatbelt" or os.getenv(
+        "CODEX_SANDBOX_NETWORK_DISABLED"
+    ) == "1"
+
+
 def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) -> bool:
     """Start the gateway detached when launchd can't manage it, with guidance.
 
@@ -4129,6 +4138,19 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     the failure surfaces instead of silently doing nothing.
     """
     from hermes_constants import display_hermes_home as _dhh
+
+    if _codex_sandbox_blocks_detached_gateway():
+        print_error(
+            "Refusing detached gateway fallback inside the Codex sandbox; "
+            "the child process cannot bind local gateway ports."
+        )
+        print(
+            "  Run from a normal shell instead: "
+            f"HERMES_HOME={shlex.quote(str(get_hermes_home()))} hermes gateway start"
+        )
+        if exit_on_failure:
+            sys.exit(1)
+        return False
 
     _write_launchd_unsupported_marker()
     print(f"⚠ launchd cannot manage the gateway on this macOS version ({reason}).")
