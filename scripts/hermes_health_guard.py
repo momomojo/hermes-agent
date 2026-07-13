@@ -893,13 +893,34 @@ def _append_history(payload: dict[str, Any]) -> None:
 
 
 def _html_table(rows: list[dict[str, Any]], kind: str) -> str:
+    def _detail_items_text(items: Any) -> str:
+        if not items:
+            return ""
+        values = items if isinstance(items, list) else [items]
+        formatted: list[str] = []
+        for value in values:
+            if isinstance(value, str):
+                formatted.append(value)
+                continue
+            try:
+                formatted.append(
+                    json.dumps(value, sort_keys=True, separators=(",", ":"))
+                )
+            except TypeError:
+                formatted.append(str(value))
+        return "; ".join(formatted)
+
     body = []
     for row in rows:
         status = "OK" if row.get("ok") else "FAIL"
         if kind == "gateway":
-            detail = "; ".join(row.get("errors") or []) or f"pid={row.get('pid')}, state={row.get('gateway_state')}"
+            detail = _detail_items_text(row.get("errors")) or (
+                f"pid={row.get('pid')}, state={row.get('gateway_state')}"
+            )
         else:
-            detail = "; ".join(row.get("missing") or []) or f"checked_tasks={row.get('checked_tasks')}"
+            detail = _detail_items_text(row.get("missing")) or (
+                f"checked_tasks={row.get('checked_tasks')}"
+            )
         body.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('profile')))}</td>"

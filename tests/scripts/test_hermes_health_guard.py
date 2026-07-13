@@ -212,6 +212,26 @@ def test_runtime_compile_failure_pages_concisely(monkeypatch):
     ]
 
 
+def test_html_table_stringifies_structured_missing_entries():
+    guard = _load_health_guard_module()
+
+    table = guard._html_table(
+        [
+            {
+                "profile": "default",
+                "ok": False,
+                "missing": [{"missing": ["task-a"], "reason": "not runnable"}],
+            }
+        ],
+        "preflight",
+    )
+
+    assert (
+        "{&quot;missing&quot;:[&quot;task-a&quot;],&quot;reason&quot;:&quot;not runnable&quot;}"
+        in table
+    )
+
+
 # ── managed-layer drift ─────────────────────────────────────────────────────
 
 
