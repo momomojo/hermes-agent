@@ -24,6 +24,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _build_embedded_profile_env,
     _cap_turn_payload,
+    _normalize_min_scores,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _redact_home_codes,
@@ -296,6 +297,11 @@ class TestSchemas:
     def test_recall_schema_has_query(self):
         assert RECALL_SCHEMA["name"] == "hindsight_recall"
         assert "query" in RECALL_SCHEMA["parameters"]["properties"]
+        assert "prefer_observations" in RECALL_SCHEMA["parameters"]["properties"]
+        assert "min_scores" in RECALL_SCHEMA["parameters"]["properties"]
+        assert "trace" in RECALL_SCHEMA["parameters"]["properties"]
+        assert "include_scores" in RECALL_SCHEMA["parameters"]["properties"]
+        assert "exact" in RECALL_SCHEMA["parameters"]["properties"]["tags_match"]["enum"]
         assert "query" in RECALL_SCHEMA["parameters"]["required"]
 
     def test_reflect_schema_has_query(self):
@@ -366,11 +372,22 @@ class TestConfig:
         p = provider_with_config(observation_scopes="per_tag")
         assert p._observation_scopes == "per_tag"
 
-    def test_observation_scopes_custom_list_config(self, provider_with_config):
+    def test_observation_scopes_list_of_lists(self, provider_with_config):
         p = provider_with_config(
             observation_scopes=[["user:alice"], ["team:eng"]]
         )
         assert p._observation_scopes == [["user:alice"], ["team:eng"]]
+
+    def test_normalize_min_scores_filters_to_numeric_known_keys(self):
+        assert _normalize_min_scores({"semantic": "0.72", "keyword": 2, "bad": 1}) == {
+            "semantic": 0.72,
+            "keyword": 2.0,
+        }
+        assert _normalize_min_scores('{"reranker": 0.001, "final": 0.5}') == {
+            "reranker": 0.001,
+            "final": 0.5,
+        }
+        assert _normalize_min_scores({"semantic": "nope"}) is None
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -387,6 +404,10 @@ class TestConfig:
             bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
             recall_types=["world", "experience"],
+            recall_prefer_observations=True,
+            recall_min_scores={"semantic": "0.7", "final": 0.2},
+            recall_trace=True,
+            recall_include_scores=True,
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
             bank_mission="Test agent mission",
@@ -405,6 +426,10 @@ class TestConfig:
         assert p._bank_retain_mission == "Extract key facts"
         assert p._recall_max_tokens == 2048
         assert p._recall_types == ["world", "experience"]
+        assert p._recall_prefer_observations is True
+        assert p._recall_min_scores == {"semantic": 0.7, "final": 0.2}
+        assert p._recall_trace is True
+        assert p._recall_include_scores is True
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
@@ -782,6 +807,9 @@ class TestToolHandlers:
             recall_tags_match="all",
             recall_types=["world", "experience"],
             recall_max_tokens=1024,
+            recall_prefer_observations=False,
+            recall_min_scores={"semantic": 0.1},
+            recall_trace=False,
         )
         p.handle_tool_call(
             "hindsight_recall",
@@ -793,6 +821,9 @@ class TestToolHandlers:
                 "query_timestamp": "2026-06-15T12:00:00Z",
                 "budget": "high",
                 "max_tokens": 2048,
+                "prefer_observations": True,
+                "min_scores": {"semantic": 0.7, "final": "0.2"},
+                "trace": True,
             },
         )
         call_kwargs = p._client.arecall.call_args.kwargs
@@ -802,6 +833,38 @@ class TestToolHandlers:
         assert call_kwargs["query_timestamp"] == "2026-06-15T12:00:00Z"
         assert call_kwargs["budget"] == "high"
         assert call_kwargs["max_tokens"] == 2048
+        assert call_kwargs["prefer_observations"] is True
+        assert call_kwargs["min_scores"] == {"semantic": 0.7, "final": 0.2}
+        assert call_kwargs["trace"] is True
+
+    def test_recall_configured_hindsight_08_options_pass_through(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefer_observations=True,
+            recall_min_scores={"semantic": "0.7"},
+            recall_trace=True,
+        )
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["prefer_observations"] is True
+        assert call_kwargs["min_scores"] == {"semantic": 0.7}
+        assert call_kwargs["trace"] is True
+
+    def test_recall_can_return_scores_and_trace(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    text="Memory 1",
+                    scores=SimpleNamespace(final=0.9, reranker=0.8, semantic=0.7, keyword=None),
+                )
+            ],
+            trace={"num_results": 1},
+        )
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "test", "trace": True, "include_scores": True}
+        ))
+        assert "final=0.9" in result["result"]
+        assert result["scores"] == [{"semantic": 0.7, "reranker": 0.8, "final": 0.9}]
+        assert result["trace"] == {"num_results": 1}
 
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
@@ -932,6 +995,9 @@ class TestPrefetch:
             recall_tags_match="all",
             recall_max_tokens=1024,
             recall_types=["world"],
+            recall_prefer_observations=True,
+            recall_min_scores={"final": 0.1},
+            recall_trace=True,
         )
         p.queue_prefetch("test query")
         if p._prefetch_thread:
@@ -942,6 +1008,9 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+        assert call_kwargs["prefer_observations"] is True
+        assert call_kwargs["min_scores"] == {"final": 0.1}
+        assert call_kwargs["trace"] is True
 
     def test_on_turn_start_prefetch_uses_current_message(self, provider):
         captured = {}
