@@ -1305,10 +1305,20 @@ class TestLaunchdServiceRecovery:
         # Marker is still written so status knows launchd is unavailable
         assert gateway_cli._launchd_unsupported_marker_exists()
 
-    def test_launchd_fallback_refuses_codex_sandbox(self, monkeypatch, capsys):
-        """A Codex seatbelt child cannot bind gateway ports, so do not spawn it."""
-        monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
-        monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    @pytest.mark.parametrize(
+        ("env_name", "env_value"),
+        [
+            ("CODEX_SANDBOX", "seatbelt"),
+            ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ],
+    )
+    def test_launchd_fallback_refuses_codex_sandbox(
+        self, monkeypatch, capsys, env_name, env_value
+    ):
+        """Either Codex sandbox signal must block the detached fallback."""
+        monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+        monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+        monkeypatch.setenv(env_name, env_value)
         monkeypatch.setattr(
             gateway_cli,
             "_spawn_detached_gateway",
@@ -1322,6 +1332,23 @@ class TestLaunchdServiceRecovery:
         out = capsys.readouterr().out
         assert "Codex sandbox" in out
         assert "hermes gateway start" in out
+        assert not gateway_cli._launchd_unsupported_marker_exists()
+
+    def test_launchd_fallback_refuses_codex_sandbox_without_exit(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+        monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        monkeypatch.setattr(
+            gateway_cli,
+            "_spawn_detached_gateway",
+            lambda: (_ for _ in ()).throw(AssertionError("should not spawn")),
+        )
+
+        assert gateway_cli._launchd_fallback_to_detached(
+            "launchctl exit 5", exit_on_failure=False
+        ) is False
+        assert "Codex sandbox" in capsys.readouterr().out
         assert not gateway_cli._launchd_unsupported_marker_exists()
 
     # ── PID parsing ──────────────────────────────────────────────────────
