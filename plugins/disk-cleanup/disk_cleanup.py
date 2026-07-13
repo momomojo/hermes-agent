@@ -189,12 +189,22 @@ def _is_protected_cron_path(p: Path) -> bool:
 
 
 def _is_durable_source_path(p: Path) -> bool:
-    """Return True for profile-local source trees that quick() must not prune."""
+    """Return True for durable source trees that quick() must not prune.
+
+    ``HERMES_HOME`` is profile-local in ordinary agent runs, but fleet-level
+    cleanup runs use the shared root. Cover both layouts, plus the managed
+    desktop build that supplies the runtime plugin used by worker cleanup.
+    """
     try:
         rel = p.resolve().relative_to(get_hermes_home().resolve())
     except (ValueError, OSError):
         return False
-    return bool(rel.parts) and rel.parts[0] == "scripts"
+    parts = rel.parts
+    if not parts:
+        return False
+    if parts[0] in {"scripts", "hermes-agent", "desktop-build"}:
+        return True
+    return len(parts) >= 3 and parts[0] == "profiles" and parts[2] == "scripts"
 
 
 def fmt_size(n: float) -> str:
@@ -578,7 +588,7 @@ def guess_category(path: Path) -> Optional[str]:
     try:
         rel = path.resolve().relative_to(hermes_home)
         top = rel.parts[0] if rel.parts else ""
-        if top in {
+        if _is_durable_source_path(path) or top in {
             "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
             "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
             "auth.json", "hermes-agent", "scripts",
