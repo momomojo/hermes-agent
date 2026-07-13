@@ -68,7 +68,7 @@ def is_safe_path(path: Path) -> bool:
 
     Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
     """
-    hermes_home = get_hermes_home()
+    hermes_home = get_hermes_home().resolve()
     try:
         path.resolve().relative_to(hermes_home)
         return True
@@ -147,7 +147,7 @@ ALLOWED_CATEGORIES = {
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "backups", "profiles", ".worktrees",
+    "hermes-agent", "backups", "profiles", ".worktrees", "scripts",
 })
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
@@ -177,7 +177,7 @@ def _is_protected_cron_path(p: Path) -> bool:
     # Lazily build the set once per process so HERMES_HOME is resolved
     # exactly once.
     if not _PROTECTED_CRON_PATHS:
-        hermes_home = get_hermes_home()
+        hermes_home = get_hermes_home().resolve()
         for parent in ("cron", "cronjobs"):
             base = hermes_home / parent
             _PROTECTED_CRON_PATHS.add(str(base))
@@ -186,6 +186,25 @@ def _is_protected_cron_path(p: Path) -> bool:
             _PROTECTED_CRON_PATHS.add(str(base / ".tick.lock"))
     resolved = str(p.resolve())
     return resolved in _PROTECTED_CRON_PATHS
+
+
+def _is_durable_source_path(p: Path) -> bool:
+    """Return True for durable source trees that quick() must not prune.
+
+    ``HERMES_HOME`` is profile-local in ordinary agent runs, but fleet-level
+    cleanup runs use the shared root. Cover both layouts, plus the managed
+    desktop build that supplies the runtime plugin used by worker cleanup.
+    """
+    try:
+        rel = p.resolve().relative_to(get_hermes_home().resolve())
+    except (ValueError, OSError):
+        return False
+    parts = rel.parts
+    if not parts:
+        return False
+    if parts[0] in {"scripts", "hermes-agent", "desktop-build"}:
+        return True
+    return len(parts) >= 3 and parts[0] == "profiles" and parts[2] == "scripts"
 
 
 def fmt_size(n: float) -> str:
@@ -276,6 +295,11 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
                 # Stale entry — would be skipped by quick(); omit from
                 # dry-run output too.
                 continue
+        if cat == "test" and _is_durable_source_path(p):
+            # Old auto-tracking treated durable profile source files named
+            # test_*.py as disposable scratch tests. They should not appear in
+            # dry-run output and quick() will drop the stale entry.
+            continue
 
         if cat == "test":
             auto.append(item)
@@ -336,6 +360,11 @@ def quick() -> Dict[str, Any]:
                 # Drop the stale entry — it was misclassified.
                 continue
 
+        if cat == "test" and _is_durable_source_path(p):
+            _log(f"SKIP stale test entry for durable source path: {p}")
+            # Drop the stale entry — profile-local source is durable.
+            continue
+
         # Hard safety net: never delete cron control-plane state even if
         # the category somehow slipped through re-validation above.
         if _is_protected_cron_path(p):
@@ -368,7 +397,7 @@ def quick() -> Dict[str, Any]:
     # durable state trees.  Some installs place the Hermes checkout, venv,
     # and desktop build under HERMES_HOME; a full rglob over that tree can
     # stall the gateway event loop for minutes.
-    hermes_home = get_hermes_home()
+    hermes_home = get_hermes_home().resolve()
     empty_removed = 0
     sweep_stack: List[Tuple[Path, bool]] = []
     try:
@@ -555,14 +584,14 @@ def guess_category(path: Path) -> Optional[str]:
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
-    hermes_home = get_hermes_home()
+    hermes_home = get_hermes_home().resolve()
     try:
         rel = path.resolve().relative_to(hermes_home)
         top = rel.parts[0] if rel.parts else ""
-        if top in {
+        if _is_durable_source_path(path) or top in {
             "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
             "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
-            "auth.json", "hermes-agent",
+            "auth.json", "hermes-agent", "scripts",
         }:
             return None
         if top == "cron" or top == "cronjobs":
