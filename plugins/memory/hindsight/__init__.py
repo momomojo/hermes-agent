@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.8.4"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
@@ -383,8 +383,39 @@ RECALL_SCHEMA = {
             },
             "tags_match": {
                 "type": "string",
-                "enum": ["any", "all", "any_strict", "all_strict"],
+                "enum": ["any", "all", "any_strict", "all_strict", "exact"],
                 "description": "Tag matching mode when tags are provided.",
+            },
+            "prefer_observations": {
+                "type": "boolean",
+                "description": (
+                    "Optional Hindsight 0.8+ recall mode. When recalling observations together "
+                    "with raw world/experience facts, prefer consolidated observations and drop "
+                    "the raw source facts they supersede. Defaults to the provider config, which "
+                    "is false unless explicitly set."
+                ),
+            },
+            "min_scores": {
+                "type": "object",
+                "description": (
+                    "Optional Hindsight 0.8+ per-stage score floors. Keys: semantic, keyword, "
+                    "reranker, final. Any omitted key imposes no floor; floors are AND-ed."
+                ),
+                "properties": {
+                    "semantic": {"type": "number"},
+                    "keyword": {"type": "number"},
+                    "reranker": {"type": "number"},
+                    "final": {"type": "number"},
+                },
+                "additionalProperties": False,
+            },
+            "trace": {
+                "type": "boolean",
+                "description": "Optional Hindsight recall trace/debug output. Defaults to false.",
+            },
+            "include_scores": {
+                "type": "boolean",
+                "description": "If true, include per-result recall scores in the tool response when returned by the server.",
             },
             "query_timestamp": {
                 "type": "string",
@@ -510,6 +541,90 @@ def _normalize_retain_tags(value: Any) -> List[str]:
 def _normalize_string_list(value: Any) -> List[str]:
     """Normalize a config string/list into non-empty strings."""
     return _normalize_retain_tags(value)
+
+
+_RECALL_SCORE_KEYS = ("semantic", "keyword", "reranker", "final")
+
+
+def _normalize_min_scores(value: Any) -> dict[str, float] | None:
+    """Normalize Hindsight recall min_scores config/tool input.
+
+    Hindsight 0.8 accepts a partial object with ``semantic``, ``keyword``,
+    ``reranker``, and/or ``final`` numeric floors. Ignore unknown keys and
+    invalid values so a bad optional diagnostic knob never breaks default
+    recall.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except Exception:
+            logger.warning("Invalid Hindsight recall_min_scores JSON %r; ignoring.", value)
+            return None
+    if not isinstance(value, dict):
+        return None
+
+    normalized: dict[str, float] = {}
+    for key in _RECALL_SCORE_KEYS:
+        raw = value.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            normalized[key] = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid Hindsight min_scores.%s=%r; ignoring that floor.", key, raw)
+    return normalized or None
+
+
+def _model_to_dict(value: Any) -> dict[str, Any] | None:
+    """Best-effort conversion for pydantic/openapi/simple namespace objects."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    for method_name in ("to_dict", "model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+            except TypeError:
+                data = method(exclude_none=True)
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+    data = {
+        key: getattr(value, key)
+        for key in _RECALL_SCORE_KEYS
+        if hasattr(value, key) and getattr(value, key) is not None
+    }
+    return data or None
+
+
+def _extract_recall_scores(result: Any) -> dict[str, Any] | None:
+    """Return a serializable per-result scores object if Hindsight returned one."""
+    return _model_to_dict(getattr(result, "scores", None))
+
+
+def _format_recall_result_line(index: int, result: Any, *, include_scores: bool = False) -> str:
+    """Format a recall result line, optionally appending compact scores."""
+    text = getattr(result, "text", "")
+    line = f"{index}. {text}"
+    if not include_scores:
+        return line
+    scores = _extract_recall_scores(result)
+    if not scores:
+        return line
+    parts = []
+    for key in _RECALL_SCORE_KEYS:
+        score = scores.get(key)
+        if isinstance(score, (int, float)):
+            parts.append(f"{key}={score:.4g}")
+    return f"{line} [scores: {', '.join(parts)}]" if parts else line
 
 
 def _redact_labeled_value(match: re.Match[str]) -> str:
@@ -958,6 +1073,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
+        self._recall_prefer_observations = False
+        self._recall_min_scores: dict[str, float] | None = None
+        self._recall_trace = False
+        self._recall_include_scores = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -1635,6 +1754,10 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list(configured_types) or ["observation"]
+        self._recall_prefer_observations = bool(self._config.get("recall_prefer_observations", False))
+        self._recall_min_scores = _normalize_min_scores(self._config.get("recall_min_scores"))
+        self._recall_trace = bool(self._config.get("recall_trace", False))
+        self._recall_include_scores = bool(self._config.get("recall_include_scores", False))
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
@@ -1905,6 +2028,12 @@ class HindsightMemoryProvider(MemoryProvider):
             recall_kwargs["tags_match"] = self._recall_tags_match
         if self._recall_types:
             recall_kwargs["types"] = self._recall_types
+        if self._recall_prefer_observations:
+            recall_kwargs["prefer_observations"] = True
+        if self._recall_min_scores:
+            recall_kwargs["min_scores"] = self._recall_min_scores
+        if self._recall_trace:
+            recall_kwargs["trace"] = True
         logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                      self._bank_id, len(query), self._budget)
         resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2252,6 +2381,24 @@ class HindsightMemoryProvider(MemoryProvider):
                 elif self._recall_types:
                     recall_kwargs["types"] = self._recall_types
 
+                if args.get("prefer_observations") is not None:
+                    recall_kwargs["prefer_observations"] = bool(args.get("prefer_observations"))
+                elif self._recall_prefer_observations:
+                    recall_kwargs["prefer_observations"] = True
+
+                min_scores = (
+                    _normalize_min_scores(args.get("min_scores"))
+                    if "min_scores" in args
+                    else self._recall_min_scores
+                )
+                if min_scores:
+                    recall_kwargs["min_scores"] = min_scores
+
+                if args.get("trace") is not None:
+                    recall_kwargs["trace"] = bool(args.get("trace"))
+                elif self._recall_trace:
+                    recall_kwargs["trace"] = True
+
                 query_timestamp = args.get("query_timestamp")
                 if query_timestamp:
                     recall_kwargs["query_timestamp"] = str(query_timestamp)
@@ -2263,8 +2410,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
+                include_scores = bool(args.get("include_scores") or self._recall_include_scores)
+                lines = [
+                    _format_recall_result_line(i, r, include_scores=include_scores)
+                    for i, r in enumerate(resp.results, 1)
+                ]
+                result_payload: dict[str, Any] = {"result": "\n".join(lines)}
+                if include_scores:
+                    scores = [_extract_recall_scores(r) for r in resp.results]
+                    if any(score is not None for score in scores):
+                        result_payload["scores"] = scores
+                if recall_kwargs.get("trace") and getattr(resp, "trace", None) is not None:
+                    result_payload["trace"] = resp.trace
+                return json.dumps(result_payload)
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
