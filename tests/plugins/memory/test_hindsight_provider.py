@@ -866,6 +866,27 @@ class TestToolHandlers:
         assert result["scores"] == [{"semantic": 0.7, "reranker": 0.8, "final": 0.9}]
         assert result["trace"] == {"num_results": 1}
 
+    def test_recall_explicit_false_disables_configured_scores(self, provider_with_config):
+        p = provider_with_config(recall_include_scores=True)
+        p._client.arecall.return_value = SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    text="Memory 1",
+                    scores=SimpleNamespace(
+                        final=0.9, reranker=None, semantic=None, keyword=None
+                    ),
+                )
+            ],
+            trace=None,
+        )
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "test", "include_scores": False}
+        ))
+
+        assert "final=" not in result["result"]
+        assert "scores" not in result
+
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
         result = json.loads(provider.handle_tool_call(

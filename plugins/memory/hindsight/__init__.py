@@ -2410,7 +2410,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                include_scores = bool(args.get("include_scores") or self._recall_include_scores)
+                include_scores = (
+                    bool(args.get("include_scores"))
+                    if "include_scores" in args
+                    else self._recall_include_scores
+                )
                 lines = [
                     _format_recall_result_line(i, r, include_scores=include_scores)
                     for i, r in enumerate(resp.results, 1)
