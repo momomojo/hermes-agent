@@ -608,6 +608,11 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @pytest.fixture(autouse=True)
+    def _clear_codex_sandbox_env(self, monkeypatch):
+        monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+        monkeypatch.delenv("CODEX_SANDBOX_NETWORK_DISABLED", raising=False)
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -1299,6 +1304,25 @@ class TestLaunchdServiceRecovery:
         assert "nohup hermes gateway run" in out
         # Marker is still written so status knows launchd is unavailable
         assert gateway_cli._launchd_unsupported_marker_exists()
+
+    def test_launchd_fallback_refuses_codex_sandbox(self, monkeypatch, capsys):
+        """A Codex seatbelt child cannot bind gateway ports, so do not spawn it."""
+        monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+        monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        monkeypatch.setattr(
+            gateway_cli,
+            "_spawn_detached_gateway",
+            lambda: (_ for _ in ()).throw(AssertionError("should not spawn")),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli._launchd_fallback_to_detached("launchctl exit 5")
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "Codex sandbox" in out
+        assert "hermes gateway start" in out
+        assert not gateway_cli._launchd_unsupported_marker_exists()
 
     # ── PID parsing ──────────────────────────────────────────────────────
 
