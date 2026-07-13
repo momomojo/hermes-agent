@@ -139,7 +139,13 @@ class TestGuessCategory:
         "relative_path",
         [
             "profiles/radulator/scripts/tests/test_kanban_decision_bridge.py",
+            "profiles/radulator/skills/test_durable_skill.md",
+            "profiles/radulator/plugins/test_durable_plugin.py",
+            "profiles/radulator/.worktrees/task/test_durable_worktree.py",
             "desktop-build/tests/plugins/test_disk_cleanup_plugin.py",
+            ".worktrees/task/test_durable_worktree.py",
+            "skills/test_durable_skill.md",
+            "plugins/test_durable_plugin.py",
         ],
     )
     def test_shared_home_durable_source_not_tracked(
@@ -399,15 +405,44 @@ class TestStaleTestEntryMigration:
         assert len(prompt) == 0
         assert source.exists()
 
+    @pytest.mark.parametrize("category", ["test", "temp", "cron-output"])
+    def test_dry_run_omits_durable_source_for_any_category(
+        self, _isolate_env, category
+    ):
+        dg = _load_lib()
+        source = _isolate_env / "profiles" / "radulator" / "skills" / "test_skill.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("x")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(source),
+            "category": category,
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": 1,
+        }]))
+
+        auto, prompt = dg.dry_run()
+        assert auto == []
+        assert prompt == []
+        assert source.exists()
+
     @pytest.mark.parametrize(
-        "relative_path",
+        ("relative_path", "category"),
         [
-            "profiles/radulator/scripts/tests/test_kanban_decision_bridge.py",
-            "desktop-build/tests/plugins/test_disk_cleanup_plugin.py",
+            ("profiles/radulator/scripts/tests/test_kanban_decision_bridge.py", "test"),
+            ("profiles/radulator/skills/test_durable_skill.md", "temp"),
+            ("profiles/radulator/plugins/test_durable_plugin.py", "cron-output"),
+            ("profiles/radulator/.worktrees/task/test_durable_worktree.py", "temp"),
+            ("desktop-build/tests/plugins/test_disk_cleanup_plugin.py", "test"),
+            (".worktrees/task/test_durable_worktree.py", "temp"),
+            ("skills/test_durable_skill.md", "temp"),
+            ("plugins/test_durable_plugin.py", "temp"),
         ],
     )
     def test_quick_skips_shared_home_durable_source(
-        self, _isolate_env, relative_path
+        self, _isolate_env, relative_path, category
     ):
         dg = _load_lib()
         source = _isolate_env / relative_path
@@ -418,7 +453,7 @@ class TestStaleTestEntryMigration:
         tracked_file.parent.mkdir(parents=True, exist_ok=True)
         tracked_file.write_text(json.dumps([{
             "path": str(source),
-            "category": "test",
+            "category": category,
             "timestamp": "2026-07-11T03:21:02+00:00",
             "size": 1,
         }]))
@@ -457,6 +492,17 @@ class TestTrackForgetQuick:
         dg = _load_lib()
         assert dg.track(str(_isolate_env / "nope.txt"), "test", silent=True) is False
 
+    def test_track_rejects_durable_source_for_any_category(self, _isolate_env):
+        dg = _load_lib()
+        source = _isolate_env / "profiles" / "radulator" / "plugins" / "tmp_plugin.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("x")
+
+        assert dg.track(str(source), "temp", silent=True) is False
+        assert source.exists()
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists()
+
     def test_forget_removes_entry(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "keep.tmp"
@@ -476,26 +522,31 @@ class TestTrackForgetQuick:
 
     def test_quick_preserves_protected_top_level_dirs(self, _isolate_env):
         dg = _load_lib()
-        for d in ("logs", "memories", "sessions", "cron", "cache", "scripts"):
+        protected = (
+            "logs", "memories", "sessions", "cron", "cache", "scripts",
+            "desktop-build",
+        )
+        for d in protected:
             (_isolate_env / d).mkdir()
         dg.quick()
-        for d in ("logs", "memories", "sessions", "cron", "cache", "scripts"):
+        for d in protected:
             assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
 
+    @pytest.mark.parametrize("top_dir", ["hermes-agent", "desktop-build"])
     def test_quick_does_not_descend_into_protected_top_level_dirs(
-        self, _isolate_env, monkeypatch
+        self, _isolate_env, monkeypatch, top_dir
     ):
         dg = _load_lib()
         protected_empty = (
-            _isolate_env / "hermes-agent" / "node_modules" / "pkg" / "empty"
+            _isolate_env / top_dir / "node_modules" / "pkg" / "empty"
         )
         protected_empty.mkdir(parents=True)
 
         original_iterdir = Path.iterdir
 
         def guarded_iterdir(path):
-            if path == _isolate_env / "hermes-agent":
-                raise AssertionError("quick() descended into protected hermes-agent/")
+            if path == _isolate_env / top_dir:
+                raise AssertionError(f"quick() descended into protected {top_dir}/")
             return original_iterdir(path)
 
         monkeypatch.setattr(Path, "iterdir", guarded_iterdir)

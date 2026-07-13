@@ -147,7 +147,7 @@ ALLOWED_CATEGORIES = {
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "backups", "profiles", ".worktrees", "scripts",
+    "hermes-agent", "desktop-build", "backups", "profiles", ".worktrees", "scripts",
 })
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
@@ -202,9 +202,16 @@ def _is_durable_source_path(p: Path) -> bool:
     parts = rel.parts
     if not parts:
         return False
-    if parts[0] in {"scripts", "hermes-agent", "desktop-build"}:
+    if parts[0] in {
+        "scripts", "skills", "plugins", "hermes-agent", "desktop-build",
+        ".worktrees",
+    }:
         return True
-    return len(parts) >= 3 and parts[0] == "profiles" and parts[2] == "scripts"
+    return (
+        len(parts) >= 3
+        and parts[0] == "profiles"
+        and parts[2] in {"scripts", "skills", "plugins", ".worktrees"}
+    )
 
 
 def fmt_size(n: float) -> str:
@@ -233,6 +240,10 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 
     if not is_safe_path(path):
         _log(f"REJECT: {path} (outside HERMES_HOME)")
+        return False
+
+    if _is_durable_source_path(path):
+        _log(f"REJECT: {path} (durable source path)")
         return False
 
     size = path.stat().st_size if path.is_file() else 0
@@ -295,10 +306,10 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
                 # Stale entry — would be skipped by quick(); omit from
                 # dry-run output too.
                 continue
-        if cat == "test" and _is_durable_source_path(p):
-            # Old auto-tracking treated durable profile source files named
-            # test_*.py as disposable scratch tests. They should not appear in
-            # dry-run output and quick() will drop the stale entry.
+        if _is_durable_source_path(p):
+            # Old or manually edited tracked state can misclassify durable
+            # source under any deletion category. Never advertise it as a
+            # cleanup candidate; quick() drops the stale entry.
             continue
 
         if cat == "test":
@@ -360,9 +371,9 @@ def quick() -> Dict[str, Any]:
                 # Drop the stale entry — it was misclassified.
                 continue
 
-        if cat == "test" and _is_durable_source_path(p):
-            _log(f"SKIP stale test entry for durable source path: {p}")
-            # Drop the stale entry — profile-local source is durable.
+        if _is_durable_source_path(p):
+            _log(f"SKIP stale cleanup entry for durable source path: {p}")
+            # Drop the stale entry regardless of category — source is durable.
             continue
 
         # Hard safety net: never delete cron control-plane state even if
