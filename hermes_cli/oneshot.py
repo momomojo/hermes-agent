@@ -187,6 +187,9 @@ def run_oneshot(
     # bytes reach the terminal.
     logging.disable(logging.CRITICAL)
 
+    from hermes_cli.kanban_env import strip_kanban_lifecycle_env
+    strip_kanban_lifecycle_env(os.environ)
+
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
