@@ -297,6 +297,24 @@ def test_disabled_profile_cron_errors_are_quarantined_from_health_pages():
     assert guard._check_cron_failures(["coder"]) == []
 
 
+def test_post_alert_accepts_async_agent_webhook_response(monkeypatch):
+    guard = _load_health_guard_module()
+
+    class Accepted:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(guard, "_notify_secret", lambda: "synthetic-secret")
+    monkeypatch.setattr(guard.urllib.request, "urlopen", lambda *_args, **_kwargs: Accepted())
+
+    assert guard._post_alert("synthetic incident", "critical") is True
+
+
 def test_html_table_stringifies_structured_missing_entries():
     guard = _load_health_guard_module()
 

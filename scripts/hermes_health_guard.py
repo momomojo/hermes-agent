@@ -1161,7 +1161,11 @@ def _post_alert(alert_text: str, level: str) -> bool:
     })
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200
+            # deliver_only routes return 200; agent-mode routes return 202
+            # immediately and process the incident asynchronously. Both are
+            # successful handoffs and must advance notify_state, otherwise the
+            # 5-minute guard loop spawns duplicate remediation agents forever.
+            return 200 <= int(resp.status) < 300
     except OSError:
         return False
 
