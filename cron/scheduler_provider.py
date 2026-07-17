@@ -15,7 +15,9 @@ delivery.
 The built-in InProcessCronScheduler runs the historical 60s daemon-thread
 ticker. Alternative providers (e.g. Chronos, a NAS-mediated managed-cron
 provider for scale-to-zero deployments) live under plugins/cron_providers/<name>/ and are
-selected via the `cron.provider` config key (empty = built-in).
+selected via the `cron.provider` config key (empty = built-in). A profile may
+set ``cron.enabled: false`` to keep its gateway running while fail-closing its
+profile-local scheduler.
 """
 from __future__ import annotations
 
@@ -114,21 +116,28 @@ class CronScheduler(ABC):
 def resolve_cron_scheduler() -> "CronScheduler":
     """Return the active cron scheduler provider.
 
-    Reads ``cron.provider`` from config. Empty/absent → built-in. A named
-    provider that is missing, fails to load, or reports ``is_available() ==
-    False`` falls back to the built-in with a warning — cron must never be left
-    without a trigger.
+    Reads ``cron.enabled`` and ``cron.provider`` from config. Explicitly false
+    returns the no-fire disabled provider. Otherwise empty/absent → built-in. A
+    named provider that is missing, fails to load, or reports
+    ``is_available() == False`` falls back to the built-in with a warning.
     """
     import logging
 
     logger = logging.getLogger("cron.scheduler_provider")
 
     name = ""
+    enabled = True
     try:
         from hermes_cli.config import cfg_get, load_config
-        name = (cfg_get(load_config(), "cron", "provider", default="") or "").strip()
+        config = load_config()
+        enabled = cfg_get(config, "cron", "enabled", default=True) is not False
+        name = (cfg_get(config, "cron", "provider", default="") or "").strip()
     except Exception:
         pass
+
+    if not enabled:
+        logger.info("Cron scheduler disabled by cron.enabled=false")
+        return DisabledCronScheduler()
 
     if not name or name in ("builtin", "in-process", "inprocess"):
         return InProcessCronScheduler()
@@ -149,6 +158,31 @@ def resolve_cron_scheduler() -> "CronScheduler":
             "Failed to load cron.provider '%s' (%s); using built-in ticker", name, e
         )
         return InProcessCronScheduler()
+
+
+class DisabledCronScheduler(CronScheduler):
+    """Fail-closed provider for profiles that must not schedule local cron.
+
+    The gateway still starts a scheduler thread so lifecycle/shutdown behavior
+    stays uniform, but this provider only waits for ``stop_event`` and never
+    touches ticker heartbeats or job state.
+    """
+
+    @property
+    def name(self) -> str:
+        return "disabled"
+
+    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+        import logging
+
+        logging.getLogger("cron.scheduler_provider").info(
+            "Profile-local cron scheduler is disabled"
+        )
+        stop_event.wait()
+
+    def fire_due(self, job_id: str, *, adapters=None, loop=None) -> bool:
+        """Refuse managed/external fire callbacks while the profile gate is off."""
+        return False
 
 
 class InProcessCronScheduler(CronScheduler):

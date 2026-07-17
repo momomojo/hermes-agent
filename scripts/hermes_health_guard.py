@@ -344,6 +344,96 @@ def _check_listener(name: str, port: int) -> dict[str, Any]:
         return {"name": name, "port": port, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _cron_scheduler_enabled(profile: str | None) -> bool:
+    """Return False only for an explicit ``cron.enabled: false`` profile gate."""
+    config_path = _profile_home(profile) / "config.yaml"
+    try:
+        import yaml
+
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return True
+    cron = config.get("cron") if isinstance(config, dict) else None
+    return not (isinstance(cron, dict) and cron.get("enabled") is False)
+
+
+_CRON_DEFINITION_FIELDS = (
+    "id",
+    "name",
+    "prompt",
+    "skills",
+    "skill",
+    "model",
+    "provider",
+    "base_url",
+    "script",
+    "script_timeout_seconds",
+    "no_agent",
+    "context_from",
+    "schedule",
+    "schedule_display",
+    "deliver",
+    "origin",
+    "enabled_toolsets",
+    "workdir",
+    "attach_to_session",
+)
+
+
+def _cron_definition(job: dict[str, Any]) -> dict[str, Any]:
+    """Operational definition without mutable run/claim/pause state."""
+    definition = {key: job.get(key) for key in _CRON_DEFINITION_FIELDS}
+    repeat = job.get("repeat")
+    definition["repeat_times"] = repeat.get("times") if isinstance(repeat, dict) else repeat
+    return definition
+
+
+def _read_cron_jobs(path: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    return [job for job in (jobs or []) if isinstance(job, dict)]
+
+
+def _check_duplicate_cron_registries(profiles: list[str]) -> list[str]:
+    """Detect specialist registries that are exact active clones of default.
+
+    Runtime fields deliberately differ after two gateways tick independently,
+    so compare immutable operational definitions keyed by the same job IDs.
+    An owned/unique/modified job makes the profile non-matching. Disabled or
+    fully paused profiles are already quarantined and stay silent.
+    """
+    default_jobs = _read_cron_jobs(HOME / "cron" / "jobs.json")
+    if not default_jobs:
+        return []
+    default_by_id = {str(job.get("id")): job for job in default_jobs if job.get("id")}
+    failures: list[str] = []
+    for profile in profiles:
+        if not _cron_scheduler_enabled(profile):
+            continue
+        jobs = _read_cron_jobs(_profile_home(profile) / "cron" / "jobs.json")
+        if not jobs or not any(
+            job.get("enabled", True) and not job.get("paused_at") for job in jobs
+        ):
+            continue
+        by_id = {str(job.get("id")): job for job in jobs if job.get("id")}
+        if set(by_id) != set(default_by_id):
+            continue
+        if not all(
+            _cron_definition(job) == _cron_definition(default_by_id[job_id])
+            for job_id, job in by_id.items()
+        ):
+            continue
+        failures.append(
+            f"cron registry duplicated from default for {profile}: "
+            f"{len(by_id)} exact job definition(s) active under a specialist gateway; "
+            "disable/quarantine the profile scheduler instead of copying owner scripts"
+        )
+    return failures
+
+
 def _check_cron_failures(profiles: list[str]) -> list[str]:
     """One failure line per enabled, unpaused cron job whose latest run errored.
 
@@ -355,6 +445,8 @@ def _check_cron_failures(profiles: list[str]) -> list[str]:
     paths += [(p, HOME / "profiles" / p / "cron" / "jobs.json") for p in profiles]
     for profile, path in paths:
         label = profile or "default"
+        if not _cron_scheduler_enabled(profile):
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -908,6 +1000,7 @@ def collect_health() -> dict[str, Any]:
         if not item["ok"]:
             failures.append(f"listener down: {item['name']} (127.0.0.1:{item['port']}): {item['error']}")
     failures.extend(kanban_flow.get("failures") or [])
+    failures.extend(_check_duplicate_cron_registries(profiles))
     failures.extend(_check_cron_failures(profiles))
     failures.extend(_check_backup_freshness())
     failures.extend(_check_runtime_compile())

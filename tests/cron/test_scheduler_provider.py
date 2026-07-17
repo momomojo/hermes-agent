@@ -182,6 +182,26 @@ def test_inprocess_provider_stop_is_noop():
     assert InProcessCronScheduler().stop() is None
 
 
+def test_disabled_provider_never_ticks_and_stops():
+    """An explicitly disabled profile cron waits for shutdown without firing."""
+    from cron.scheduler_provider import DisabledCronScheduler
+
+    stop = threading.Event()
+    prov = DisabledCronScheduler()
+    assert prov.name == "disabled"
+
+    with patch("cron.scheduler.tick") as tick:
+        t = threading.Thread(target=prov.start, args=(stop,), daemon=True)
+        t.start()
+        time.sleep(0.02)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive(), "disabled provider did not exit after stop_event"
+    tick.assert_not_called()
+    assert prov.fire_due("would-have-run") is False
+
+
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
 
 
@@ -190,6 +210,13 @@ def test_default_config_cron_provider_is_empty():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["cron"]["provider"] == ""
+
+
+def test_default_config_cron_is_enabled():
+    """Existing installs keep the historical built-in scheduler by default."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["enabled"] is True
 
 
 def test_discover_cron_schedulers_returns_list():
@@ -247,6 +274,20 @@ def test_resolve_no_cron_section_falls_back_to_builtin(monkeypatch):
     monkeypatch.setattr(cfg, "load_config", lambda: {})
     prov = sp.resolve_cron_scheduler()
     assert prov.name == "builtin"
+
+
+def test_resolve_cron_enabled_false_returns_disabled(monkeypatch):
+    """cron.enabled=false is a fail-closed profile-level scheduling gate."""
+    import hermes_cli.config as cfg
+    from cron import scheduler_provider as sp
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {"cron": {"enabled": False, "provider": ""}},
+    )
+    prov = sp.resolve_cron_scheduler()
+    assert prov.name == "disabled"
 
 
 def test_resolve_unknown_provider_falls_back_to_builtin(monkeypatch):

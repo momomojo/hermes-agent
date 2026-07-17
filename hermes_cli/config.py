@@ -2493,6 +2493,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Master profile-local scheduling gate. Set false on specialist
+        # gateways that must stay online for chat/webhooks but must never fire
+        # a cloned or stale cron registry. Existing installs remain enabled.
+        "enabled": True,
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or

@@ -212,6 +212,91 @@ def test_runtime_compile_failure_pages_concisely(monkeypatch):
     ]
 
 
+# ── profile cron ownership / duplicate-registry quarantine ─────────────────
+
+
+def _write_cron_jobs(home: Path, jobs: list[dict]) -> None:
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": jobs}), encoding="utf-8"
+    )
+
+
+def test_exact_default_cron_clone_is_flagged_before_jobs_error():
+    guard = _load_health_guard_module()
+    jobs = [
+        {
+            "id": "a",
+            "name": "owner job",
+            "prompt": "",
+            "script": "owner.sh",
+            "no_agent": True,
+            "schedule": {"kind": "interval", "minutes": 5},
+            "enabled": True,
+            "last_status": "ok",
+        },
+        {
+            "id": "b",
+            "name": "second owner job",
+            "prompt": "reason",
+            "script": None,
+            "no_agent": False,
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "enabled": True,
+            "last_status": "ok",
+        },
+    ]
+    _write_cron_jobs(guard.HOME, jobs)
+    clone_home = guard.HOME / "profiles" / "coder"
+    clone_jobs = json.loads(json.dumps(jobs))
+    clone_jobs[0]["last_status"] = "error"
+    clone_jobs[0]["last_error"] = "profile-local script missing"
+    _write_cron_jobs(clone_home, clone_jobs)
+    (clone_home / "config.yaml").write_text("cron:\n  enabled: true\n", encoding="utf-8")
+
+    failures = guard._check_duplicate_cron_registries(["coder"])
+
+    assert len(failures) == 1
+    assert "cron registry duplicated from default for coder" in failures[0]
+    assert "2 exact job definition(s)" in failures[0]
+
+
+def test_profile_with_owned_cron_job_is_not_misclassified_as_clone():
+    guard = _load_health_guard_module()
+    _write_cron_jobs(
+        guard.HOME,
+        [{"id": "a", "name": "default", "script": "a.sh", "enabled": True}],
+    )
+    profile_home = guard.HOME / "profiles" / "coder"
+    _write_cron_jobs(
+        profile_home,
+        [{"id": "owned", "name": "owned", "script": "owned.sh", "enabled": True}],
+    )
+    (profile_home / "config.yaml").write_text("cron:\n  enabled: true\n", encoding="utf-8")
+
+    assert guard._check_duplicate_cron_registries(["coder"]) == []
+
+
+def test_disabled_profile_cron_errors_are_quarantined_from_health_pages():
+    guard = _load_health_guard_module()
+    profile_home = guard.HOME / "profiles" / "coder"
+    _write_cron_jobs(
+        profile_home,
+        [
+            {
+                "id": "a",
+                "name": "stale cloned failure",
+                "enabled": True,
+                "last_status": "error",
+                "last_error": "Script not found",
+            }
+        ],
+    )
+    (profile_home / "config.yaml").write_text("cron:\n  enabled: false\n", encoding="utf-8")
+
+    assert guard._check_cron_failures(["coder"]) == []
+
+
 def test_html_table_stringifies_structured_missing_entries():
     guard = _load_health_guard_module()
 
