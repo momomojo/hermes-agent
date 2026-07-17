@@ -245,6 +245,108 @@ def test_managed_layer_drift_fresh_vs_old_dirty_paths(monkeypatch):
     assert "autocommit aborted/failing?" in failures[0]
 
 
+def _backup_timestamp(*, hours_ago: float) -> str:
+    return (datetime.now() - timedelta(hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_backup_freshness_accepts_clean_zero_exit(monkeypatch, tmp_path):
+    guard = _load_health_guard_module()
+    log = tmp_path / "home-backup.log"
+    stamp = _backup_timestamp(hours_ago=1)
+    log.write_text(
+        f"=== hermes home backup started {stamp} ===\n"
+        f"=== finished {stamp} rsync_rc=0/0 ===\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "BACKUP_LOG", log)
+
+    assert guard._check_backup_freshness() == []
+
+
+def test_backup_freshness_accepts_wrapper_classified_vanished_source_race(
+    monkeypatch, tmp_path
+):
+    guard = _load_health_guard_module()
+    log = tmp_path / "home-backup.log"
+    stamp = _backup_timestamp(hours_ago=1)
+    log.write_text(
+        f"=== hermes home backup started {stamp} ===\n"
+        "rsync(42): error: /tmp/source: open (2): No such file or directory\n"
+        f"=== finished {stamp} rsync_rc=23/0 ===\n"
+        "BACKUP OK with benign vanished-source warning rc=23/0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "BACKUP_LOG", log)
+
+    assert guard._check_backup_freshness() == []
+
+
+def test_backup_freshness_rejects_unclassified_or_mismatched_nonzero_run(
+    monkeypatch, tmp_path
+):
+    guard = _load_health_guard_module()
+    log = tmp_path / "home-backup.log"
+    old_stamp = _backup_timestamp(hours_ago=48)
+    new_stamp = _backup_timestamp(hours_ago=1)
+    log.write_text(
+        f"=== hermes home backup started {old_stamp} ===\n"
+        f"=== finished {old_stamp} rsync_rc=0/0 ===\n"
+        f"=== hermes home backup started {new_stamp} ===\n"
+        f"=== finished {new_stamp} rsync_rc=23/0 ===\n"
+        "BACKUP OK with benign vanished-source warning rc=24/0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "BACKUP_LOG", log)
+
+    failures = guard._check_backup_freshness()
+    assert len(failures) == 1
+    assert f"home-backup stale: last success {old_stamp}" in failures[0]
+
+
+def test_gateway_restart_not_required_for_health_scripts_and_tests(monkeypatch):
+    guard = _load_health_guard_module()
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout="scripts/hermes_health_guard.py\ntests/scripts/test_hermes_health_guard.py\n",
+                stderr="",
+            ),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    assert guard._gateway_restart_required_since(12345) is False
+
+
+def test_gateway_restart_required_for_runtime_change(monkeypatch):
+    guard = _load_health_guard_module()
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="gateway/run.py\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    assert guard._gateway_restart_required_since(12345) is True
+
+
+def test_gateway_restart_required_when_git_baseline_is_ambiguous(monkeypatch):
+    guard = _load_health_guard_module()
+    monkeypatch.setattr(
+        guard.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="git failed"
+        ),
+    )
+
+    assert guard._gateway_restart_required_since(12345) is True
+
+
 def test_hindsight_recall_types_observation_only_is_healthy(monkeypatch):
     guard = _load_health_guard_module()
     (guard.HOME / "hindsight").mkdir(exist_ok=True)
