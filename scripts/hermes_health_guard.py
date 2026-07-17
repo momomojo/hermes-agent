@@ -549,19 +549,50 @@ def _check_managed_layer_drift() -> list[str]:
     ]
 
 
+def _last_successful_backup_timestamp(text: str) -> str | None:
+    """Return the newest run timestamp accepted by the backup's own contract.
+
+    A clean rsync ends ``0/0``. The backup wrapper also deliberately accepts
+    rsync 23/24 when every diagnostic is a verified vanished-source race and
+    records that decision with ``BACKUP OK with benign ... rc=X/Y``. Keep the
+    health guard aligned with that fail-closed classifier instead of treating
+    a successful partial-race run as stale. The marker must match the finished
+    run's exact return codes and occur before the next run starts.
+    """
+    finish_re = re.compile(
+        r"^=== finished (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+        r"rsync_rc=(\d+)/(\d+) ===$",
+        re.MULTILINE,
+    )
+    last: str | None = None
+    for match in finish_re.finditer(text):
+        timestamp, rc1, rc2 = match.groups()
+        if rc1 == "0" and rc2 == "0":
+            last = timestamp
+            continue
+
+        next_run = text.find("\n=== hermes home backup started ", match.end())
+        run_tail = text[match.end() : next_run if next_run != -1 else len(text)]
+        accepted = re.search(
+            rf"^BACKUP OK with benign vanished-source warning "
+            rf"rc={re.escape(rc1)}/{re.escape(rc2)}$",
+            run_tail,
+            re.MULTILINE,
+        )
+        if accepted:
+            last = timestamp
+    return last
+
+
 def _check_backup_freshness() -> list[str]:
     """Alert when the nightly ~/.hermes -> NAS mirror hasn't succeeded lately."""
     try:
         text = BACKUP_LOG.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return [f"home-backup log missing ({BACKUP_LOG})"]
-    last: str | None = None
-    for m in re.finditer(
-        r"=== finished (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) rsync_rc=0/0 ===", text
-    ):
-        last = m.group(1)
+    last = _last_successful_backup_timestamp(text)
     if last is None:
-        return ["home-backup has never succeeded (no rsync_rc=0/0 in log)"]
+        return ["home-backup has never succeeded (no accepted run in log)"]
     age = datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
     if age > timedelta(hours=BACKUP_MAX_AGE_HOURS):
         hours = age.total_seconds() / 3600
@@ -673,17 +704,56 @@ def _check_hindsight_configs(profiles: list[str]) -> list[str]:
     return failures
 
 
+def _gateway_restart_required_since(proc_epoch: float) -> bool:
+    """Return whether post-start commits changed gateway-loaded runtime code.
+
+    Health-guard and test-only commits are consumed by fresh short-lived
+    processes and do not require restarting long-lived gateways. Fail closed:
+    any Git ambiguity or any other changed path preserves the restart page.
+    """
+    try:
+        baseline = subprocess.run(
+            ["git", "log", "-1", f"--before=@{int(proc_epoch)}", "--format=%H"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        base_sha = (baseline.stdout or "").strip()
+        if baseline.returncode != 0 or not base_sha:
+            return True
+        changed = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_sha}..HEAD"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if changed.returncode != 0:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+
+    paths = [line.strip() for line in (changed.stdout or "").splitlines() if line.strip()]
+    if not paths:
+        return True
+    non_gateway_prefixes = ("scripts/", "tests/")
+    return any(not path.startswith(non_gateway_prefixes) for path in paths)
+
+
 def _check_gateway_staleness(profiles: list[str]) -> list[str]:
-    """Detect profile gateways running pre-update code.
+    """Detect profile gateways running pre-update gateway code.
 
     Compares each gateway's process start time against the git HEAD commit
-    timestamp.  If the HEAD is newer than the gateway's start time by more
-    than STALENESS_THRESHOLD_MINUTES, the gateway is considered stale (it
-    was started before the latest code update and was never restarted).
+    timestamp. If HEAD is newer by more than the threshold, the changed paths
+    since process start are inspected. Commits limited to short-lived health
+    scripts and tests are hot-consumed and do not require a gateway restart;
+    any runtime path or Git ambiguity remains fail-closed and pages.
 
     Returns a list of human-readable failure strings (empty = all current).
     """
     failures: list[str] = []
+    restart_required_cache: dict[int, bool] = {}
 
     # Read HEAD commit timestamp as Unix epoch (seconds since 1970) —
     # avoids timezone math entirely.
@@ -735,6 +805,13 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
         gap_minutes = gap / 60.0
 
         if gap_minutes > STALENESS_THRESHOLD_MINUTES:
+            proc_key = int(proc_epoch)
+            restart_required = restart_required_cache.get(proc_key)
+            if restart_required is None:
+                restart_required = _gateway_restart_required_since(proc_epoch)
+                restart_required_cache[proc_key] = restart_required
+            if not restart_required:
+                continue
             failures.append(
                 f"gateway stale for {label}: "
                 f"process started {proc_dt.strftime('%b %d %H:%M')} "
