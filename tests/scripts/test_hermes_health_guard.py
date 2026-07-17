@@ -334,6 +334,34 @@ def test_gateway_restart_required_for_runtime_change(monkeypatch):
     assert guard._gateway_restart_required_since(12345) is True
 
 
+def test_gateway_restart_required_for_whatsapp_bridge_script(monkeypatch):
+    guard = _load_health_guard_module()
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess(
+                [], 0, stdout="scripts/whatsapp-bridge/bridge.js\n", stderr=""
+            ),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    assert guard._gateway_restart_required_since(12345) is True
+
+
+def test_gateway_restart_required_for_package_json(monkeypatch):
+    guard = _load_health_guard_module()
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="package.json\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+
+    assert guard._gateway_restart_required_since(12345) is True
+
+
 def test_gateway_restart_required_when_git_baseline_is_ambiguous(monkeypatch):
     guard = _load_health_guard_module()
     monkeypatch.setattr(

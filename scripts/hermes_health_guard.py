@@ -708,8 +708,10 @@ def _gateway_restart_required_since(proc_epoch: float) -> bool:
     """Return whether post-start commits changed gateway-loaded runtime code.
 
     Health-guard and test-only commits are consumed by fresh short-lived
-    processes and do not require restarting long-lived gateways. Fail closed:
-    any Git ambiguity or any other changed path preserves the restart page.
+    processes and do not require restarting long-lived gateways. Known
+    long-lived bridge code under scripts/ remains restart-required. Fail
+    closed: any Git ambiguity or any other changed path preserves the restart
+    page.
     """
     try:
         baseline = subprocess.run(
@@ -738,7 +740,12 @@ def _gateway_restart_required_since(proc_epoch: float) -> bool:
     if not paths:
         return True
     non_gateway_prefixes = ("scripts/", "tests/")
-    return any(not path.startswith(non_gateway_prefixes) for path in paths)
+    gateway_loaded_prefixes = ("scripts/whatsapp-bridge/",)
+    return any(
+        path.startswith(gateway_loaded_prefixes)
+        or not path.startswith(non_gateway_prefixes)
+        for path in paths
+    )
 
 
 def _check_gateway_staleness(profiles: list[str]) -> list[str]:
@@ -747,8 +754,9 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
     Compares each gateway's process start time against the git HEAD commit
     timestamp. If HEAD is newer by more than the threshold, the changed paths
     since process start are inspected. Commits limited to short-lived health
-    scripts and tests are hot-consumed and do not require a gateway restart;
-    any runtime path or Git ambiguity remains fail-closed and pages.
+    scripts and tests are hot-consumed and do not require a gateway restart,
+    while known long-lived bridge scripts still page. Any runtime path or Git
+    ambiguity remains fail-closed and pages.
 
     Returns a list of human-readable failure strings (empty = all current).
     """
