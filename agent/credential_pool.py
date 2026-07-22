@@ -2040,7 +2040,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # refresh_token_reused race failures.  Users who want to adopt
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
-        if isinstance(tokens, dict) and tokens.get("access_token"):
+        if _codex_provider_state_is_healthy_for_profile_borrow(state):
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
             changed |= _upsert_entry(
@@ -2324,7 +2324,16 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def _profile_is_borrowing_complete_global_codex_singleton() -> bool:
+def _codex_provider_state_is_healthy_for_profile_borrow(state: Any) -> bool:
+    """True when a Codex singleton can be used without local pool shadowing."""
+    if not isinstance(state, dict):
+        return False
+    if "last_auth_error" in state:
+        return False
+    return auth_mod._codex_has_complete_token_pair(state.get("tokens"))
+
+
+def _profile_is_borrowing_healthy_global_codex_singleton() -> bool:
     """True when this profile should use root Codex auth without pool shadowing."""
     try:
         active_store = _load_auth_store()
@@ -2344,8 +2353,7 @@ def _profile_is_borrowing_complete_global_codex_singleton() -> bool:
         state = global_providers.get("openai-codex")
         if not isinstance(state, dict):
             return False
-        tokens = state.get("tokens")
-        return auth_mod._codex_has_complete_token_pair(tokens)
+        return _codex_provider_state_is_healthy_for_profile_borrow(state)
     except Exception:
         return False
 
@@ -2354,7 +2362,7 @@ def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     borrowing_global_codex = (
         provider == "openai-codex"
-        and _profile_is_borrowing_complete_global_codex_singleton()
+        and _profile_is_borrowing_healthy_global_codex_singleton()
     )
     if borrowing_global_codex:
         active_store = _load_auth_store()

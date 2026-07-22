@@ -436,6 +436,37 @@ def test_codex_load_pool_does_not_materialize_healthy_global_singleton(profile_e
     assert creds["api_key"] == "global-access"
 
 
+def test_codex_load_pool_does_not_materialize_unhealthy_global_singleton(profile_env):
+    """A complete token pair with last_auth_error is not a healthy root fallback."""
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "openai-codex": {
+            "tokens": {
+                "access_token": "global-access",
+                "refresh_token": "global-refresh",
+            },
+            "auth_mode": "chatgpt",
+            "last_auth_error": {
+                "provider": "openai-codex",
+                "code": "refresh_token_reused",
+                "relogin_required": True,
+            },
+        },
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    from agent.credential_pool import (
+        _profile_is_borrowing_healthy_global_codex_singleton,
+        load_pool,
+    )
+
+    assert _profile_is_borrowing_healthy_global_codex_singleton() is False
+    pool = load_pool("openai-codex")
+
+    assert pool.entries() == []
+    profile_state = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "openai-codex" not in profile_state.get("credential_pool", {})
+
+
 def test_codex_load_pool_prunes_shadow_but_keeps_independent_profile_accounts(profile_env):
     """Root Codex fallback must not overwrite independent profile pool accounts."""
     _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
