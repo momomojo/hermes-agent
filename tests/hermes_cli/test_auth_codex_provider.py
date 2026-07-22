@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_cli.auth as auth
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
@@ -258,6 +259,54 @@ def test_save_codex_tokens_clears_last_auth_error_after_complete_pair(tmp_path, 
     state = auth["providers"]["openai-codex"]
     assert state["tokens"]["access_token"] == "new-at"
     assert "last_auth_error" not in state
+
+
+def test_save_codex_tokens_verifies_pair_before_clearing_last_auth_error(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
+            },
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    real_save = auth._save_auth_store
+    writes = []
+
+    def _save_spy(auth_store, target_path=None):
+        state = auth_store["providers"]["openai-codex"]
+        saved_tokens = state["tokens"]
+        writes.append({
+            "has_last_auth_error": "last_auth_error" in state,
+            "access_token": saved_tokens.get("access_token"),
+            "refresh_token": saved_tokens.get("refresh_token"),
+        })
+        return real_save(auth_store, target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", _save_spy)
+
+    _save_codex_tokens({"access_token": "new-at", "refresh_token": "new-rt"})
+
+    assert writes == [
+        {
+            "has_last_auth_error": True,
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+        },
+        {
+            "has_last_auth_error": False,
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+        },
+    ]
 
 
 def test_save_codex_tokens_rejects_half_pair_and_preserves_error(tmp_path, monkeypatch):

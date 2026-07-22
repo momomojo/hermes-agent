@@ -3651,6 +3651,34 @@ def _codex_has_complete_token_pair(tokens: Dict[str, Any]) -> bool:
     )
 
 
+def _codex_token_pair_matches(
+    actual: Dict[str, Any],
+    expected: Dict[str, Any],
+) -> bool:
+    return bool(
+        _codex_has_complete_token_pair(actual)
+        and actual.get("access_token") == expected.get("access_token")
+        and actual.get("refresh_token") == expected.get("refresh_token")
+    )
+
+
+def _verified_codex_provider_state(
+    target_path: Path,
+    expected_tokens: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    persisted_store = _load_auth_store(target_path)
+    persisted_state = _load_local_provider_state(persisted_store, "openai-codex") or {}
+    persisted_tokens = persisted_state.get("tokens")
+    if not _codex_token_pair_matches(persisted_tokens, expected_tokens):
+        raise AuthError(
+            "Codex token save verification failed after writing auth.json.",
+            provider="openai-codex",
+            code="codex_auth_save_verification_failed",
+            relogin_required=True,
+        )
+    return persisted_store, persisted_state
+
+
 def _save_codex_tokens(
     tokens: Dict[str, str],
     last_refresh: str = None,
@@ -3696,12 +3724,9 @@ def _save_codex_tokens(
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
-        # A terminal marker is only cleared after the write boundary has a
-        # complete access+refresh pair.  Partial imports fail above and leave
-        # the old marker in place.
-        state.pop("last_auth_error", None)
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        had_last_auth_error = "last_auth_error" in state
         _save_provider_state(target_store, "openai-codex", state)
         _sync_codex_pool_entries(
             target_store,
@@ -3710,6 +3735,14 @@ def _save_codex_tokens(
             previous_singleton_tokens=previous_singleton_tokens,
         )
         _save_auth_store(target_store, target_path)
+        persisted_store, persisted_state = _verified_codex_provider_state(
+            target_path,
+            tokens,
+        )
+        if had_last_auth_error:
+            persisted_state.pop("last_auth_error", None)
+            _save_provider_state(persisted_store, "openai-codex", persisted_state)
+            _save_auth_store(persisted_store, target_path)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -3723,8 +3756,8 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
         and str(imported.get("refresh_token", "") or "").strip()
     ):
         return None
-    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
     _save_codex_tokens(imported)
+    logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
     return dict(imported)
 
 
