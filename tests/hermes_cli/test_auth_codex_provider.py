@@ -234,6 +234,60 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
     assert data["tokens"]["refresh_token"] == "rt456"
 
 
+def test_save_codex_tokens_clears_last_auth_error_after_complete_pair(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
+            },
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_codex_tokens({"access_token": "new-at", "refresh_token": "new-rt"})
+
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    state = auth["providers"]["openai-codex"]
+    assert state["tokens"]["access_token"] == "new-at"
+    assert "last_auth_error" not in state
+
+
+def test_save_codex_tokens_rejects_half_pair_and_preserves_error(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
+            },
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc:
+        _save_codex_tokens({"access_token": "new-at"})
+
+    assert exc.value.code == "codex_auth_incomplete_token_pair"
+    auth = json.loads((hermes_home / "auth.json").read_text())
+    state = auth["providers"]["openai-codex"]
+    assert state["tokens"]["access_token"] == "old-at"
+    assert state["last_auth_error"]["code"] == "refresh_token_reused"
+
+
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     """Re-auth must update the credential_pool device_code entry, not just providers.
 
@@ -993,10 +1047,11 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         },
     )
 
-    def _fake_save(tokens, last_refresh=None):
+    def _fake_save(tokens, last_refresh=None, **kwargs):
         called["device_login"] += 1
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
+        called["force_active_store"] = kwargs.get("force_active_store")
 
     monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
     monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
@@ -1009,6 +1064,7 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+    assert called["force_active_store"] is True
 
 
 class _FakeResp:

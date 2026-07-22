@@ -46,7 +46,14 @@ import httpx
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    SKIP_WRITE,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+    locked_yaml_mutate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1200,6 +1207,19 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     """
     state, _source_path = _load_provider_state_with_source(auth_store, provider_id)
     return state
+
+
+def _load_local_provider_state(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return only the active auth store's provider state, with no fallback."""
+    providers = auth_store.get("providers")
+    if isinstance(providers, dict):
+        state = providers.get(provider_id)
+        if isinstance(state, dict):
+            return dict(state)
+    return None
 
 
 def _save_provider_state(auth_store: Dict[str, Any], provider_id: str, state: Dict[str, Any]) -> None:
@@ -3623,13 +3643,50 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+def _codex_has_complete_token_pair(tokens: Dict[str, Any]) -> bool:
+    return bool(
+        isinstance(tokens, dict)
+        and str(tokens.get("access_token", "") or "").strip()
+        and str(tokens.get("refresh_token", "") or "").strip()
+    )
+
+
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    *,
+    force_active_store: bool = False,
+) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    if not _codex_has_complete_token_pair(tokens):
+        raise AuthError(
+            "Codex token save requires both access_token and refresh_token.",
+            provider="openai-codex",
+            code="codex_auth_incomplete_token_pair",
+            relogin_required=True,
+        )
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
+        active_path = _auth_file_path()
+        if force_active_store:
+            state = _load_local_provider_state(auth_store, "openai-codex") or {}
+            target_store = auth_store
+            target_path = active_path
+        else:
+            state, source_path = _load_provider_state_with_source(
+                auth_store,
+                "openai-codex",
+            )
+            state = state or {}
+            target_path = source_path or active_path
+            try:
+                same_store = target_path.resolve(strict=False) == active_path.resolve(strict=False)
+            except Exception:
+                same_store = target_path == active_path
+            target_store = auth_store if same_store else _load_auth_store(target_path)
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3639,16 +3696,20 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
+        # A terminal marker is only cleared after the write boundary has a
+        # complete access+refresh pair.  Partial imports fail above and leave
+        # the old marker in place.
+        state.pop("last_auth_error", None)
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _save_provider_state(target_store, "openai-codex", state)
         _sync_codex_pool_entries(
-            auth_store,
+            target_store,
             tokens,
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(target_store, target_path)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -6984,7 +7045,7 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens)
+                _save_codex_tokens(cli_tokens, force_active_store=True)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
@@ -7002,7 +7063,11 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+    _save_codex_tokens(
+        creds["tokens"],
+        creds.get("last_refresh"),
+        force_active_store=True,
+    )
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")

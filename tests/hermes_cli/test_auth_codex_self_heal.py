@@ -159,6 +159,11 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
                 "tokens": {"refresh_token": "stale-refresh"},
                 "last_refresh": "2026-06-01T00:00:00Z",
                 "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
             },
         },
     }))
@@ -176,6 +181,7 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert resolved["api_key"] == "fresh-access"
     assert resolved["source"] == "hermes-auth-store"
     stored = json.loads((hermes_home / "auth.json").read_text())
+    assert "last_auth_error" not in stored["providers"]["openai-codex"]
     tokens = stored["providers"]["openai-codex"]["tokens"]
     assert tokens["access_token"] == "fresh-access"
     assert tokens["refresh_token"] == "fresh-refresh"
@@ -193,6 +199,11 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
             "openai-codex": {
                 "tokens": {"refresh_token": "stale-refresh"},
                 "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
             },
         },
     }))
@@ -206,3 +217,5 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
         resolve_codex_runtime_credentials()
 
     assert ei.value.code == "codex_auth_missing_access_token"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"]["last_auth_error"]["code"] == "refresh_token_reused"

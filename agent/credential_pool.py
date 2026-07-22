@@ -2324,9 +2324,49 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
+def _profile_is_borrowing_complete_global_codex_singleton() -> bool:
+    """True when this profile should use root Codex auth without pool shadowing."""
+    try:
+        active_store = _load_auth_store()
+        providers = active_store.get("providers")
+        if (
+            isinstance(providers, dict)
+            and isinstance(providers.get("openai-codex"), dict)
+        ):
+            return False
+        global_path = auth_mod._global_auth_file_path()
+        if global_path is None:
+            return False
+        global_store = auth_mod._load_global_auth_store()
+        global_providers = global_store.get("providers")
+        if not isinstance(global_providers, dict):
+            return False
+        state = global_providers.get("openai-codex")
+        if not isinstance(state, dict):
+            return False
+        tokens = state.get("tokens")
+        return auth_mod._codex_has_complete_token_pair(tokens)
+    except Exception:
+        return False
+
+
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    borrowing_global_codex = (
+        provider == "openai-codex"
+        and _profile_is_borrowing_complete_global_codex_singleton()
+    )
+    if borrowing_global_codex:
+        active_store = _load_auth_store()
+        active_pool = active_store.get("credential_pool")
+        active_entries = (
+            active_pool.get(provider)
+            if isinstance(active_pool, dict)
+            else None
+        )
+        raw_entries = list(active_entries) if isinstance(active_entries, list) else []
+    else:
+        raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2338,16 +2378,30 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    codex_shadow_pruned = False
+    if borrowing_global_codex:
+        retained = [entry for entry in entries if entry.source != "device_code"]
+        if len(retained) != len(entries):
+            entries = retained
+            codex_shadow_pruned = True
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = raw_needs_sanitization or custom_changed
+        changed = raw_needs_sanitization or codex_shadow_pruned or custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        if borrowing_global_codex:
+            singleton_changed, singleton_sources = False, set()
+        else:
+            singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
         env_changed, env_sources = _seed_from_env(provider, entries)
-        changed = raw_needs_sanitization or singleton_changed or env_changed
+        changed = (
+            raw_needs_sanitization
+            or codex_shadow_pruned
+            or singleton_changed
+            or env_changed
+        )
         # ``load_pool()`` is a non-destructive read for env-seeded entries: a
         # process missing a provider env var must not delete the persisted
         # pool entry for every other process (#9331). File-backed singletons
