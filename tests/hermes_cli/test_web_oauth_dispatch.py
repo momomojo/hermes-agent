@@ -317,14 +317,14 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
                 "refresh_token": "codex-refresh",
             })
 
-    saved_homes = []
+    saved_calls = []
     monkeypatch.setattr(httpx, "Client", _Client)
     monkeypatch.setattr(ws.time, "sleep", lambda _: None)
-    monkeypatch.setattr(
-        auth_mod,
-        "_save_codex_tokens",
-        lambda tokens: saved_homes.append(get_hermes_home()),
-    )
+
+    def _save_codex_tokens(_tokens, **kwargs):
+        saved_calls.append((get_hermes_home(), kwargs))
+
+    monkeypatch.setattr(auth_mod, "_save_codex_tokens", _save_codex_tokens)
 
     sid, _ = ws._new_oauth_session(
         "openai-codex",
@@ -335,7 +335,7 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
         ws._codex_full_login_worker(sid)
 
         assert ws._oauth_sessions[sid]["status"] == "approved"
-        assert saved_homes == [profile_home]
+        assert saved_calls == [(profile_home, {"force_active_store": True})]
     finally:
         ws._oauth_sessions.pop(sid, None)
 
