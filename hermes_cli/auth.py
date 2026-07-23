@@ -974,7 +974,25 @@ def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
-_auth_lock_holder = threading.local()
+_auth_target_lock_holders: Dict[str, threading.local] = {}
+_auth_target_lock_holders_guard = threading.Lock()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve(strict=False) == right.resolve(strict=False)
+    except Exception:
+        return left == right
+
+
+def _auth_lock_holder_for(target_path: Path) -> threading.local:
+    """Return a reentrancy tracker keyed to one canonical auth-store path."""
+    try:
+        key = str(target_path.resolve(strict=False))
+    except Exception:
+        key = str(target_path)
+    with _auth_target_lock_holders_guard:
+        return _auth_target_lock_holders.setdefault(key, threading.local())
 
 
 @contextmanager
@@ -1050,8 +1068,16 @@ def _file_lock(
 
 
 @contextmanager
-def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
-    """Cross-process advisory lock for auth.json reads+writes.  Reentrant.
+def _auth_store_lock(
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+    *,
+    target_path: Optional[Path] = None,
+):
+    """Cross-process advisory lock for one auth.json read/write transaction.
+
+    ``target_path`` is required for profile-to-global write-throughs. A profile
+    lock does not protect the distinct global auth store, so every auth-store
+    path gets its own reentrancy tracker and kernel lock.
 
     Lock ordering invariant: when this lock is held together with
     ``_nous_shared_store_lock``, acquire ``_auth_store_lock`` FIRST
@@ -1059,9 +1085,11 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     refresh paths follow this order; violating it risks deadlock
     against a concurrent import on the shared store.
     """
+    auth_path = target_path if target_path is not None else _auth_file_path()
+    lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
     with _file_lock(
-        _auth_lock_path(),
-        _auth_lock_holder,
+        lock_path,
+        _auth_lock_holder_for(auth_path),
         timeout_seconds,
         "Timed out waiting for auth store lock",
     ):
@@ -3696,25 +3724,13 @@ def _save_codex_tokens(
         )
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        active_path = _auth_file_path()
-        if force_active_store:
-            state = _load_local_provider_state(auth_store, "openai-codex") or {}
-            target_store = auth_store
-            target_path = active_path
-        else:
-            state, source_path = _load_provider_state_with_source(
-                auth_store,
-                "openai-codex",
-            )
-            state = state or {}
-            target_path = source_path or active_path
-            try:
-                same_store = target_path.resolve(strict=False) == active_path.resolve(strict=False)
-            except Exception:
-                same_store = target_path == active_path
-            target_store = auth_store if same_store else _load_auth_store(target_path)
+
+    def _write_locked(
+        target_store: Dict[str, Any],
+        target_path: Path,
+        state: Dict[str, Any],
+    ) -> None:
+        state = dict(state or {})
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3743,6 +3759,28 @@ def _save_codex_tokens(
             persisted_state.pop("last_auth_error", None)
             _save_provider_state(persisted_store, "openai-codex", persisted_state)
             _save_auth_store(persisted_store, target_path)
+
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        active_path = _auth_file_path()
+        if force_active_store:
+            state = _load_local_provider_state(auth_store, "openai-codex") or {}
+            _write_locked(auth_store, active_path, state)
+            return
+        else:
+            state, source_path = _load_provider_state_with_source(
+                auth_store,
+                "openai-codex",
+            )
+            state = state or {}
+            target_path = source_path or active_path
+            if _same_path(target_path, active_path):
+                _write_locked(auth_store, active_path, state)
+                return
+            with _auth_store_lock(target_path=target_path):
+                target_store = _load_auth_store(target_path)
+                state = _load_local_provider_state(target_store, "openai-codex") or {}
+                _write_locked(target_store, target_path, state)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:

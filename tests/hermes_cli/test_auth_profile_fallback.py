@@ -12,6 +12,7 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -409,6 +410,70 @@ def test_codex_cli_recovery_updates_global_root_without_profile_shadow(profile_e
     profile_state = json.loads((profile_env["profile"] / "auth.json").read_text())
     assert profile_state.get("providers") == {}
     assert "openai-codex" not in profile_state.get("credential_pool", {})
+
+
+def test_codex_profile_recovery_locks_and_rereads_global_target(profile_env, monkeypatch):
+    """Fallback recovery must lock the global auth store before merging tokens."""
+    import hermes_cli.auth as auth
+
+    global_auth = profile_env["global"] / "auth.json"
+    _write(global_auth, _make_auth_store(providers={
+        "openai-codex": {
+            "tokens": {"access_token": "old-access", "refresh_token": "old-refresh"},
+            "auth_mode": "chatgpt",
+            "last_auth_error": {
+                "provider": "openai-codex",
+                "code": "refresh_token_reused",
+                "relogin_required": True,
+            },
+        },
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    entered = []
+    injected = False
+    real_file_lock = auth._file_lock
+    global_lock = profile_env["global"] / "auth.lock"
+
+    @contextmanager
+    def recording_file_lock(lock_path, holder, timeout_seconds, timeout_message):
+        nonlocal injected
+        entered.append(lock_path)
+        if lock_path == global_lock and not injected:
+            payload = json.loads(global_auth.read_text())
+            payload["concurrent_global_marker"] = "preserve-me"
+            payload.setdefault("providers", {})["anthropic"] = {
+                "access_token": "concurrent-anthropic-token",
+            }
+            _write(global_auth, payload)
+            injected = True
+        with real_file_lock(lock_path, holder, timeout_seconds, timeout_message):
+            yield
+
+    monkeypatch.setattr(auth, "_file_lock", recording_file_lock)
+
+    auth._save_codex_tokens(
+        {"access_token": "fresh-global-access", "refresh_token": "fresh-global-refresh"},
+        last_refresh="2026-07-22T00:00:00Z",
+    )
+
+    assert entered[:2] == [
+        profile_env["profile"] / "auth.lock",
+        profile_env["global"] / "auth.lock",
+    ]
+
+    global_state = json.loads(global_auth.read_text())
+    assert global_state["concurrent_global_marker"] == "preserve-me"
+    assert global_state["providers"]["anthropic"]["access_token"] == "concurrent-anthropic-token"
+    global_codex = global_state["providers"]["openai-codex"]
+    assert global_codex["tokens"] == {
+        "access_token": "fresh-global-access",
+        "refresh_token": "fresh-global-refresh",
+    }
+    assert "last_auth_error" not in global_codex
+
+    profile_state = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_state.get("providers") == {}
 
 
 def test_codex_load_pool_does_not_materialize_healthy_global_singleton(profile_env):
