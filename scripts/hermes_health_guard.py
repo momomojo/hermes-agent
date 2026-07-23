@@ -704,6 +704,17 @@ def _check_hindsight_configs(profiles: list[str]) -> list[str]:
     return failures
 
 
+def _gateway_paths_require_restart(paths: list[str]) -> bool:
+    """Classify changed paths using the PR #19 gateway restart contract."""
+    non_gateway_prefixes = ("scripts/", "tests/")
+    gateway_loaded_prefixes = ("scripts/whatsapp-bridge/",)
+    return any(
+        path.startswith(gateway_loaded_prefixes)
+        or not path.startswith(non_gateway_prefixes)
+        for path in paths
+    )
+
+
 def _gateway_restart_required_since(proc_epoch: float) -> bool:
     """Return whether post-start commits changed gateway-loaded runtime code.
 
@@ -739,13 +750,57 @@ def _gateway_restart_required_since(proc_epoch: float) -> bool:
     paths = [line.strip() for line in (changed.stdout or "").splitlines() if line.strip()]
     if not paths:
         return True
-    non_gateway_prefixes = ("scripts/", "tests/")
-    gateway_loaded_prefixes = ("scripts/whatsapp-bridge/",)
-    return any(
-        path.startswith(gateway_loaded_prefixes)
-        or not path.startswith(non_gateway_prefixes)
-        for path in paths
-    )
+    return _gateway_paths_require_restart(paths)
+
+
+def _newest_gateway_runtime_commit_since(proc_epoch: float) -> int | None:
+    """Return the newest post-start restart-requiring commit epoch.
+
+    ``None`` means every post-start commit is hot-consumed. Git failures and
+    malformed history are raised so the caller remains fail-closed rather than
+    treating uncertainty as a scripts/tests exemption.
+    """
+    try:
+        baseline = subprocess.run(
+            ["git", "log", "-1", f"--before=@{int(proc_epoch)}", "--format=%H"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        base_sha = (baseline.stdout or "").strip()
+        if baseline.returncode != 0 or not base_sha:
+            raise RuntimeError("cannot identify the pre-start git baseline")
+        commits = subprocess.run(
+            ["git", "log", "--format=%x1e%ct", "--name-only", f"{base_sha}..HEAD"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if commits.returncode != 0:
+            raise RuntimeError("cannot inspect post-start git commits")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot inspect post-start git commits") from exc
+
+    saw_commit = False
+    for record in (commits.stdout or "").split("\x1e"):
+        lines = [line.strip() for line in record.splitlines() if line.strip()]
+        if not lines:
+            continue
+        saw_commit = True
+        try:
+            commit_epoch = int(lines[0])
+        except ValueError as exc:
+            raise RuntimeError("cannot parse post-start git commit time") from exc
+        paths = lines[1:]
+        if not paths:
+            raise RuntimeError("post-start git commit has no changed paths")
+        if _gateway_paths_require_restart(paths):
+            return commit_epoch
+    if not saw_commit:
+        raise RuntimeError("post-start git history is empty")
+    return None
 
 
 def _check_gateway_staleness(profiles: list[str]) -> list[str]:
@@ -760,7 +815,7 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
     Returns a list of human-readable failure strings (empty = all current).
     """
     failures: list[str] = []
-    restart_required_cache: dict[int, bool] = {}
+    runtime_commit_cache: dict[int, int | None] = {}
 
     # Read HEAD commit timestamp as Unix epoch (seconds since 1970) —
     # avoids timezone math entirely.
@@ -807,33 +862,37 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             continue
 
-        # A gateway only needs a restart when HEAD is newer than the process.
-        # The grace period starts at that runtime update, not at process start:
-        # otherwise a commit shortly after startup can suppress paging forever.
+        # The grace period starts at the newest runtime update, not at HEAD:
+        # otherwise a later scripts/tests-only commit can mask an older runtime
+        # change indefinitely.
         gap = (head_dt - proc_dt).total_seconds()
         gap_minutes = gap / 60.0
-        post_commit_minutes = (time.time() - head_epoch) / 60.0
+        if gap_minutes <= 0:
+            continue
 
-        if gap_minutes > 0 and post_commit_minutes > STALENESS_THRESHOLD_MINUTES:
-            proc_key = int(proc_epoch)
-            restart_required = restart_required_cache.get(proc_key)
-            if restart_required is None:
-                restart_required = _gateway_restart_required_since(proc_epoch)
-                restart_required_cache[proc_key] = restart_required
-            if not restart_required:
+        proc_key = int(proc_epoch)
+        if proc_key not in runtime_commit_cache:
+            try:
+                runtime_commit_cache[proc_key] = _newest_gateway_runtime_commit_since(proc_epoch)
+            except RuntimeError:
+                failures.append(
+                    f"gateway stale for {label}: cannot inspect post-start git history, "
+                    "restart required to pick up new code"
+                )
                 continue
-            failures.append(
-                f"gateway stale for {label}: "
-                f"process started {proc_dt.strftime('%b %d %H:%M')} "
-                f"(~{gap_minutes:.0f} min before HEAD commit "
-                f"{datetime.fromtimestamp(head_epoch).strftime('%Y-%m-%d %H:%M')}), "
-                f"restart required to pick up new code"
-            )
-        elif gap_minutes > 0:
-            # Gateway started before latest commit but within the threshold —
-            # informational, not a failure.  The nightly updater may still be
-            # running or about to kickstart gateways.
-            pass
+        runtime_commit_epoch = runtime_commit_cache[proc_key]
+        if runtime_commit_epoch is None:
+            continue
+        post_commit_minutes = (time.time() - runtime_commit_epoch) / 60.0
+        if post_commit_minutes <= STALENESS_THRESHOLD_MINUTES:
+            continue
+        failures.append(
+            f"gateway stale for {label}: "
+            f"process started {proc_dt.strftime('%b %d %H:%M')} "
+            f"(~{gap_minutes:.0f} min before HEAD commit "
+            f"{datetime.fromtimestamp(head_epoch).strftime('%Y-%m-%d %H:%M')}), "
+            f"restart required to pick up new code"
+        )
 
     return failures
 
