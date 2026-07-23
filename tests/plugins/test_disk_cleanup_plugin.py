@@ -127,6 +127,14 @@ class TestGuessCategory:
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
 
+    def test_scripts_test_source_not_tracked(self, _isolate_env):
+        dg = _load_lib()
+        scripts_tests = _isolate_env / "scripts" / "tests"
+        scripts_tests.mkdir(parents=True)
+        p = scripts_tests / "test_kanban_decision_bridge.py"
+        p.write_text("x")
+        assert dg.guess_category(p) is None
+
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.
@@ -329,6 +337,53 @@ class TestStaleCronEntryMigration:
         assert not run_md.exists()
 
 
+class TestStaleTestEntryMigration:
+    """Regression tests for durable source files stale-tracked as tests."""
+
+    def test_quick_skips_stale_test_entry_for_scripts_source(self, _isolate_env):
+        dg = _load_lib()
+        scripts_tests = _isolate_env / "scripts" / "tests"
+        scripts_tests.mkdir(parents=True)
+        source = scripts_tests / "test_kanban_decision_bridge.py"
+        source.write_text("x")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(source),
+            "category": "test",
+            "timestamp": "2026-07-11T03:21:02+00:00",
+            "size": 1,
+        }]))
+
+        summary = dg.quick()
+        assert summary["deleted"] == 0, "durable source test must not be deleted"
+        assert source.exists()
+        remaining = json.loads(tracked_file.read_text())
+        assert len(remaining) == 0
+
+    def test_dry_run_omits_stale_test_entry_for_scripts_source(self, _isolate_env):
+        dg = _load_lib()
+        scripts_tests = _isolate_env / "scripts" / "tests"
+        scripts_tests.mkdir(parents=True)
+        source = scripts_tests / "test_kanban_decision_bridge.py"
+        source.write_text("x")
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(source),
+            "category": "test",
+            "timestamp": "2026-07-11T03:21:02+00:00",
+            "size": 1,
+        }]))
+
+        auto, prompt = dg.dry_run()
+        assert len(auto) == 0
+        assert len(prompt) == 0
+        assert source.exists()
+
+
 class TestTrackForgetQuick:
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
@@ -376,10 +431,10 @@ class TestTrackForgetQuick:
 
     def test_quick_preserves_protected_top_level_dirs(self, _isolate_env):
         dg = _load_lib()
-        for d in ("logs", "memories", "sessions", "cron", "cache"):
+        for d in ("logs", "memories", "sessions", "cron", "cache", "scripts"):
             (_isolate_env / d).mkdir()
         dg.quick()
-        for d in ("logs", "memories", "sessions", "cron", "cache"):
+        for d in ("logs", "memories", "sessions", "cron", "cache", "scripts"):
             assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
 
     def test_quick_does_not_descend_into_protected_top_level_dirs(
@@ -471,6 +526,20 @@ class TestPostToolCallHook:
     def test_write_file_non_test_not_tracked(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "notes.md"
+        p.write_text("x")
+        pi._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": str(p), "content": "x"},
+            result="OK",
+            task_id="t2", session_id="s2",
+        )
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
+    def test_write_file_scripts_test_source_not_tracked(self, _isolate_env):
+        pi = _load_plugin_init()
+        p = _isolate_env / "scripts" / "tests" / "test_kanban_decision_bridge.py"
+        p.parent.mkdir(parents=True)
         p.write_text("x")
         pi._on_post_tool_call(
             tool_name="write_file",
