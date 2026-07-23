@@ -7744,7 +7744,7 @@ def _codex_full_login_worker(session_id: str) -> None:
             _save_codex_tokens({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
-            })
+            }, force_active_store=True)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)

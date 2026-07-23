@@ -159,6 +159,11 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
                 "tokens": {"refresh_token": "stale-refresh"},
                 "last_refresh": "2026-06-01T00:00:00Z",
                 "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
             },
         },
     }))
@@ -176,9 +181,63 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert resolved["api_key"] == "fresh-access"
     assert resolved["source"] == "hermes-auth-store"
     stored = json.loads((hermes_home / "auth.json").read_text())
+    assert "last_auth_error" not in stored["providers"]["openai-codex"]
     tokens = stored["providers"]["openai-codex"]["tokens"]
     assert tokens["access_token"] == "fresh-access"
     assert tokens["refresh_token"] == "fresh-refresh"
+
+
+def test_self_heal_preserves_last_auth_error_when_verified_save_fails(tmp_path, monkeypatch):
+    """CLI recovery must not clear a terminal marker unless the save verifies."""
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"refresh_token": "stale-refresh"},
+                "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
+            },
+        },
+    }))
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    real_save = auth._save_auth_store
+    calls = {"count": 0}
+
+    def _save_broken_first_write(auth_store, target_path=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            broken_store = json.loads(json.dumps(auth_store))
+            broken_store["providers"]["openai-codex"]["tokens"] = {
+                "access_token": "fresh-access",
+            }
+            return real_save(broken_store, target_path)
+        return real_save(auth_store, target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", _save_broken_first_write)
+
+    with pytest.raises(AuthError) as ei:
+        resolve_codex_runtime_credentials()
+
+    assert ei.value.code == "codex_auth_save_verification_failed"
+    assert calls["count"] == 1
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    state = stored["providers"]["openai-codex"]
+    assert state["last_auth_error"]["code"] == "refresh_token_reused"
 
 
 def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_path, monkeypatch):
@@ -193,6 +252,11 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
             "openai-codex": {
                 "tokens": {"refresh_token": "stale-refresh"},
                 "auth_mode": "chatgpt",
+                "last_auth_error": {
+                    "provider": "openai-codex",
+                    "code": "refresh_token_reused",
+                    "relogin_required": True,
+                },
             },
         },
     }))
@@ -206,3 +270,5 @@ def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_p
         resolve_codex_runtime_credentials()
 
     assert ei.value.code == "codex_auth_missing_access_token"
+    stored = json.loads((hermes_home / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"]["last_auth_error"]["code"] == "refresh_token_reused"
