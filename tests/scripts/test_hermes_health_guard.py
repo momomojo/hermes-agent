@@ -375,6 +375,124 @@ def test_gateway_restart_required_when_git_baseline_is_ambiguous(monkeypatch):
     assert guard._gateway_restart_required_since(12345) is True
 
 
+def test_gateway_staleness_pages_after_runtime_commit_grace_expires(monkeypatch):
+    """Grace is measured from a post-start runtime commit, not process start."""
+    guard = _load_health_guard_module()
+    now_epoch = 1_700_000_000
+    proc_epoch = now_epoch - 51 * 60
+    head_epoch = proc_epoch + 20 * 60
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{head_epoch}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=datetime.fromtimestamp(proc_epoch).strftime("%a %b %d %H:%M:%S %Y") + "\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=f"\x1e{head_epoch}\ngateway/run.py\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(guard, "_launchd_service_pid", lambda _profile: 42)
+    monkeypatch.setattr(guard.time, "time", lambda: now_epoch)
+
+    failures = guard._check_gateway_staleness([])
+
+    assert len(failures) == 1
+    assert failures[0].startswith("gateway stale for default:")
+
+
+def test_gateway_staleness_waits_for_post_commit_grace(monkeypatch):
+    guard = _load_health_guard_module()
+    now_epoch = 1_700_000_000
+    proc_epoch = now_epoch - 45 * 60
+    head_epoch = proc_epoch + 20 * 60
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{head_epoch}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=datetime.fromtimestamp(proc_epoch).strftime("%a %b %d %H:%M:%S %Y") + "\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=f"\x1e{head_epoch}\ngateway/run.py\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(guard, "_launchd_service_pid", lambda _profile: 42)
+    monkeypatch.setattr(guard.time, "time", lambda: now_epoch)
+
+    assert guard._check_gateway_staleness([]) == []
+
+
+def test_gateway_staleness_does_not_mask_old_runtime_commit_with_newer_scripts_head(monkeypatch):
+    guard = _load_health_guard_module()
+    now_epoch = 1_700_000_000
+    proc_epoch = now_epoch - 120 * 60
+    runtime_epoch = now_epoch - 70 * 60
+    head_epoch = now_epoch - 10 * 60
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{head_epoch}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=datetime.fromtimestamp(proc_epoch).strftime("%a %b %d %H:%M:%S %Y") + "\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess([], 0, stdout="baseline-sha\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    f"\x1e{head_epoch}\nscripts/hermes_health_guard.py\n"
+                    f"\x1e{runtime_epoch}\ngateway/run.py\n"
+                ),
+                stderr="",
+            ),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(guard, "_launchd_service_pid", lambda _profile: 42)
+    monkeypatch.setattr(guard.time, "time", lambda: now_epoch)
+
+    failures = guard._check_gateway_staleness([])
+
+    assert len(failures) == 1
+    assert failures[0].startswith("gateway stale for default:")
+
+
+def test_gateway_staleness_pages_when_runtime_history_is_ambiguous(monkeypatch):
+    guard = _load_health_guard_module()
+    now_epoch = 1_700_000_000
+    proc_epoch = now_epoch - 120 * 60
+    head_epoch = now_epoch - 70 * 60
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{head_epoch}\n", stderr=""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=datetime.fromtimestamp(proc_epoch).strftime("%a %b %d %H:%M:%S %Y") + "\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="git failed"),
+        ]
+    )
+    monkeypatch.setattr(guard.subprocess, "run", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(guard, "_launchd_service_pid", lambda _profile: 42)
+    monkeypatch.setattr(guard.time, "time", lambda: now_epoch)
+
+    assert guard._check_gateway_staleness([]) == [
+        "gateway stale for default: cannot inspect post-start git history, "
+        "restart required to pick up new code"
+    ]
+
+
 def test_hindsight_recall_types_observation_only_is_healthy(monkeypatch):
     guard = _load_health_guard_module()
     (guard.HOME / "hindsight").mkdir(exist_ok=True)
