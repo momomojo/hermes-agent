@@ -751,12 +751,11 @@ def _gateway_restart_required_since(proc_epoch: float) -> bool:
 def _check_gateway_staleness(profiles: list[str]) -> list[str]:
     """Detect profile gateways running pre-update gateway code.
 
-    Compares each gateway's process start time against the git HEAD commit
-    timestamp. If HEAD is newer by more than the threshold, the changed paths
-    since process start are inspected. Commits limited to short-lived health
-    scripts and tests are hot-consumed and do not require a gateway restart,
-    while known long-lived bridge scripts still page. Any runtime path or Git
-    ambiguity remains fail-closed and pages.
+    For a HEAD newer than a gateway process, inspect changed paths since that
+    process started. Runtime changes page once the post-commit restart grace
+    expires; health scripts and tests are hot-consumed and do not require a
+    gateway restart, while known long-lived bridge scripts still page. Any
+    runtime path or Git ambiguity remains fail-closed and pages.
 
     Returns a list of human-readable failure strings (empty = all current).
     """
@@ -808,11 +807,14 @@ def _check_gateway_staleness(profiles: list[str]) -> list[str]:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             continue
 
-        # Staleness condition: HEAD commit is newer than process start + threshold
+        # A gateway only needs a restart when HEAD is newer than the process.
+        # The grace period starts at that runtime update, not at process start:
+        # otherwise a commit shortly after startup can suppress paging forever.
         gap = (head_dt - proc_dt).total_seconds()
         gap_minutes = gap / 60.0
+        post_commit_minutes = (time.time() - head_epoch) / 60.0
 
-        if gap_minutes > STALENESS_THRESHOLD_MINUTES:
+        if gap_minutes > 0 and post_commit_minutes > STALENESS_THRESHOLD_MINUTES:
             proc_key = int(proc_epoch)
             restart_required = restart_required_cache.get(proc_key)
             if restart_required is None:
