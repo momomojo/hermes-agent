@@ -40,8 +40,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Select a test-capable Python ────────────────────────────────────────────
 PYTHON=""
 for candidate in \
-  "$REPO_ROOT/venv/bin/python" \
   "$REPO_ROOT/.venv/bin/python" \
+  "$REPO_ROOT/venv/bin/python" \
   "${VIRTUAL_ENV:-}/bin/python" \
   "$HOME/.hermes/hermes-agent/venv/bin/python"; do
   [ -x "$candidate" ] || continue
@@ -92,6 +92,7 @@ env -i \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
   PYTHONDONTWRITEBYTECODE=1 \
+  RUN_TESTS_SELECTED_PYTHON="$PYTHON" \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

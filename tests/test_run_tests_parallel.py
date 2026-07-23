@@ -319,3 +319,43 @@ def test_collection_uses_temp_hermes_home_not_live_home(
     assert data["kanban_task"] is None
     assert not Path(data["hermes_home"]).exists()
     assert not (live_home / "logs" / "collection_probe.json").exists()
+
+
+def test_shell_selected_python_takes_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shell wrapper's probed interpreter is reused by the Python runner."""
+    from scripts import run_tests_parallel
+
+    selected = tmp_path / "selected-python"
+    selected.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -c ]; then exit 0; fi\n"
+        "exit 7\n"
+    )
+    selected.chmod(0o755)
+
+    repo = tmp_path / "repo"
+    legacy = repo / "venv" / "bin" / "python"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -c ]; then exit 0; fi\n"
+        "exit 9\n"
+    )
+    legacy.chmod(0o755)
+
+    monkeypatch.setenv("RUN_TESTS_SELECTED_PYTHON", str(selected))
+    assert run_tests_parallel._resolve_python(repo) == str(selected)
+
+
+def test_shell_selected_python_is_scrubbed_from_pytest_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_tests_parallel
+
+    monkeypatch.setenv("RUN_TESTS_SELECTED_PYTHON", "/tmp/selected")
+    env = run_tests_parallel._build_pytest_env(tmp_path)
+    assert "RUN_TESTS_SELECTED_PYTHON" not in env

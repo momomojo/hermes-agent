@@ -150,6 +150,7 @@ def _safe_home_label(file: Path, repo_root: Path) -> str:
 def _build_pytest_env(hermes_home: Path) -> dict[str, str]:
     """Return an env for pytest that cannot touch live Hermes profile logs."""
     env = os.environ.copy()
+    env.pop("RUN_TESTS_SELECTED_PYTHON", None)
     for name in list(env):
         if name in _PYTEST_ENV_DROP_NAMES or any(
             name.startswith(prefix) for prefix in _PYTEST_ENV_DROP_PREFIXES
@@ -163,7 +164,7 @@ def _build_pytest_env(hermes_home: Path) -> dict[str, str]:
     env["PYTHONHASHSEED"] = "0"
     return env
 
-# Resolve the project Python — prefer venv over system python.
+# Resolve the project Python — prefer .venv over legacy venv over system python.
 def _resolve_python(repo_root: Path) -> str:
     """Resolve a Python that can import pytest.
 
@@ -173,7 +174,8 @@ def _resolve_python(repo_root: Path) -> str:
     silently using system Python and failing with ``No module named pytest``.
     """
     candidate_venvs: list[Path] = []
-    for candidate in ("venv", ".venv"):
+    selected_python = os.environ.get("RUN_TESTS_SELECTED_PYTHON")
+    for candidate in (".venv", "venv"):
         candidate_venvs.append(repo_root / candidate)
     if os.environ.get("VIRTUAL_ENV"):
         candidate_venvs.append(Path(os.environ["VIRTUAL_ENV"]))
@@ -181,6 +183,11 @@ def _resolve_python(repo_root: Path) -> str:
 
     seen: set[Path] = set()
     candidate_pythons: list[Path] = []
+    if selected_python:
+        selected_path = Path(selected_python)
+        candidate_pythons.append(selected_path)
+        seen.add(selected_path)
+
     for venv in candidate_venvs:
         for rel in (
             ("bin", "python3"),

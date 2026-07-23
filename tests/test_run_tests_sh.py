@@ -107,3 +107,46 @@ def test_prefers_test_capable_venv_over_broken_dotvenv(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert marker.read_text() == "capable"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell")
+def test_prefers_test_capable_dotvenv_over_legacy_venv(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    source = Path(__file__).resolve().parent.parent / "scripts" / "run_tests.sh"
+    runner = scripts / "run_tests.sh"
+    runner.write_text(source.read_text())
+    runner.chmod(0o755)
+    (scripts / "run_tests_parallel.py").write_text(
+        "raise AssertionError('fake interpreter should intercept')\n"
+    )
+
+    marker = tmp_path / "selected.txt"
+    legacy = repo / "venv" / "bin" / "python"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -c ]; then exit 0; fi\n"
+        f"printf legacy > {str(marker)!r}\n"
+    )
+    legacy.chmod(0o755)
+
+    current = repo / ".venv" / "bin" / "python"
+    current.parent.mkdir(parents=True)
+    current.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -c ]; then exit 0; fi\n"
+        f"printf current > {str(marker)!r}\n"
+    )
+    current.chmod(0o755)
+
+    proc = subprocess.run(
+        [str(runner)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert marker.read_text() == "current"
