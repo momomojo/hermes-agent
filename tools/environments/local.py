@@ -370,6 +370,9 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
 
+    from hermes_cli.kanban_env import strip_kanban_lifecycle_env
+    strip_kanban_lifecycle_env(sanitized)
+
     return sanitized
 
 
@@ -489,6 +492,9 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+
+    from hermes_cli.kanban_env import strip_kanban_lifecycle_env
+    strip_kanban_lifecycle_env(env)
 
     return env
 
@@ -790,6 +796,9 @@ def _make_run_env(env: dict) -> dict:
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+
+    from hermes_cli.kanban_env import strip_kanban_lifecycle_env
+    strip_kanban_lifecycle_env(run_env)
 
     return run_env
 

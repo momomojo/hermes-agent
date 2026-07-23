@@ -2295,6 +2295,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from hermes_cli.kanban_env import strip_kanban_lifecycle_env
+    strip_kanban_lifecycle_env(os.environ)
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
