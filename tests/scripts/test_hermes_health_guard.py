@@ -68,6 +68,45 @@ def test_ensure_venv_python_noops_when_already_in_venv(monkeypatch, tmp_path):
     guard._ensure_venv_python()
 
 
+def test_history_is_trimmed_and_failure_text_is_capped(monkeypatch, tmp_path):
+    guard = _load_health_guard_module()
+    history = tmp_path / "history.jsonl"
+    history.write_text(
+        "\n".join(json.dumps({"timestamp": str(i), "level": "ok", "failures": []}) for i in range(20)) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "HISTORY_PATH", history)
+    monkeypatch.setattr(guard, "HISTORY_MAX_BYTES", 10_000)
+    monkeypatch.setattr(guard, "HISTORY_MAX_ENTRIES", 3)
+    monkeypatch.setattr(guard, "HISTORY_FAILURE_MAX_CHARS", 12)
+
+    guard._append_history({"timestamp": "new", "level": "critical", "failures": ["y" * 50]})
+
+    records = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 3
+    assert records[-1]["failures"] == ["y" * 12]
+
+
+def test_history_is_bounded_by_bytes_after_append(monkeypatch, tmp_path):
+    guard = _load_health_guard_module()
+    history = tmp_path / "history.jsonl"
+    history.write_text(
+        "\n".join(json.dumps({"timestamp": str(i), "level": "critical", "failures": ["x" * 80]}) for i in range(20)) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "HISTORY_PATH", history)
+    monkeypatch.setattr(guard, "HISTORY_MAX_BYTES", 200)
+    monkeypatch.setattr(guard, "HISTORY_MAX_ENTRIES", 500)
+    monkeypatch.setattr(guard, "HISTORY_FAILURE_MAX_CHARS", 12)
+
+    guard._append_history({"timestamp": "new", "level": "critical", "failures": ["y" * 50]})
+
+    assert history.stat().st_size <= 200
+    records = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["timestamp"] == "new"
+    assert records[-1]["failures"] == ["y" * 12]
+
+
 # ── provider-health sentinel integration ───────────────────────────────────
 #
 # The autouse _hermetic_environment fixture points HERMES_HOME at a per-test

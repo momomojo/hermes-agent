@@ -33,6 +33,9 @@ HISTORY_PATH = BASE / "history.jsonl"
 HTML_PATH = BASE / "index.html"
 LOG_PATH = HOME / "logs" / "hermes_health_guard.log"
 LOG_MAX_BYTES = int(os.environ.get("HERMES_HEALTH_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+HISTORY_MAX_BYTES = int(os.environ.get("HERMES_HEALTH_HISTORY_MAX_BYTES", str(2 * 1024 * 1024)))
+HISTORY_MAX_ENTRIES = int(os.environ.get("HERMES_HEALTH_HISTORY_MAX_ENTRIES", "500"))
+HISTORY_FAILURE_MAX_CHARS = int(os.environ.get("HERMES_HEALTH_HISTORY_FAILURE_MAX_CHARS", "2048"))
 LAUNCHD_LOG_PATHS = [
     Path(os.environ.get("HERMES_HEALTH_LAUNCHD_STDOUT_PATH", str(HOME / "logs" / "hermes_health_guard.launchd.log"))),
     Path(os.environ.get("HERMES_HEALTH_LAUNCHD_STDERR_PATH", str(HOME / "logs" / "hermes_health_guard.launchd.err"))),
@@ -1054,12 +1057,44 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def _append_history(payload: dict[str, Any]) -> None:
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    failures = [str(failure)[:HISTORY_FAILURE_MAX_CHARS] for failure in payload["failures"]]
+    record = {
+        "timestamp": payload["timestamp"],
+        "level": payload["level"],
+        "failures": failures,
+    }
+    line = json.dumps(record, sort_keys=True) + "\n"
+    while failures and len(line.encode("utf-8")) > HISTORY_MAX_BYTES:
+        failures.pop()
+        line = json.dumps(record, sort_keys=True) + "\n"
     with HISTORY_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps({
-            "timestamp": payload["timestamp"],
-            "level": payload["level"],
-            "failures": payload["failures"],
-        }, sort_keys=True) + "\n")
+        fh.write(line)
+    _trim_history()
+
+
+def _trim_history() -> None:
+    """Bound history without retaining a second large rotated log."""
+    try:
+        size = HISTORY_PATH.stat().st_size
+    except OSError:
+        return
+    try:
+        with HISTORY_PATH.open("rb") as fh:
+            fh.seek(max(0, size - max(1, HISTORY_MAX_BYTES)))
+            if fh.tell() > 0:
+                fh.readline()  # discard a partial JSONL record
+            tail = fh.read().splitlines()
+        max_entries = max(1, HISTORY_MAX_ENTRIES)
+        if size <= HISTORY_MAX_BYTES and len(tail) <= max_entries:
+            return
+        tail = tail[-max_entries:]
+        while tail and len(b"\n".join(tail)) + 1 > HISTORY_MAX_BYTES:
+            tail.pop(0)
+        tmp = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + ".tmp")
+        tmp.write_bytes(b"\n".join(tail) + (b"\n" if tail else b""))
+        tmp.replace(HISTORY_PATH)
+    except OSError:
+        return
 
 
 def _html_table(rows: list[dict[str, Any]], kind: str) -> str:
