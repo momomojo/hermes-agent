@@ -42,6 +42,7 @@ PYTHON=""
 for candidate in \
   "$REPO_ROOT/.venv/bin/python" \
   "$REPO_ROOT/venv/bin/python" \
+  "${HERMES_PYTHON:-}" \
   "${VIRTUAL_ENV:-}/bin/python" \
   "$HOME/.hermes/hermes-agent/venv/bin/python"; do
   [ -x "$candidate" ] || continue
@@ -52,7 +53,7 @@ for candidate in \
 done
 
 if [ -z "$PYTHON" ]; then
-  echo "error: no Python interpreter with pytest available; run 'uv sync --locked --extra all --extra dev'" >&2
+  echo "error: no Python interpreter with pytest available; run 'uv sync --locked --extra all --extra dev' or enter the Nix devShell" >&2
   exit 1
 fi
 
@@ -83,6 +84,15 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env; HERMES_HOME=$TEST_HERM
 
 cd "$REPO_ROOT"
 
+# ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
+# Each test file runs in its own subprocess via run_tests_parallel.py.
+# Pre-building the bytecode cache once here (instead of each subprocess
+# compiling on first import) avoids redundant work across ~2000 processes.
+# Uses git to list tracked .py files (skips venv, node_modules, etc).
+echo "▶ pre-compiling bytecode cache"
+"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+
+echo "▶ launching test runner"
 env -i \
   PATH="$PATH" \
   HOME="$HOME" \

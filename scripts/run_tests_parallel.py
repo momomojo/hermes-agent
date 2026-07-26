@@ -219,6 +219,16 @@ def _resolve_python(repo_root: Path) -> str:
         "`uv sync --locked --extra all --extra dev`."
     )
 
+
+# One-shot retry of failing test FILES. A file that exits non-zero is re-run
+# once in a fresh subprocess; if the re-run passes, the file counts as passed
+# but is loudly reported as FLAKY so it gets fixed rather than hidden.
+# Deterministic failures fail both attempts — a real regression can never be
+# laundered into green by this (it would have to flake in our favor twice in
+# a row on the same runner, which is exactly the definition of a flake).
+# Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
+_DEFAULT_FILE_RETRIES = 1
+
 # Duration cache: maps relative file paths to last-observed subprocess
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
@@ -360,10 +370,18 @@ def _run_one_file(
     file_timeout: float,
     test_home_root: Path,
     python_executable: str,
+    retries: int = 0,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
+
+    ``retries`` > 0 enables the one-shot flake retry: a non-zero exit is
+    re-run in a fresh subprocess; if the re-run passes, the file counts as
+    passed but the output is prefixed with a FLAKY banner and the file/output
+    are recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
+    deterministic failure fails every attempt, so real regressions cannot
+    be laundered green.
 
     ``summary_counts`` is the result of ``_parse_pytest_summary(output)`` —
 
@@ -386,10 +404,64 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    file, rc, output, summary, subproc_wall = _run_one_file_once(
+        file,
+        pytest_args,
+        repo_root,
+        file_timeout,
+        test_home_root,
+        python_executable,
+        attempt=1,
+    )
+    attempt = 0
+    while rc != 0 and attempt < retries:
+        attempt += 1
+        first_output = output
+        file, rc, output, summary, subproc_wall2 = _run_one_file_once(
+            file,
+            pytest_args,
+            repo_root,
+            file_timeout,
+            test_home_root,
+            python_executable,
+            attempt=attempt + 1,
+        )
+        subproc_wall += subproc_wall2
+        if rc == 0:
+            output = (
+                f"⚠ FLAKY: failed on attempt 1, passed on retry "
+                f"(attempt {attempt + 1}). Fix the flake — do not ignore this.\n"
+                f"--- first-attempt output ---\n{first_output}\n"
+                f"--- retry output ---\n{output}"
+            )
+            with _flaky_lock:
+                _FLAKY_RESULTS.append((file, output))
+    return file, rc, output, summary, subproc_wall
+
+
+# Files that failed once and passed on retry, with both attempts' output.
+# Keeping the traceback is load-bearing: a self-healed flake without its
+# failing assertion is only a filename, which forces another expensive full
+# run to rediscover the race.
+_FLAKY_RESULTS: List[Tuple[Path, str]] = []
+_flaky_lock = threading.Lock()
+
+
+def _run_one_file_once(
+    file: Path,
+    pytest_args: List[str],
+    repo_root: Path,
+    file_timeout: float,
+    test_home_root: Path,
+    python_executable: str,
+    *,
+    attempt: int,
+) -> Tuple[Path, int, str, dict[str, int], float]:
+    """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [python_executable, "-m", "pytest", str(file), *pytest_args]
     hermes_home = _prepare_hermes_home(
         test_home_root,
-        _safe_home_label(file, repo_root),
+        f"{_safe_home_label(file, repo_root)}-attempt-{attempt}",
     )
     pytest_env = _build_pytest_env(hermes_home)
     pytest_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -604,9 +676,9 @@ def _print_inline_failure(
     print(f"  ╔╍ Failed: {rel} ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     for line in tail.splitlines():
         print(f"  ║ {line}", flush=True)
-    print(f"  ║", flush=True)
+    print("  ║", flush=True)
     print(f"  ║  Repro: {repro}", flush=True)
-    print(f"  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    print("  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
     print(flush=True)
 
 
@@ -768,6 +840,19 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--file-retries",
+        type=int,
+        default=int(
+            os.environ.get("HERMES_TEST_FILE_RETRIES", _DEFAULT_FILE_RETRIES)
+        ),
+        help=(
+            "Re-run a failing test FILE this many times in a fresh subprocess "
+            "before declaring it failed. A pass-on-retry counts as passed but "
+            "is reported as FLAKY in the summary. 0 disables. "
+            f"Default: {_DEFAULT_FILE_RETRIES}, env: HERMES_TEST_FILE_RETRIES."
+        ),
+    )
+    parser.add_argument(
         "--slice",
         metavar="I/N",
         help=(
@@ -827,7 +912,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--slice", "--generate-slices", "--files",
+        "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -909,7 +994,7 @@ def main() -> int:
         files = _discover_files(roots)
 
     if not files:
-        print(f"No test files to run", file=sys.stderr)
+        print("No test files to run", file=sys.stderr)
         return 1
 
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
@@ -1033,6 +1118,7 @@ def main() -> int:
                     args.file_timeout,
                     test_home_root,
                     python_executable,
+                    args.file_retries,
                 )
                 fut.add_done_callback(
                     lambda f, file=file, t0=t0: _on_done(file, t0, f)
@@ -1049,6 +1135,15 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # Flaky files: failed once, passed on the automatic retry. Green, but
+    # loudly reported so they get fixed instead of silently re-flaking.
+    if _FLAKY_RESULTS:
+        print()
+        print(f"=== ⚠ {len(_FLAKY_RESULTS)} FLAKY file{'s' if len(_FLAKY_RESULTS) != 1 else ''} (failed once, passed on retry — fix these) ===")
+        for f, output in _FLAKY_RESULTS:
+            print(f"  {_format_file(f, repo_root)}")
+            print(output.rstrip())
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.
@@ -1073,14 +1168,14 @@ def main() -> int:
         fast = sum(1 for t in times if t < 1.0)
         fast_2s = sum(1 for t in times if t < 2.0)
         print()
-        print(f"=== Per-file subprocess time distribution ===")
+        print("=== Per-file subprocess time distribution ===")
         print(f"  Files:   {len(times)}")
         print(f"  Total subprocess CPU-wall: {total_subproc:.1f}s  (runner wall: {elapsed:.1f}s, parallelism: {args.jobs}x)")
         print(f"  P50: {p50:.2f}s  P90: {p90:.2f}s  P95: {p95:.2f}s  P99: {p99:.2f}s  Max: {max_t:.2f}s")
         print(f"  <1s: {fast} files ({fast/len(times)*100:.0f}%)  <2s: {fast_2s} files ({fast_2s/len(times)*100:.0f}%)")
         # Top 10 slowest files — likely the ones dragging the run.
         slowest = sorted(file_times, key=lambda x: x[1], reverse=True)[:10]
-        print(f"  Top 10 slowest:")
+        print("  Top 10 slowest:")
         for f, t in slowest:
             print(f"    {t:>6.2f}s  {_format_file(f, repo_root)}")
 
