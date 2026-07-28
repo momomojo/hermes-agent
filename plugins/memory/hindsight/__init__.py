@@ -543,6 +543,33 @@ def _normalize_string_list(value: Any) -> List[str]:
     return _normalize_retain_tags(value)
 
 
+def _load_create_bank_request():
+    """Load the optional client's request model through transient import races.
+
+    Hindsight can initialize its embedded/client stack on background threads.
+    CPython may then surface a transient ``ImportError`` or private
+    ``_DeadlockError`` when this control-path import overlaps that work.  The
+    package is optional, so permanently missing imports still fall back to the
+    legacy mission APIs; only short-lived concurrent-import failures are
+    retried here.
+    """
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            from hindsight_client_api.models.create_bank_request import (
+                CreateBankRequest,
+            )
+
+            return CreateBankRequest
+        except Exception as exc:
+            if not isinstance(exc, ImportError) and exc.__class__.__name__ != "_DeadlockError":
+                raise
+            last_error = exc
+            if attempt < 3:
+                threading.Event().wait(0.01 * (attempt + 1))
+    raise ImportError("Hindsight request model is unavailable") from last_error
+
+
 _RECALL_SCORE_KEYS = ("semantic", "keyword", "reranker", "final")
 
 
@@ -1920,7 +1947,7 @@ class HindsightMemoryProvider(MemoryProvider):
         banks = getattr(client, "banks", None)
         if banks is not None and hasattr(banks, "update_bank"):
             try:
-                from hindsight_client_api.models.create_bank_request import CreateBankRequest
+                CreateBankRequest = _load_create_bank_request()
                 request = CreateBankRequest(mission=mission)
                 self._run_sync(
                     banks.update_bank(

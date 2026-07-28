@@ -452,6 +452,41 @@ class TestConfig:
         assert banks.update_bank.call_args.args[0] == "test-bank"
         assert banks.update_bank.call_args.args[1].mission == "Configured mission"
 
+    def test_bank_mission_patch_retries_transient_request_model_import(
+        self, monkeypatch,
+    ):
+        """A concurrent optional-client import must not skip the modern API."""
+        import builtins
+
+        real_import = builtins.__import__
+        target = "hindsight_client_api.models.create_bank_request"
+        attempts = 0
+
+        def transient_import(name, *args, **kwargs):
+            nonlocal attempts
+            if name == target and attempts == 0:
+                attempts += 1
+                raise ImportError("transient concurrent import")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", transient_import)
+
+        p = HindsightMemoryProvider()
+        banks = SimpleNamespace(
+            get_bank_profile=AsyncMock(return_value=SimpleNamespace(mission="")),
+            update_bank=AsyncMock(return_value=SimpleNamespace(mission="Configured mission")),
+        )
+        p._client = SimpleNamespace(banks=banks)
+        p._bank_id = "test-bank"
+        p._bank_mission = "Configured mission"
+        p._timeout = 1
+
+        p._sync_bank_mission_if_empty()
+
+        assert attempts == 1
+        banks.update_bank.assert_called_once()
+        assert banks.update_bank.call_args.args[1].mission == "Configured mission"
+
     def test_bank_mission_not_overwritten_when_server_has_mission(self):
         p = HindsightMemoryProvider()
         banks = SimpleNamespace(

@@ -8,6 +8,7 @@ operators can tell when drift or adapter trouble returns.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import html
@@ -84,6 +85,15 @@ PROVIDER_HEALTH_PAGE_STATES = {"down", "critical", "error"}
 # Cap per-lane detail in failure lines — sentinel details can embed whole
 # tracebacks/HTTP bodies and huge alert strings drown the pager.
 PROVIDER_HEALTH_DETAIL_MAX_CHARS = 160
+OUTBOUND_SOURCE_PROBE_HOST = os.environ.get(
+    "HERMES_HEALTH_OUTBOUND_SOURCE_HOST", "api.telegram.org"
+)
+OUTBOUND_SOURCE_PROBE_PORT = int(
+    os.environ.get("HERMES_HEALTH_OUTBOUND_SOURCE_PORT", "443")
+)
+OUTBOUND_SOURCE_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("HERMES_HEALTH_OUTBOUND_SOURCE_TIMEOUT_S", "3.0")
+)
 COMPILEALL_TARGETS = ("hermes_cli", "agent", "gateway", "plugins")
 COMPILEALL_TIMEOUT_SECONDS = float(os.environ.get("HERMES_HEALTH_COMPILE_TIMEOUT_S", "60.0"))
 
@@ -602,6 +612,46 @@ def _check_provider_health() -> list[str]:
     return failures
 
 
+def _check_outbound_source_selection() -> list[str]:
+    """Detect failure before an outbound request reaches its provider.
+
+    Provider sentinels already report upstream connectivity. This narrower
+    probe preserves EADDRNOTAVAIL, which macOS can emit when conflicting
+    active default routes leave it unable to choose a local source address.
+    """
+    try:
+        addresses = socket.getaddrinfo(
+            OUTBOUND_SOURCE_PROBE_HOST,
+            OUTBOUND_SOURCE_PROBE_PORT,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return []
+
+    source_selection_failed = False
+    for family, socktype, proto, _canonname, address in addresses:
+        candidate: socket.socket | None = None
+        try:
+            candidate = socket.socket(family, socktype, proto)
+            candidate.settimeout(OUTBOUND_SOURCE_PROBE_TIMEOUT_SECONDS)
+            candidate.connect(address)
+            return []
+        except OSError as exc:
+            if exc.errno == errno.EADDRNOTAVAIL:
+                source_selection_failed = True
+        finally:
+            if candidate is not None:
+                candidate.close()
+
+    if not source_selection_failed:
+        return []
+    return [
+        "outbound source selection failed: "
+        f"{OUTBOUND_SOURCE_PROBE_HOST}:{OUTBOUND_SOURCE_PROBE_PORT} returned "
+        "EADDRNOTAVAIL; check for conflicting active default routes/interfaces"
+    ]
+
+
 def _check_managed_layer_drift() -> list[str]:
     """Page when uncommitted ~/.hermes paths survive the nightly autocommit.
 
@@ -1009,6 +1059,8 @@ def collect_health() -> dict[str, Any]:
     failures.extend(_check_runtime_compile())
     failures.extend(_check_launchd_jobs())
     failures.extend(_check_provider_health())
+    outbound_source_failures = _check_outbound_source_selection()
+    failures.extend(outbound_source_failures)
     failures.extend(_check_managed_layer_drift())
     failures.extend(_check_gateway_staleness(profiles))
     hindsight_failures = _check_hindsight_configs(profiles)
@@ -1044,6 +1096,10 @@ def collect_health() -> dict[str, Any]:
         "listeners": listeners,
         "kanban_flow": kanban_flow,
         "provider_health": _provider_health_summary(),
+        "outbound_source_selection": {
+            "ok": not outbound_source_failures,
+            "failures": outbound_source_failures,
+        },
         "hindsight_checks": _check_hindsight_configs(profiles),
     }
 

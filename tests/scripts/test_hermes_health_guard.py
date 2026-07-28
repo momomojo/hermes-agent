@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -217,6 +218,99 @@ def test_provider_health_unparseable_updated_treated_as_no_output():
     failures = guard._check_provider_health()
     assert len(failures) == 1
     assert "state file missing/unreadable" in failures[0]
+
+
+def test_outbound_source_selection_accepts_when_any_address_connects(monkeypatch):
+    guard = _load_health_guard_module()
+    attempts = []
+
+    class FakeSocket:
+        def __init__(self, failure=None):
+            self.failure = failure
+            self.closed = False
+
+        def settimeout(self, value):
+            assert value == guard.OUTBOUND_SOURCE_PROBE_TIMEOUT_SECONDS
+
+        def connect(self, address):
+            attempts.append(address)
+            if self.failure:
+                raise self.failure
+
+        def close(self):
+            self.closed = True
+
+    sockets = iter(
+        [
+            FakeSocket(OSError(errno.EAGAIN, "Resource temporarily unavailable")),
+            FakeSocket(),
+        ]
+    )
+    monkeypatch.setattr(
+        guard.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (guard.socket.AF_INET6, guard.socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0)),
+            (guard.socket.AF_INET, guard.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ],
+    )
+    monkeypatch.setattr(guard.socket, "socket", lambda *_args, **_kwargs: next(sockets))
+
+    assert guard._check_outbound_source_selection() == []
+    assert attempts == [("::1", 443, 0, 0), ("127.0.0.1", 443)]
+
+
+def test_outbound_source_selection_flags_eaddrnotavail(monkeypatch):
+    guard = _load_health_guard_module()
+
+    class FailingSocket:
+        def settimeout(self, _value):
+            pass
+
+        def connect(self, _address):
+            raise OSError(errno.EADDRNOTAVAIL, "Can't assign requested address")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        guard.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (guard.socket.AF_INET, guard.socket.SOCK_STREAM, 6, "", ("203.0.113.10", 443)),
+        ],
+    )
+    monkeypatch.setattr(guard.socket, "socket", lambda *_args, **_kwargs: FailingSocket())
+
+    assert guard._check_outbound_source_selection() == [
+        "outbound source selection failed: api.telegram.org:443 returned "
+        "EADDRNOTAVAIL; check for conflicting active default routes/interfaces"
+    ]
+
+
+def test_outbound_source_selection_ignores_unrelated_connectivity_failure(monkeypatch):
+    guard = _load_health_guard_module()
+
+    class RefusedSocket:
+        def settimeout(self, _value):
+            pass
+
+        def connect(self, _address):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        guard.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (guard.socket.AF_INET, guard.socket.SOCK_STREAM, 6, "", ("203.0.113.10", 443)),
+        ],
+    )
+    monkeypatch.setattr(guard.socket, "socket", lambda *_args, **_kwargs: RefusedSocket())
+
+    assert guard._check_outbound_source_selection() == []
 
 
 def test_runtime_compile_success_is_silent(monkeypatch):
