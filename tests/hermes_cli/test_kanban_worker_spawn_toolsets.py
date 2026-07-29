@@ -209,3 +209,38 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_skill_names_omits_worker_skill_when_dispatcher_lacks_it(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    assert kb._kanban_worker_skill_available(root) is False
+    assert kb._default_spawn_skill_names("elias", ["custom", "custom", ""]) == [
+        "custom"
+    ]
+
+
+def test_default_spawn_skill_names_uses_only_task_skills_when_worker_skill_exists(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / ".hermes"
+    skill_file = root / "skills" / "kanban-worker" / "SKILL.md"
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text("---\nname: kanban-worker\n---\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    assert kb._kanban_worker_skill_available(root) is True
+    assert kb._default_spawn_skill_names(
+        "elias",
+        ["review-helper", "review-helper", ""],
+    ) == ["review-helper"]
