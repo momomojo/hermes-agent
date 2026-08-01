@@ -18,6 +18,7 @@ for invariants and PR review criteria.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -975,8 +976,13 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    # Python threads do not inherit ContextVars automatically. Capture the cron
+    # lifecycle mask so the curator cannot reconstruct a caller worker's task
+    # surface from its still-present process environment.
+    _context = contextvars.copy_context()
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _context.copy().run(_run_review_in_thread, agent, messages_snapshot, prompt)
 
     return _target, prompt
 

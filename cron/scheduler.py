@@ -2696,6 +2696,25 @@ def _guard_job_credential_exfil(job: dict) -> None:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
+    """Run a cron job in an independent scheduler lifecycle context.
+
+    Cron may be entered inline from a dispatcher worker via ``cronjob(run)``.
+    The parent process keeps its Kanban task environment for its own lifecycle,
+    but this nested scheduler execution must never acquire that task's tools,
+    prompt guidance, turn-end guard, or heartbeat bridge.  The ContextVar mask
+    is thread-local and exception-safe; board/profile pins remain available.
+    """
+    from agent.kanban_context import cron_scheduler_context
+
+    with cron_scheduler_context():
+        return _run_job_in_scheduler_context(
+            job, defer_agent_teardown=defer_agent_teardown
+        )
+
+
+def _run_job_in_scheduler_context(
+    job: dict, *, defer_agent_teardown: Optional[list] = None
+) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
 

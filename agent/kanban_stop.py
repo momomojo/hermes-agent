@@ -31,8 +31,12 @@ def kanban_stop_nudge_enabled() -> bool:
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    try:
+        from agent.kanban_context import has_lifecycle_task
+        return has_lifecycle_task()
+    except Exception:
+        task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        return bool(task)
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -85,7 +89,13 @@ def build_kanban_stop_nudge(
     if session_called_kanban_terminal(messages):
         return None
 
-    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    if task_id is None:
+        try:
+            from agent.kanban_context import get_lifecycle_task_id
+            task_id = get_lifecycle_task_id()
+        except Exception:
+            task_id = os.environ.get("HERMES_KANBAN_TASK")
+    tid = (task_id or "").strip() or "this task"
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
