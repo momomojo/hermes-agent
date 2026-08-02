@@ -6,7 +6,10 @@ background review as an independent, unscoped scheduler session.
 """
 from __future__ import annotations
 
+import json
 import os
+import shlex
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +27,7 @@ _PIN_ENV = {
     "HERMES_KANBAN_BOARD": "pinned-board",
     "HERMES_KANBAN_WORKSPACES_ROOT": "/tmp/pinned-workspaces",
 }
+_PROFILE_ENV = {"HERMES_PROFILE": "parent-worker-profile"}
 
 
 @pytest.fixture
@@ -31,6 +35,8 @@ def parent_worker_env(monkeypatch, tmp_path):
     for name, value in _LIFECYCLE_ENV.items():
         monkeypatch.setenv(name, value)
     for name, value in _PIN_ENV.items():
+        monkeypatch.setenv(name, value)
+    for name, value in _PROFILE_ENV.items():
         monkeypatch.setenv(name, value)
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -86,6 +92,86 @@ def test_scheduler_context_restores_parent_lifecycle_after_exception(parent_work
 
     assert get_lifecycle_task_id() == _LIFECYCLE_ENV["HERMES_KANBAN_TASK"]
     assert {name: os.environ.get(name) for name in _LIFECYCLE_ENV} == _LIFECYCLE_ENV
+
+
+def test_scheduler_context_strips_parent_lifecycle_from_local_subprocesses(parent_worker_env):
+    """Nested cron children cannot reacquire the parent worker lifecycle."""
+    from agent.kanban_context import cron_scheduler_context
+    from tools.environments.local import (
+        LocalEnvironment,
+        _make_run_env,
+        _sanitize_subprocess_env,
+        hermes_subprocess_env,
+    )
+
+    child_program = "\n".join((
+        "import json, os",
+        "from tools.kanban_tools import _handle_block, _handle_complete, _handle_heartbeat",
+        f"names = {tuple(_LIFECYCLE_ENV)!r}",
+        "print(json.dumps({'env': {name: os.environ.get(name) for name in names}, "
+        "'heartbeat': _handle_heartbeat({}), "
+        "'complete': _handle_complete({'summary': 'should not persist'}), "
+        "'block': _handle_block({'reason': 'should not persist'})}))",
+    ))
+    environment = LocalEnvironment(cwd=os.getcwd(), timeout=10)
+    try:
+        outside_envs = (
+            _make_run_env({}),
+            _sanitize_subprocess_env(os.environ.copy()),
+            hermes_subprocess_env(),
+        )
+        for env in outside_envs:
+            assert {name: env.get(name) for name in _LIFECYCLE_ENV} == _LIFECYCLE_ENV
+            assert env["HERMES_HOME"] == os.environ["HERMES_HOME"]
+            assert {name: env.get(name) for name in _PROFILE_ENV} == _PROFILE_ENV
+            assert {name: env.get(name) for name in _PIN_ENV} == _PIN_ENV
+
+        with cron_scheduler_context():
+            nested_envs = (
+                _make_run_env({}),
+                _sanitize_subprocess_env(os.environ.copy()),
+                hermes_subprocess_env(),
+            )
+            for env in nested_envs:
+                assert not set(_LIFECYCLE_ENV) & set(env)
+                assert env["HERMES_HOME"] == os.environ["HERMES_HOME"]
+                assert {name: env.get(name) for name in _PROFILE_ENV} == _PROFILE_ENV
+                assert {name: env.get(name) for name in _PIN_ENV} == _PIN_ENV
+
+            child = environment._run_bash(
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(child_program)}"
+            )
+            output, _ = child.communicate(timeout=10)
+
+        child_result = json.loads(output)
+        assert child_result["env"] == {name: None for name in _LIFECYCLE_ENV}
+        for action in ("heartbeat", "complete", "block"):
+            assert "task_id is required" in child_result[action]
+    finally:
+        environment.cleanup()
+
+    assert {name: os.environ.get(name) for name in _LIFECYCLE_ENV} == _LIFECYCLE_ENV
+
+
+def test_non_kanban_check_fn_cache_is_unchanged_in_scheduler_context():
+    """Scheduler isolation does not disturb normal registry availability caching."""
+    from agent.kanban_context import cron_scheduler_context
+    from tools.registry import _check_fn_cached, invalidate_check_fn_cache
+
+    calls = {"count": 0}
+
+    def check_fn():
+        calls["count"] += 1
+        return True
+
+    invalidate_check_fn_cache()
+    try:
+        assert _check_fn_cached(check_fn) is True
+        with cron_scheduler_context():
+            assert _check_fn_cached(check_fn) is True
+        assert calls["count"] == 1
+    finally:
+        invalidate_check_fn_cache()
 
 
 def test_inline_force_run_uses_unscoped_scheduler_context(parent_worker_env):

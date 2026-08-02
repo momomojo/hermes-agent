@@ -37,6 +37,11 @@ def has_lifecycle_task() -> bool:
     return get_lifecycle_task_id() is not None
 
 
+def lifecycle_task_suppressed() -> bool:
+    """Whether nested scheduler work must omit worker lifecycle env bindings."""
+    return _LIFECYCLE_TASK_SUPPRESSED.get()
+
+
 @contextmanager
 def cron_scheduler_context() -> Iterator[None]:
     """Run nested cron work without inheriting a caller's Kanban lifecycle.
@@ -56,4 +61,5 @@ __all__ = [
     "cron_scheduler_context",
     "get_lifecycle_task_id",
     "has_lifecycle_task",
+    "lifecycle_task_suppressed",
 ]
