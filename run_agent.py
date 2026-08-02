@@ -114,6 +114,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.kanban_context import has_lifecycle_task
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -3224,12 +3225,7 @@ class AIAgent:
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
-        try:
-            from agent.kanban_context import has_lifecycle_task
-            _has_kanban_lifecycle_task = has_lifecycle_task()
-        except Exception:
-            _has_kanban_lifecycle_task = bool(os.environ.get("HERMES_KANBAN_TASK"))
-        if _has_kanban_lifecycle_task:
+        if has_lifecycle_task():
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
                 heartbeat_current_worker_from_env()

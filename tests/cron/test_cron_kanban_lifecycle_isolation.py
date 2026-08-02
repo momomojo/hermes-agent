@@ -156,3 +156,40 @@ def test_unscoped_kanban_cron_keeps_explicit_orchestrator_tools(parent_worker_en
         names = {tool["function"]["name"] for tool in tools}
 
     assert {"kanban_list", "kanban_show", "kanban_complete", "kanban_block"}.issubset(names)
+
+
+def test_non_contextual_check_fn_keeps_its_ttl_verdict_in_scheduler_context(parent_worker_env):
+    """The ContextVar opt-out does not alter shared cache behavior for other tools."""
+    from agent.kanban_context import cron_scheduler_context
+    from tools.registry import ToolRegistry, invalidate_check_fn_cache
+
+    calls = {"count": 0}
+
+    def general_check():
+        calls["count"] += 1
+        return True
+
+    reg = ToolRegistry()
+    reg.register(
+        name="general_cached_tool",
+        toolset="general-cache-test",
+        schema={"name": "general_cached_tool", "parameters": {"type": "object"}},
+        handler=lambda _args, **_kwargs: "{}",
+        check_fn=general_check,
+    )
+
+    invalidate_check_fn_cache()
+    try:
+        assert {tool["function"]["name"] for tool in reg.get_definitions({"general_cached_tool"})} == {
+            "general_cached_tool"
+        }
+        with cron_scheduler_context():
+            assert {tool["function"]["name"] for tool in reg.get_definitions({"general_cached_tool"})} == {
+                "general_cached_tool"
+            }
+        # ``general_check`` has no ContextVar opt-out marker, so the scheduler
+        # boundary reuses its normal process-wide TTL cache rather than probing
+        # it again or altering its cached availability verdict.
+        assert calls == {"count": 1}
+    finally:
+        invalidate_check_fn_cache()

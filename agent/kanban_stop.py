@@ -16,6 +16,8 @@ from __future__ import annotations
 import os
 from typing import Any, Iterable, Optional
 
+from agent.kanban_context import get_lifecycle_task_id, has_lifecycle_task
+
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
@@ -31,12 +33,7 @@ def kanban_stop_nudge_enabled() -> bool:
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    try:
-        from agent.kanban_context import has_lifecycle_task
-        return has_lifecycle_task()
-    except Exception:
-        task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-        return bool(task)
+    return has_lifecycle_task()
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -90,11 +87,7 @@ def build_kanban_stop_nudge(
         return None
 
     if task_id is None:
-        try:
-            from agent.kanban_context import get_lifecycle_task_id
-            task_id = get_lifecycle_task_id()
-        except Exception:
-            task_id = os.environ.get("HERMES_KANBAN_TASK")
+        task_id = get_lifecycle_task_id()
     tid = (task_id or "").strip() or "this task"
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "

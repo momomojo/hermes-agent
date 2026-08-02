@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.kanban_context import has_lifecycle_task
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -263,11 +264,7 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
 def _has_kanban_lifecycle_task() -> bool:
     """Context-aware worker check for model tool schema assembly."""
-    try:
-        from agent.kanban_context import has_lifecycle_task
-        return has_lifecycle_task()
-    except Exception:
-        return bool(os.environ.get("HERMES_KANBAN_TASK"))
+    return has_lifecycle_task()
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime

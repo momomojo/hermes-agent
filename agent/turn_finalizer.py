@@ -22,9 +22,8 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
-import os
-
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.kanban_context import get_lifecycle_task_id
 from agent.message_content import flatten_message_text
 
 
@@ -151,11 +150,7 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
-        try:
-            from agent.kanban_context import get_lifecycle_task_id
-            _kanban_task = get_lifecycle_task_id()
-        except Exception:
-            _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        _kanban_task = get_lifecycle_task_id()
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
