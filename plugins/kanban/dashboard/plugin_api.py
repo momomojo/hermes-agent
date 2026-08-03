@@ -140,8 +140,11 @@ def _conn(board: Optional[str] = None):
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
-# Columns shown by the dashboard, in left-to-right order. "archived" is
-# available via a filter toggle rather than a visible column.
+# Active columns shown by the dashboard, in left-to-right order. Terminal
+# history columns are appended only when ``include_archived`` is requested.
+# ``superseded`` belongs in history because it is terminal for display and
+# retention, but unlike ``archived`` it intentionally does not satisfy parent
+# dependencies (see kanban_db.PARENT_SATISFYING_STATUSES).
 #
 # Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
 # ``scheduled`` is a first-class waiting column used for time-based follow-ups;
@@ -151,6 +154,7 @@ def _conn(board: Optional[str] = None):
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
+HISTORY_COLUMNS: tuple[str, ...] = ("archived", "superseded")
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -452,7 +456,7 @@ def get_board(
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
-            columns["archived"] = []
+            columns.update({c: [] for c in HISTORY_COLUMNS})
 
         # Batch-fetch the latest non-null run summary per task in one
         # window-function query (avoids N+1 ``latest_summary`` calls
@@ -476,8 +480,14 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
-            columns[col].append(d)
+            if t.status not in columns:
+                log.warning(
+                    "kanban dashboard: omitting task %s with unrequested status %s",
+                    t.id,
+                    t.status,
+                )
+                continue
+            columns[t.status].append(d)
 
         # Stable per-column ordering already applied by list_tasks
         # (priority DESC, created_at ASC), keep as-is.

@@ -235,6 +235,52 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_notifier_collects_superseded_event_and_unsubscribes(tmp_path, monkeypatch):
+    """Supersession is silent, but it must still reach final cleanup.
+
+    A superseded task is final for notification purposes even though it does
+    not satisfy child dependencies. The watcher therefore claims the real
+    ``superseded`` event, advances past it without sending a chat ping, and
+    removes the now-finished subscription.
+    """
+    db_path = tmp_path / "superseded-final.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        canonical = kb.create_task(conn, title="canonical", assignee="worker")
+        obsolete = kb.create_task(conn, title="obsolete", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=obsolete,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        assert kb.supersede_task(
+            conn,
+            obsolete,
+            superseded_by=canonical,
+            reason="duplicate incident",
+        )
+        assert [ev.kind for ev in kb.list_events(conn, obsolete)][-1] == "superseded"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == [], "superseded cleanup should not emit a chat notification"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, obsolete)
+        assert task is not None
+        assert task.status == "superseded"
+        assert kb.list_notify_subs(conn, obsolete) == []
+    finally:
+        conn.close()
+
+
 def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypatch):
     """A subscription owned by a secondary profile whose profile-adapter
     registry entry EXISTS but lacks this platform must NOT fall back to the
