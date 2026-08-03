@@ -99,7 +99,12 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived", "superseded"}
+# ``superseded`` is terminal for triage, retention, and normal listings, but
+# deliberately does NOT satisfy a parent dependency. A replacement can close
+# an obsolete incident without accidentally releasing a parked duplicate child.
+TERMINAL_STATUSES = frozenset({"done", "archived", "superseded"})
+PARENT_SATISFYING_STATUSES = frozenset({"done", "archived"})
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -2564,7 +2569,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "AND status NOT IN ('archived', 'superseded') "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
@@ -2776,8 +2781,8 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
-    if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+    if not include_archived and status not in {"archived", "superseded"}:
+        query += " AND status NOT IN ('archived', 'superseded')"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3478,7 +3483,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] in PARENT_SATISFYING_STATUSES for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5187,7 +5192,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if p["status"] not in PARENT_SATISFYING_STATUSES
         ]
         if unsatisfied:
             return False, (
@@ -5619,6 +5624,71 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    return True
+
+
+def supersede_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    superseded_by: str,
+    reason: Optional[str] = None,
+) -> bool:
+    """Administratively terminalize an obsolete task without releasing children.
+
+    Unlike ``archive_task()``, a superseded task does not satisfy dependency
+    links. This is for a resolved incident whose old provenance must be kept
+    out of circuit-breaker triage while duplicate, dependency-parked children
+    remain parked. The replacement task must already exist, which makes the
+    transition auditable and prevents a typo from silently discarding work.
+
+    This is intentionally a database/CLI-only administrative transition: no
+    worker tool exposes it, so dispatcher-scoped workers retain their strict
+    one-task mutation boundary.
+    """
+    if not superseded_by or superseded_by == task_id:
+        return False
+    summary = f"superseded by {superseded_by}"
+    if reason and reason.strip():
+        summary += f": {reason.strip()}"
+    with write_txn(conn):
+        replacement = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (superseded_by,),
+        ).fetchone()
+        if replacement is None:
+            return False
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] in TERMINAL_STATUSES:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'superseded',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND status NOT IN ('done', 'archived', 'superseded')
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="superseded",
+            status="superseded",
+            summary=summary,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "superseded",
+            {"superseded_by": superseded_by, "reason": reason.strip() if reason else None},
+            run_id=run_id,
+        )
     return True
 
 
@@ -8980,14 +9050,14 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "WHERE status NOT IN ('archived', 'superseded') GROUP BY status"
     ):
         by_status[row["status"]] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status NOT IN ('archived', 'superseded') AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
@@ -9278,14 +9348,14 @@ def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
-    in a terminal state (``done`` or ``archived``). Returns the number of
+    in a terminal state (``done``, ``archived``, or ``superseded``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived', 'superseded'))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
@@ -9405,7 +9475,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
     A name is included when it's a configured profile on disk OR when
-    any non-archived task has it as the assignee. Used by:
+    any non-terminal task has it as the assignee. Used by:
 
     - ``hermes kanban assignees`` for the terminal.
     - The dashboard assignee dropdown (so a fresh profile appears in
@@ -9415,11 +9485,11 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     """
     on_disk = set(list_profiles_on_disk())
 
-    # Count tasks per (assignee, status), excluding archived.
+    # Count tasks per (assignee, status), excluding terminal reconciliation.
     counts: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status NOT IN ('archived', 'superseded') AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])

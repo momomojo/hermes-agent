@@ -482,13 +482,13 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
+                        # final status (done / archived / superseded). For blocked /
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = task and task.status in {"done", "archived", "superseded"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:

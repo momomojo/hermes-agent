@@ -275,7 +275,7 @@ def _compute_task_diagnostics(
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            "SELECT * FROM tasks WHERE status NOT IN ('archived', 'superseded')",
         ).fetchall()
 
     if not rows:
@@ -494,7 +494,7 @@ def get_board(
             r["assignee"]
             for r in conn.execute(
                 "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
+                "AND status NOT IN ('archived', 'superseded') ORDER BY assignee"
             )
         ]
 
