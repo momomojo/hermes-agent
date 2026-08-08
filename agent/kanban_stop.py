@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -66,6 +67,30 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def is_successful_kanban_terminal_result(tool_name: str, result: Any) -> bool:
+    """Return whether a terminal tool actually transitioned this worker's card.
+
+    A terminal tool name alone is insufficient: validation, ownership,
+    artifact, and goal-judge refusals return normally so a worker can recover.
+    Only the handlers' ``{"ok": true, "task_id": ...}`` response for this
+    worker's assigned card is an irreversible stop boundary.
+    """
+    if tool_name not in _TERMINAL_KANBAN_TOOLS or not isinstance(result, str):
+        return False
+    assigned_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not assigned_task:
+        return False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and str(payload.get("task_id") or "").strip() == assigned_task
+    )
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -103,6 +128,7 @@ def build_kanban_stop_nudge(
 
 __all__ = [
     "build_kanban_stop_nudge",
+    "is_successful_kanban_terminal_result",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]

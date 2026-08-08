@@ -4458,6 +4458,114 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    @pytest.mark.parametrize("terminal_tool", ["kanban_complete", "kanban_block"])
+    def test_successful_kanban_terminal_tool_stops_before_later_tool_or_api_call(
+        self, agent, monkeypatch, terminal_tool
+    ):
+        """A terminal board transition is a hard worker boundary, not advice."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+        agent.valid_tool_names.update({terminal_tool, "write_file"})
+        terminal = _mock_tool_call(name=terminal_tool, arguments="{}", call_id="terminal")
+        later_mutation = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"later.txt","content":"must not land"}',
+            call_id="later",
+        )
+        response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[terminal, later_mutation]
+        )
+        agent.client.chat.completions.create.side_effect = [response, AssertionError("second API call")]
+        dispatched = []
+
+        def _dispatch(name, args, task_id, **kwargs):
+            dispatched.append(name)
+            if name == terminal_tool:
+                return '{"ok": true, "task_id": "t_owned"}'
+            raise AssertionError(f"later tool dispatched: {name}")
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("terminalize this task")
+
+        assert dispatched == [terminal_tool]
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["turn_exit_reason"] == "kanban_terminal_success"
+        assert result["final_response"] == ""
+        skipped = [m for m in result["messages"] if m.get("tool_call_id") == "later"]
+        assert len(skipped) == 1
+        assert "terminal kanban transition" in skipped[0]["content"].lower()
+
+    def test_refused_kanban_terminal_tool_allows_worker_to_reconcile(self, agent, monkeypatch):
+        """A failed lifecycle request must not make the worker exit early."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+        agent.valid_tool_names.update({"kanban_complete", "web_search"})
+        terminal = _mock_tool_call(name="kanban_complete", arguments="{}", call_id="terminal")
+        reconcile = _mock_tool_call(name="web_search", arguments="{}", call_id="reconcile")
+        response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[terminal, reconcile]
+        )
+        agent.client.chat.completions.create.side_effect = [
+            response,
+            _mock_response(content="reconciled", finish_reason="stop"),
+        ]
+        dispatched = []
+
+        def _dispatch(name, args, task_id, **kwargs):
+            dispatched.append(name)
+            if name == "kanban_complete":
+                return '{"error": "completion refused"}'
+            return "reconciliation result"
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("terminalize this task")
+
+        assert dispatched == ["kanban_complete", "web_search"]
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["final_response"] == "reconciled"
+
+    def test_successful_terminal_tool_skips_later_parallel_segment(self, agent, monkeypatch):
+        """A terminal barrier also prevents later segmented-dispatch calls."""
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owned")
+        agent.valid_tool_names.update({"kanban_complete", "web_search", "read_file"})
+        terminal = _mock_tool_call(name="kanban_complete", arguments="{}", call_id="terminal")
+        search = _mock_tool_call(name="web_search", arguments="{}", call_id="search")
+        read = _mock_tool_call(name="read_file", arguments='{"path":"later.txt"}', call_id="read")
+        response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[terminal, search, read]
+        )
+        agent.client.chat.completions.create.side_effect = [response, AssertionError("second API call")]
+        dispatched = []
+
+        def _dispatch(name, args, task_id, **kwargs):
+            dispatched.append(name)
+            if name == "kanban_complete":
+                return '{"ok": true, "task_id": "t_owned"}'
+            raise AssertionError(f"later tool dispatched: {name}")
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("terminalize this task")
+
+        assert dispatched == ["kanban_complete"]
+        assert agent.client.chat.completions.create.call_count == 1
+        assert {m.get("tool_call_id") for m in result["messages"]} >= {"search", "read"}
+
     def test_tool_call_none_args_verbose_logging_does_not_crash(self, agent):
         self._setup_agent(agent)
         agent.verbose_logging = True

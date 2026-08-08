@@ -737,6 +737,9 @@ def run_conversation(
     # so this tally caps same-entry refreshes and lets the fallback chain take
     # over instead of spinning. Reset here so each turn starts fresh. See #26080.
     agent._auth_pool_refresh_counts = {}
+    # Worker agents normally exit after a successful lifecycle transition, but
+    # reset defensively so a reused agent instance never inherits that boundary.
+    agent._kanban_terminal_succeeded = False
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -5093,6 +5096,13 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_kanban_terminal_succeeded", False):
+                    # A successful lifecycle transition ends this worker before
+                    # another assistant turn can mutate task-owned bytes.
+                    _turn_exit_reason = "kanban_terminal_success"
+                    final_response = ""
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

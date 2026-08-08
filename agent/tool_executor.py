@@ -31,6 +31,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.kanban_stop import is_successful_kanban_terminal_result
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -1571,6 +1572,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        _terminal_kanban_success = is_successful_kanban_terminal_result(
+            function_name, function_result
+        )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1603,6 +1607,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
+            if _terminal_kanban_success:
+                # Do not use ``interrupt()``: that aborts child agents and
+                # concurrent tools belonging to this process.  The board
+                # transition ends only this worker's conversation loop.
+                agent._kanban_terminal_succeeded = True
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
@@ -1704,6 +1713,27 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        if getattr(agent, "_kanban_terminal_succeeded", False) and i < len(assistant_message.tool_calls):
+            remaining = len(assistant_message.tool_calls) - i
+            agent._vprint(
+                f"{agent.log_prefix}✓ Kanban terminal transition: skipping {remaining} remaining tool call(s)",
+                force=True,
+            )
+            for skipped_tc in assistant_message.tool_calls[i:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    f"[Tool execution skipped — {skipped_name} was not started after a successful terminal Kanban transition]",
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"terminal Kanban skipped tool result {skipped_name}",
+                )
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -1769,7 +1799,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -1781,6 +1811,24 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
+        if getattr(agent, "_kanban_terminal_succeeded", False):
+            # The sequential executor drained the current segment. Keep later
+            # calls paired with synthetic results, but never dispatch them.
+            for _, later_calls in segments[segment_index + 1:]:
+                for skipped_tc in later_calls:
+                    skipped_name = skipped_tc.function.name
+                    messages.append(make_tool_result_message(
+                        skipped_name,
+                        f"[Tool execution skipped — {skipped_name} was not started after a successful terminal Kanban transition]",
+                        skipped_tc.id,
+                        effect_disposition="none",
+                    ))
+                    _flush_session_db_after_tool_progress(
+                        agent,
+                        messages,
+                        stage=f"terminal Kanban skipped tool result {skipped_name}",
+                    )
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
