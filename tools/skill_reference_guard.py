@@ -9,8 +9,10 @@ small, import-light, and reusable across those call sites.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -64,45 +66,68 @@ def normalize_skill_names(skills: Optional[Iterable[Any]]) -> list[str]:
     return out
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
+def _read_yaml(path: Path) -> tuple[dict[str, Any], str | None]:
+    """Read a configured mapping without treating corruption as absence."""
+    try:
+        if not path.exists():
+            return {}, None
+        if not path.is_file():
+            return {}, f"{path.name} is not a regular file"
+    except OSError as exc:
+        return {}, f"{path.name} inaccessible ({type(exc).__name__})"
     try:
         import yaml
 
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}, f"{path.name} is not a mapping"
+        return data, None
     except Exception as exc:
-        logger.debug("failed to read yaml %s: %s", path, exc)
-        return {}
+        return {}, f"{path.name} unreadable ({type(exc).__name__})"
 
 
-def _configured_external_skill_dirs(home: Path) -> list[Path]:
-    cfg = _read_yaml(home / "config.yaml")
-    skills_cfg = cfg.get("skills") if isinstance(cfg, dict) else None
+def _configured_external_skill_dirs(home: Path) -> tuple[list[Path], str | None]:
+    cfg, error = _read_yaml(home / "config.yaml")
+    if error:
+        return [], error
+    skills_cfg = cfg.get("skills")
+    if skills_cfg is None:
+        return [], None
     if not isinstance(skills_cfg, dict):
-        return []
-    raw = skills_cfg.get("external_dirs") or []
+        return [], "skills config is not a mapping"
+    raw = skills_cfg.get("external_dirs")
+    if raw is None:
+        return [], None
     if isinstance(raw, str):
         raw = [raw]
     if not isinstance(raw, (list, tuple)):
-        return []
+        return [], "skills.external_dirs is not a list"
     dirs: list[Path] = []
     for value in raw:
-        text = str(value or "").strip()
-        if not text:
-            continue
+        if not isinstance(value, str) or not value.strip():
+            return [], "skills.external_dirs contains an invalid root"
+        text = value.strip()
         path = Path(text).expanduser()
         if not path.is_absolute():
             path = home / path
-        if path.is_dir():
-            dirs.append(path)
-    return dirs
+        try:
+            if not path.exists():
+                return [], f"configured external skill root is missing: {path.name}"
+            if not path.is_dir():
+                return [], f"configured external skill root is not a directory: {path.name}"
+            # Force a traversal now so permissions/stat errors cannot later be
+            # misreported as an empty inventory.
+            next(path.iterdir(), None)
+        except OSError as exc:
+            return [], f"configured external skill root inaccessible ({type(exc).__name__})"
+        dirs.append(path)
+    return dirs, None
 
 
 def _iter_skill_roots(home: Path) -> list[Path]:
     roots = [home / "skills"]
-    roots.extend(_configured_external_skill_dirs(home))
+    dirs, _error = _configured_external_skill_dirs(home)
+    roots.extend(dirs)
     return roots
 
 
@@ -311,29 +336,45 @@ def _collect_kanban_references() -> tuple[list[dict[str, Any]], str | None]:
     return refs, None
 
 
+def _profile_homes() -> tuple[list[tuple[str, Path]], str | None]:
+    """Enumerate the default store and every profile store fail-closed."""
+    try:
+        root = get_default_hermes_root()
+        homes: list[tuple[str, Path]] = [("default", root)]
+        profiles_root = root / "profiles"
+        if not profiles_root.exists():
+            return homes, None
+        if not profiles_root.is_dir():
+            return homes, "profiles root is not a directory"
+        homes.extend((entry.name, entry) for entry in sorted(profiles_root.iterdir()) if entry.is_dir())
+        return homes, None
+    except OSError as exc:
+        return [], f"profile enumeration failed ({type(exc).__name__})"
+
+
 def _collect_cron_references() -> tuple[list[dict[str, Any]], str | None]:
     refs: list[dict[str, Any]] = []
     try:
-        from cron.jobs import load_jobs
+        from cron.jobs import load_jobs, use_cron_store
 
-        for job in load_jobs():
-            if not isinstance(job, dict):
-                return refs, "cron scan failed: job record is not an object"
-            raw_skills = job.get("skills")
-            if raw_skills is None and job.get("skill"):
-                raw_skills = [job.get("skill")]
-            if raw_skills is not None and not isinstance(raw_skills, (str, list, tuple)):
-                return refs, "cron scan failed: skills field is malformed"
-            for name in normalize_skill_names(raw_skills or []):
-                refs.append(
-                    {
-                        "name": name,
-                        "source": "cron.jobs.skills",
-                        "job_id": job.get("id"),
-                        "job_name": job.get("name"),
-                        "profile": job.get("profile"),
-                    }
-                )
+        homes, error = _profile_homes()
+        if error:
+            return refs, f"cron scan failed: {error}"
+        for profile, home in homes:
+            if not (home / "cron" / "jobs.json").exists():
+                continue
+            with use_cron_store(home):
+                jobs = load_jobs()
+            for job in jobs:
+                if not isinstance(job, dict):
+                    return refs, f"cron scan failed: {profile} job record is not an object"
+                raw_skills = job.get("skills")
+                if raw_skills is None and job.get("skill"):
+                    raw_skills = [job.get("skill")]
+                if raw_skills is not None and not isinstance(raw_skills, (str, list, tuple)):
+                    return refs, f"cron scan failed: {profile} skills field is malformed"
+                for name in normalize_skill_names(raw_skills or []):
+                    refs.append({"name": name, "source": "cron.jobs.skills", "job_id": job.get("id"), "job_name": job.get("name"), "profile": profile})
     except Exception as exc:
         logger.debug("failed to collect cron skill references: %s", exc, exc_info=True)
         return refs, f"cron scan failed: {type(exc).__name__}"
@@ -393,6 +434,18 @@ def _collect_profile_default_references() -> tuple[list[dict[str, Any]], str | N
     return refs, None
 
 
+def _collect_external_root_health() -> tuple[list[dict[str, Any]], str | None]:
+    """Fail closed when an explicitly configured external root is unhealthy."""
+    homes, error = _profile_homes()
+    if error:
+        return [], f"external-root scan failed: {error}"
+    for profile, home in homes:
+        _roots, root_error = _configured_external_skill_dirs(home)
+        if root_error:
+            return [], f"external-root scan failed: {profile} {root_error}"
+    return [], None
+
+
 def collect_protected_references() -> dict[str, Any]:
     """Return a complete safety index and separate diagnostics input.
 
@@ -409,6 +462,7 @@ def collect_protected_references() -> dict[str, Any]:
         ("kanban", _collect_kanban_references),
         ("cron", _collect_cron_references),
         ("profiles", _collect_profile_default_references),
+        ("external_roots", _collect_external_root_health),
     ):
         collected, error = collector()
         refs.extend(collected)
