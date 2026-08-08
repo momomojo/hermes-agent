@@ -322,8 +322,21 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
     cron_referenced = _cron_referenced_skills()
+    try:
+        from tools.skill_reference_guard import collect_protected_references
+        protected_snapshot = collect_protected_references()
+    except Exception:
+        protected_snapshot = {"complete": False, "protected_names": []}
+    protected_names = set(protected_snapshot.get("protected_names") or [])
 
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    counts = {
+        "marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0,
+        "seeded": 0, "protected_skipped": 0,
+    }
+    # A failed collector is never proof that a skill is unused. Do not perform
+    # automatic archive transitions until the complete safety index is readable.
+    if not protected_snapshot.get("complete", False):
+        return counts
 
     for row in _u.agent_created_report():
         counts["checked"] += 1
@@ -1093,6 +1106,27 @@ def _build_rename_summary(
     return "\n".join(lines)
 
 
+def normalize_run_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Read v1/v2 curator reports through a stable v2-shaped view.
+
+    v1 reports had no explicit schema version and exposed unbounded reference
+    detail. Keep their documented fields intact while supplying v2 defaults so
+    consumers need not branch on historical report files.
+    """
+    normalized = dict(payload) if isinstance(payload, dict) else {}
+    version = normalized.get("schema_version", 1)
+    if version not in (1, 2):
+        raise ValueError(f"unsupported curator report schema version: {version}")
+    normalized["schema_version"] = 2
+    normalized.setdefault("cron_rewrites", {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0})
+    normalized.setdefault("blocked_mutations", [])
+    normalized.setdefault("protected_references", {
+        "protected_names": [], "references": [], "by_name": {}, "count": 0,
+        "reference_count": 0, "bounded": True,
+    })
+    return normalized
+
+
 def _write_run_report(
     *,
     started_at: datetime,
@@ -1246,38 +1280,10 @@ def _write_run_report(
                 }
             )
 
-    # Rewrite cron job skill references. When the curator consolidates
-    # skill X into umbrella Y, any cron job that lists X fails to load
-    # it at run time — the scheduler skips it and the job runs without
-    # the instructions it was scheduled to follow. Rewriting the
-    # references in-place keeps scheduled jobs working across
-    # consolidation passes. Best-effort: never let a cron-module issue
-    # break the curator.
-    consolidated_map = {
-        e["name"]: e["into"]
-        for e in consolidated
-        if isinstance(e, dict) and e.get("name") and e.get("into")
-    }
-    pruned_names = [
-        e["name"] for e in pruned
-        if isinstance(e, dict) and e.get("name")
-    ]
+    # Reference migration is performed synchronously in skill_manage's delete
+    # saga before archive. Reports only serialize evidence; they never mutate
+    # cron or Kanban state after the source skill has disappeared.
     cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
-    try:
-        if consolidated_map or pruned_names:
-            from cron.jobs import rewrite_skill_refs as _rewrite_cron_refs
-            cron_rewrites = _rewrite_cron_refs(
-                consolidated=consolidated_map,
-                pruned=pruned_names,
-            )
-    except Exception as e:
-        logger.debug("Curator cron skill rewrite failed: %s", e, exc_info=True)
-        cron_rewrites = {
-            "rewrites": [],
-            "jobs_updated": 0,
-            "jobs_scanned": 0,
-            "error": str(e),
-        }
 
     try:
         from tools.skill_reference_guard import (
@@ -1303,6 +1309,7 @@ def _write_run_report(
         }
 
     payload = {
+        "schema_version": 2,
         "started_at": started_at.isoformat(),
         "duration_seconds": round(elapsed_seconds, 2),
         "model": llm_meta.get("model", ""),

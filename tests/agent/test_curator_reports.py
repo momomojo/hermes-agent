@@ -348,10 +348,8 @@ def curator_env_with_cron(curator_env, monkeypatch):
     return {**curator_env, "jobs": jobs_mod}
 
 
-def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_cron):
-    """A skill consolidated into an umbrella should be rewritten in any
-    cron job's skills list; the rewrite should be visible in run.json
-    and cron_rewrites.json."""
+def test_curator_report_never_mutates_cron_skills(curator_env_with_cron):
+    """Migration is a delete-saga concern, not a report-writer side effect."""
     curator = curator_env_with_cron["curator"]
     jobs = curator_env_with_cron["jobs"]
 
@@ -391,35 +389,27 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
         ),
     )
 
-    # Cron job is rewritten on disk
+    # Reporting cannot repair or silently mutate a stale cron job.
     loaded = jobs.get_job(job["id"])
-    assert loaded["skills"] == ["foo-umbrella"]
-    assert loaded["skill"] == "foo-umbrella"
+    assert loaded["skills"] == ["foo"]
+    assert loaded["skill"] == "foo"
 
     # Rewrite is recorded in run.json
     payload = json.loads((run_dir / "run.json").read_text())
-    assert payload["cron_rewrites"]["jobs_updated"] == 1
-    assert payload["counts"]["cron_jobs_rewritten"] == 1
-    rewrites = payload["cron_rewrites"]["rewrites"]
-    assert len(rewrites) == 1
-    assert rewrites[0]["mapped"] == {"foo": "foo-umbrella"}
+    assert payload["cron_rewrites"]["jobs_updated"] == 0
+    assert payload["counts"]["cron_jobs_rewritten"] == 0
 
-    # Separate cron_rewrites.json is written for convenience
+    # No mutation report is emitted either.
     cron_file = run_dir / "cron_rewrites.json"
-    assert cron_file.exists()
-    detail = json.loads(cron_file.read_text())
-    assert detail["jobs_updated"] == 1
+    assert not cron_file.exists()
 
-    # Markdown surfaces the change
+    # Markdown does not claim a migration it did not perform.
     md = (run_dir / "REPORT.md").read_text()
-    assert "Cron job skill references rewritten" in md
-    assert "foo-watcher" in md
-    assert "foo-umbrella" in md
+    assert "Cron job skill references rewritten" not in md
 
 
-def test_curator_drops_pruned_skill_from_cron_job(curator_env_with_cron):
-    """A pruned (no-umbrella) skill should be dropped from the cron
-    job's skill list entirely — there's no forwarding target."""
+def test_curator_report_never_drops_pruned_cron_skills(curator_env_with_cron):
+    """A report cannot erase runtime meaning after an archive."""
     curator = curator_env_with_cron["curator"]
     jobs = curator_env_with_cron["jobs"]
 
@@ -444,12 +434,10 @@ def test_curator_drops_pruned_skill_from_cron_job(curator_env_with_cron):
     )
 
     loaded = jobs.get_job(job["id"])
-    assert loaded["skills"] == ["keep"]
+    assert loaded["skills"] == ["keep", "stale-one"]
 
     payload = json.loads((run_dir / "run.json").read_text())
-    assert payload["cron_rewrites"]["jobs_updated"] == 1
-    rewrites = payload["cron_rewrites"]["rewrites"]
-    assert rewrites[0]["dropped"] == ["stale-one"]
+    assert payload["cron_rewrites"]["jobs_updated"] == 0
 
 
 def test_curator_report_has_no_cron_section_when_nothing_changes(curator_env_with_cron):

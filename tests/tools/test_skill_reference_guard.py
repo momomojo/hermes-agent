@@ -1,4 +1,37 @@
-from tools.skill_reference_guard import summarize_protected_references
+from tools.skill_reference_guard import (
+    collect_protected_references,
+    summarize_protected_references,
+)
+
+
+def test_collector_failure_keeps_safety_index_incomplete(monkeypatch):
+    """Unreadable stores must not be mistaken for an empty reference set."""
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_cron_references",
+        lambda: ([], "cron scan failed: OSError"),
+    )
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_kanban_references",
+        lambda: ([], None),
+    )
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_profile_default_references",
+        lambda: ([], None),
+    )
+
+    result = collect_protected_references()
+
+    assert result["complete"] is False
+    assert result["collector_errors"] == {"cron": "cron scan failed: OSError"}
+
+
+def test_bounded_summary_preserves_scan_completeness():
+    result = summarize_protected_references(
+        {"by_name": {}, "complete": False, "collector_errors": {"kanban": "locked"}}
+    )
+
+    assert result["complete"] is False
+    assert result["collector_errors"] == {"kanban": "locked"}
 
 
 def test_protected_reference_summary_is_bounded_and_aggregated():

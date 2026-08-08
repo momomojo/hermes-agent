@@ -210,6 +210,23 @@ def _json_skill_list(value: Any) -> list[str]:
     return []
 
 
+def _strict_json_skill_list(value: Any) -> tuple[list[str], str | None]:
+    """Parse persisted Kanban skills without treating corruption as empty."""
+    if value in (None, ""):
+        return [], None
+    if isinstance(value, list):
+        return normalize_skill_names(value), None
+    if not isinstance(value, str):
+        return [], "skills value is not JSON text"
+    try:
+        parsed = json.loads(value)
+    except Exception as exc:
+        return [], f"skills JSON malformed: {type(exc).__name__}"
+    if not isinstance(parsed, list):
+        return [], "skills JSON is not a list"
+    return normalize_skill_names(parsed), None
+
+
 def kanban_preflight(conn: Any) -> dict[str, Any]:
     """Check every non-terminal Kanban task against its assignee skill home."""
     placeholders = ",".join("?" * len(NON_TERMINAL_KANBAN_STATUSES))
@@ -249,14 +266,14 @@ def kanban_preflight(conn: Any) -> dict[str, Any]:
     }
 
 
-def _collect_kanban_references() -> list[dict[str, Any]]:
+def _collect_kanban_references() -> tuple[list[dict[str, Any]], str | None]:
     refs: list[dict[str, Any]] = []
     try:
         from hermes_cli import kanban_db
 
         db_path = kanban_db.kanban_db_path()
         if not db_path.exists():
-            return refs
+            return refs, None
         with kanban_db.connect_closing() as conn:
             placeholders = ",".join("?" * len(NON_TERMINAL_KANBAN_STATUSES))
             rows = conn.execute(
@@ -265,7 +282,10 @@ def _collect_kanban_references() -> list[dict[str, Any]]:
                 NON_TERMINAL_KANBAN_STATUSES,
             ).fetchall()
             for row in rows:
-                for name in _json_skill_list(row["skills"]):
+                names, malformed = _strict_json_skill_list(row["skills"])
+                if malformed:
+                    return refs, f"kanban scan failed: task {row['id']} {malformed}"
+                for name in names:
                     refs.append(
                         {
                             "name": name,
@@ -287,18 +307,23 @@ def _collect_kanban_references() -> list[dict[str, Any]]:
                     )
     except Exception as exc:
         logger.debug("failed to collect kanban skill references: %s", exc, exc_info=True)
-    return refs
+        return refs, f"kanban scan failed: {type(exc).__name__}"
+    return refs, None
 
 
-def _collect_cron_references() -> list[dict[str, Any]]:
+def _collect_cron_references() -> tuple[list[dict[str, Any]], str | None]:
     refs: list[dict[str, Any]] = []
     try:
         from cron.jobs import load_jobs
 
         for job in load_jobs():
+            if not isinstance(job, dict):
+                return refs, "cron scan failed: job record is not an object"
             raw_skills = job.get("skills")
             if raw_skills is None and job.get("skill"):
                 raw_skills = [job.get("skill")]
+            if raw_skills is not None and not isinstance(raw_skills, (str, list, tuple)):
+                return refs, "cron scan failed: skills field is malformed"
             for name in normalize_skill_names(raw_skills or []):
                 refs.append(
                     {
@@ -311,7 +336,8 @@ def _collect_cron_references() -> list[dict[str, Any]]:
                 )
     except Exception as exc:
         logger.debug("failed to collect cron skill references: %s", exc, exc_info=True)
-    return refs
+        return refs, f"cron scan failed: {type(exc).__name__}"
+    return refs, None
 
 
 def _extract_profile_skill_defaults(config: dict[str, Any]) -> list[str]:
@@ -328,12 +354,12 @@ def _extract_profile_skill_defaults(config: dict[str, Any]) -> list[str]:
     return normalize_skill_names(names)
 
 
-def _collect_profile_default_references() -> list[dict[str, Any]]:
+def _collect_profile_default_references() -> tuple[list[dict[str, Any]], str | None]:
     refs: list[dict[str, Any]] = []
     try:
         root = get_default_hermes_root()
-    except Exception:
-        root = get_hermes_home()
+    except Exception as exc:
+        return refs, f"profile scan failed: {type(exc).__name__}"
     candidates: list[tuple[str, Path]] = [("default", root)]
     profiles_root = root / "profiles"
     if profiles_root.is_dir():
@@ -341,10 +367,20 @@ def _collect_profile_default_references() -> list[dict[str, Any]]:
             for entry in sorted(profiles_root.iterdir()):
                 if entry.is_dir():
                     candidates.append((entry.name, entry))
-        except OSError:
-            pass
+        except OSError as exc:
+            return refs, f"profile scan failed: {type(exc).__name__}"
     for profile, home in candidates:
-        cfg = _read_yaml(home / "config.yaml")
+        config_path = home / "config.yaml"
+        if not config_path.exists():
+            cfg = {}
+        else:
+            try:
+                import yaml
+                cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                if not isinstance(cfg, dict):
+                    return refs, f"profile scan failed: {profile} config is not a mapping"
+            except Exception as exc:
+                return refs, f"profile scan failed: {profile} config unreadable ({type(exc).__name__})"
         for name in _extract_profile_skill_defaults(cfg):
             refs.append(
                 {
@@ -354,18 +390,30 @@ def _collect_profile_default_references() -> list[dict[str, Any]]:
                     "config": str(home / "config.yaml"),
                 }
             )
-    return refs
+    return refs, None
 
 
 def collect_protected_references() -> dict[str, Any]:
-    """Return protected skill names and the live references protecting them."""
+    """Return a complete safety index and separate diagnostics input.
+
+    A collector failure never means that no references exist. Callers that
+    archive skills must reject an incomplete index; reports can compact it via
+    :func:`summarize_protected_references` without weakening that safety gate.
+    """
     refs: list[dict[str, Any]] = [
         {"name": name, "source": "runtime.abi"}
         for name in sorted(RUNTIME_ABI_SKILLS)
     ]
-    refs.extend(_collect_kanban_references())
-    refs.extend(_collect_cron_references())
-    refs.extend(_collect_profile_default_references())
+    collector_errors: dict[str, str] = {}
+    for label, collector in (
+        ("kanban", _collect_kanban_references),
+        ("cron", _collect_cron_references),
+        ("profiles", _collect_profile_default_references),
+    ):
+        collected, error = collector()
+        refs.extend(collected)
+        if error:
+            collector_errors[label] = error
 
     by_name: dict[str, list[dict[str, Any]]] = {}
     for ref in refs:
@@ -379,6 +427,8 @@ def collect_protected_references() -> dict[str, Any]:
         "by_name": by_name,
         "count": len(by_name),
         "reference_count": len(refs),
+        "complete": not collector_errors,
+        "collector_errors": collector_errors,
     }
 
 
@@ -439,6 +489,8 @@ def summarize_protected_references(
         "protected_names_truncated": len(all_names) > len(summaries),
         "names_omitted": max(0, len(all_names) - len(summaries)),
         "references_truncated": reference_count > len(sampled_references),
+        "complete": bool(snapshot.get("complete", True)),
+        "collector_errors": dict(snapshot.get("collector_errors") or {}),
         **({"error": snapshot["error"]} if snapshot.get("error") else {}),
     }
 
@@ -449,4 +501,82 @@ def is_protected_skill(skill_name: str) -> bool:
     if not name:
         return False
     return name in set(collect_protected_references().get("protected_names") or [])
+
+
+def _replace_ordered(skills: list[str], old: str, new: str) -> list[str]:
+    """Replace one reference while preserving first-seen order and uniqueness."""
+    out: list[str] = []
+    for skill in skills:
+        candidate = new if skill == old else skill
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def migrate_kanban_skill_refs(old: str, new: str) -> dict[str, Any]:
+    """Atomically migrate non-terminal Kanban references and audit each row."""
+    from hermes_cli import kanban_db
+    from hermes_cli.sqlite_util import write_txn
+
+    updates: list[dict[str, Any]] = []
+    with kanban_db.connect_closing() as conn, write_txn(conn):
+        placeholders = ",".join("?" * len(NON_TERMINAL_KANBAN_STATUSES))
+        rows = conn.execute(
+            "SELECT id, skills FROM tasks WHERE status IN (" + placeholders + ")",
+            NON_TERMINAL_KANBAN_STATUSES,
+        ).fetchall()
+        for row in rows:
+            before, malformed = _strict_json_skill_list(row["skills"])
+            if malformed:
+                raise ValueError(f"task {row['id']} {malformed}")
+            if old not in before:
+                continue
+            after = _replace_ordered(before, old, new)
+            cursor = conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ? AND COALESCE(skills, '') = ?",
+                (json.dumps(after, ensure_ascii=False), row["id"], row["skills"] or ""),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"concurrent Kanban update for task {row['id']}")
+            kanban_db._append_event(
+                conn, row["id"], "skill_reference_migrated",
+                {"from": old, "to": new, "before": before, "after": after},
+            )
+            updates.append({"task_id": row["id"], "before": before, "after": after})
+    return {"tasks_updated": len(updates), "updates": updates}
+
+
+def prepare_skill_archive(name: str, absorbed_into: Optional[str]) -> dict[str, Any]:
+    """Run the fail-closed prepare → migrate → verify half of archive saga.
+
+    The caller archives only after this succeeds, so every partial migration
+    failure leaves the source active. Retrying is safe because rewrites dedupe.
+    """
+    source = str(name or "").strip()
+    target = str(absorbed_into or "").strip()
+    snapshot = collect_protected_references()
+    if not snapshot.get("complete", False):
+        return {"success": False, "error": "reference safety scan incomplete", "_fail_closed": True}
+    refs = list((snapshot.get("by_name") or {}).get(source) or [])
+    if not target:
+        if refs:
+            return {"success": False, "error": f"Skill '{source}' has live references and cannot be pruned.", "_fail_closed": True}
+        return {"success": True, "migration": {"cron": {}, "kanban": {}}}
+    if source in RUNTIME_ABI_SKILLS:
+        return {"success": False, "error": f"Skill '{source}' is a runtime ABI reference and cannot be migrated.", "_fail_closed": True}
+    profiles = {str(ref.get("profile") or "") for ref in refs}
+    for profile in profiles:
+        if not skill_exists_in_home(target, profile_home(profile or None)):
+            return {"success": False, "error": f"Target '{target}' is not active for affected profile '{profile or 'default'}'.", "_fail_closed": True}
+    try:
+        from cron.jobs import rewrite_skill_refs
+        cron = rewrite_skill_refs(consolidated={source: target}, pruned=[])
+        kanban = migrate_kanban_skill_refs(source, target)
+    except Exception as exc:
+        logger.warning("skill archive migration failed for %s: %s", source, exc, exc_info=True)
+        return {"success": False, "error": f"reference migration failed: {type(exc).__name__}", "_fail_closed": True}
+    verified = collect_protected_references()
+    if not verified.get("complete", False) or source in set(verified.get("protected_names") or []):
+        return {"success": False, "error": "post-migration complete rescan still finds source references", "_fail_closed": True}
+    return {"success": True, "migration": {"cron": cron, "kanban": kanban}}
 
