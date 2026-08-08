@@ -46,6 +46,33 @@ def _make_llm_meta(**overrides):
     return base
 
 
+def test_normalize_run_report_upgrades_v1_payload_without_losing_audit_fields(curator_env):
+    """Historical v1 readback has the v2 fields consumers now require."""
+    curator = curator_env["curator"]
+
+    normalized = curator.normalize_run_report(
+        {"started_at": "2026-01-01T00:00:00+00:00", "llm_final": "done"}
+    )
+
+    assert normalized["schema_version"] == 2
+    assert normalized["started_at"] == "2026-01-01T00:00:00+00:00"
+    assert normalized["llm_final"] == "done"
+    assert normalized["blocked_mutations"] == []
+    assert normalized["protected_references"]["bounded"] is True
+
+
+def test_read_run_report_normalizes_historical_v1_fixture(curator_env, tmp_path):
+    """The public readback path, not only a helper, accepts v1 reports."""
+    curator = curator_env["curator"]
+    report = tmp_path / "run.json"
+    report.write_text(json.dumps({"llm_final": "historic"}), encoding="utf-8")
+
+    normalized = curator.read_run_report(report)
+
+    assert normalized["schema_version"] == 2
+    assert normalized["llm_final"] == "historic"
+
+
 def test_reports_root_is_under_logs_not_skills(curator_env):
     """Reports live in logs/curator/, not skills/ — operational telemetry
     belongs with the logs, not with user-authored skill data."""

@@ -1127,6 +1127,12 @@ def normalize_run_report(payload: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def read_run_report(path: Path | str) -> Dict[str, Any]:
+    """Load persisted curator telemetry through the version-normalizing path."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return normalize_run_report(payload)
+
+
 def _write_run_report(
     *,
     started_at: datetime,
