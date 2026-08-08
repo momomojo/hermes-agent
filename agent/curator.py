@@ -37,6 +37,75 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 
+# Curator reports are durable operational telemetry, not a raw model trace.
+# Keep their full encoded representation bounded so a pathological model reply
+# or nested tool payload cannot exhaust disk or leak profile-local paths.
+MAX_RUN_REPORT_BYTES = 64 * 1024
+_REPORT_PATH_RE = re.compile(r"(?<![\w.-])(?:~|/[\w.~+@%=-]+)(?:/[\w.~+@%=-]+)+")
+
+
+def _sanitize_report_value(value: Any, *, string_limit: int, list_limit: int, depth: int = 0) -> Any:
+    """Return JSON-safe, path-safe telemetry with deterministic local bounds."""
+    if depth >= 12:
+        return "<nested value omitted>"
+    if isinstance(value, Path):
+        return "<path>"
+    if isinstance(value, str):
+        clean = _REPORT_PATH_RE.sub("<path>", value)
+        if len(clean) > string_limit:
+            return clean[:string_limit] + "…<truncated>"
+        return clean
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        items = list(value.items())[:list_limit]
+        result = {
+            str(key)[:128]: _sanitize_report_value(
+                item, string_limit=string_limit, list_limit=list_limit, depth=depth + 1
+            )
+            for key, item in items
+        }
+        if len(value) > len(items):
+            result["_omitted_items"] = len(value) - len(items)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)[:list_limit]
+        result = [
+            _sanitize_report_value(
+                item, string_limit=string_limit, list_limit=list_limit, depth=depth + 1
+            )
+            for item in items
+        ]
+        if len(value) > len(items):
+            result.append({"_omitted_items": len(value) - len(items)})
+        return result
+    return _sanitize_report_value(repr(value), string_limit=string_limit, list_limit=list_limit, depth=depth + 1)
+
+
+def _encode_bounded_run_report(payload: Dict[str, Any]) -> bytes:
+    """Serialize a v2 report under a fixed ceiling without dropping its audit core."""
+    for string_limit, list_limit in ((4096, 100), (512, 25), (96, 5)):
+        candidate = _sanitize_report_value(
+            payload, string_limit=string_limit, list_limit=list_limit
+        )
+        candidate["report_truncated"] = string_limit < 4096 or list_limit < 100
+        encoded = (json.dumps(candidate, indent=2, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+        if len(encoded) <= MAX_RUN_REPORT_BYTES:
+            return encoded
+    # Preserve the fields operators use to audit outcomes even for adversarial
+    # input that remains huge after structural trimming.
+    minimal = {
+        key: _sanitize_report_value(payload.get(key), string_limit=96, list_limit=5)
+        for key in (
+            "schema_version", "started_at", "duration_seconds", "model", "provider",
+            "counts", "tool_call_counts", "protected_references", "blocked_mutations",
+        )
+    }
+    minimal["report_truncated"] = True
+    minimal["report_omission"] = "payload exceeded curator report size ceiling"
+    return (json.dumps(minimal, indent=2, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+
+
 def _strip_aux_credential(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -322,8 +391,21 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
     cron_referenced = _cron_referenced_skills()
+    try:
+        from tools.skill_reference_guard import collect_protected_references
+        protected_snapshot = collect_protected_references()
+    except Exception:
+        protected_snapshot = {"complete": False, "protected_names": []}
+    protected_names = set(protected_snapshot.get("protected_names") or [])
 
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    counts = {
+        "marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0,
+        "seeded": 0, "protected_skipped": 0,
+    }
+    # A failed collector is never proof that a skill is unused. Do not perform
+    # automatic archive transitions until the complete safety index is readable.
+    if not protected_snapshot.get("complete", False):
+        return counts
 
     for row in _u.agent_created_report():
         counts["checked"] += 1
@@ -1093,6 +1175,33 @@ def _build_rename_summary(
     return "\n".join(lines)
 
 
+def normalize_run_report(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Read v1/v2 curator reports through a stable v2-shaped view.
+
+    v1 reports had no explicit schema version and exposed unbounded reference
+    detail. Keep their documented fields intact while supplying v2 defaults so
+    consumers need not branch on historical report files.
+    """
+    normalized = dict(payload) if isinstance(payload, dict) else {}
+    version = normalized.get("schema_version", 1)
+    if version not in (1, 2):
+        raise ValueError(f"unsupported curator report schema version: {version}")
+    normalized["schema_version"] = 2
+    normalized.setdefault("cron_rewrites", {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0})
+    normalized.setdefault("blocked_mutations", [])
+    normalized.setdefault("protected_references", {
+        "protected_names": [], "references": [], "by_name": {}, "count": 0,
+        "reference_count": 0, "bounded": True,
+    })
+    return normalized
+
+
+def read_run_report(path: Path | str) -> Dict[str, Any]:
+    """Load persisted curator telemetry through the version-normalizing path."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return normalize_run_report(payload)
+
+
 def _write_run_report(
     *,
     started_at: datetime,
@@ -1246,38 +1355,10 @@ def _write_run_report(
                 }
             )
 
-    # Rewrite cron job skill references. When the curator consolidates
-    # skill X into umbrella Y, any cron job that lists X fails to load
-    # it at run time — the scheduler skips it and the job runs without
-    # the instructions it was scheduled to follow. Rewriting the
-    # references in-place keeps scheduled jobs working across
-    # consolidation passes. Best-effort: never let a cron-module issue
-    # break the curator.
-    consolidated_map = {
-        e["name"]: e["into"]
-        for e in consolidated
-        if isinstance(e, dict) and e.get("name") and e.get("into")
-    }
-    pruned_names = [
-        e["name"] for e in pruned
-        if isinstance(e, dict) and e.get("name")
-    ]
+    # Reference migration is performed synchronously in skill_manage's delete
+    # saga before archive. Reports only serialize evidence; they never mutate
+    # cron or Kanban state after the source skill has disappeared.
     cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
-    try:
-        if consolidated_map or pruned_names:
-            from cron.jobs import rewrite_skill_refs as _rewrite_cron_refs
-            cron_rewrites = _rewrite_cron_refs(
-                consolidated=consolidated_map,
-                pruned=pruned_names,
-            )
-    except Exception as e:
-        logger.debug("Curator cron skill rewrite failed: %s", e, exc_info=True)
-        cron_rewrites = {
-            "rewrites": [],
-            "jobs_updated": 0,
-            "jobs_scanned": 0,
-            "error": str(e),
-        }
 
     try:
         from tools.skill_reference_guard import (
@@ -1303,6 +1384,7 @@ def _write_run_report(
         }
 
     payload = {
+        "schema_version": 2,
         "started_at": started_at.isoformat(),
         "duration_seconds": round(elapsed_seconds, 2),
         "model": llm_meta.get("model", ""),
@@ -1338,12 +1420,16 @@ def _write_run_report(
         "tool_calls": llm_meta.get("tool_calls", []),
     }
 
-    # run.json — machine-readable, full fidelity
+    # run.json — machine-readable, path-safe, and globally byte-bounded.
     try:
+        encoded_payload = _encode_bounded_run_report(payload)
         (run_dir / "run.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoded_payload.decode("utf-8"),
             encoding="utf-8",
         )
+        # The markdown view is another serialized report surface; render the
+        # exact sanitized representation rather than the raw model payload.
+        payload = json.loads(encoded_payload)
     except Exception as e:
         logger.debug("Curator run.json write failed: %s", e)
 

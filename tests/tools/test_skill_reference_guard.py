@@ -1,4 +1,107 @@
-from tools.skill_reference_guard import summarize_protected_references
+from tools.skill_reference_guard import (
+    collect_protected_references,
+    migrate_profile_config_skill_refs,
+    skill_lifecycle_lock,
+    summarize_protected_references,
+)
+
+
+def test_skill_lifecycle_lock_blocks_concurrent_archive_window(tmp_path, monkeypatch):
+    """A managed target archive cannot pass the source's migration/archive window."""
+    import threading
+
+    monkeypatch.setattr("tools.skill_reference_guard.get_default_hermes_root", lambda: tmp_path)
+    source_holds_lock = threading.Event()
+    release_source = threading.Event()
+    target_entered = threading.Event()
+
+    def source_archive():
+        with skill_lifecycle_lock():
+            source_holds_lock.set()
+            release_source.wait(timeout=2)
+
+    def target_archive():
+        with skill_lifecycle_lock():
+            target_entered.set()
+
+    source = threading.Thread(target=source_archive)
+    target = threading.Thread(target=target_archive)
+    source.start()
+    assert source_holds_lock.wait(timeout=2)
+    target.start()
+    assert not target_entered.wait(timeout=0.1)
+    release_source.set()
+    source.join(timeout=2)
+    target.join(timeout=2)
+    assert target_entered.is_set()
+
+
+def test_collector_failure_keeps_safety_index_incomplete(monkeypatch):
+    """Unreadable stores must not be mistaken for an empty reference set."""
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_cron_references",
+        lambda: ([], "cron scan failed: OSError"),
+    )
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_kanban_references",
+        lambda: ([], None),
+    )
+    monkeypatch.setattr(
+        "tools.skill_reference_guard._collect_profile_default_references",
+        lambda: ([], None),
+    )
+
+    result = collect_protected_references()
+
+    assert result["complete"] is False
+    assert result["collector_errors"] == {"cron": "cron scan failed: OSError"}
+
+
+def test_configured_missing_external_root_fails_closed(tmp_path, monkeypatch):
+    """Configured roots are inventory obligations, not optional empty scans."""
+    import yaml
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text(
+        yaml.safe_dump({"skills": {"external_dirs": ["gone"]}}), encoding="utf-8"
+    )
+    monkeypatch.setattr("tools.skill_reference_guard.get_default_hermes_root", lambda: root)
+
+    result = collect_protected_references()
+
+    assert result["complete"] is False
+    assert "external_roots" in result["collector_errors"]
+
+
+def test_external_root_skill_discovery_includes_configured_root(tmp_path, monkeypatch):
+    """A healthy configured root contributes real profile-local references."""
+    import yaml
+
+    root = tmp_path / ".hermes"
+    external = root / "external"
+    (external / "target" / "nested-skill").mkdir(parents=True)
+    (external / "target" / "nested-skill" / "SKILL.md").write_text(
+        "---\nname: external-skill\ndescription: x\n---\n# x\n", encoding="utf-8"
+    )
+    (root / "config.yaml").write_text(
+        yaml.safe_dump({"skills": {"external_dirs": ["external"]}}), encoding="utf-8"
+    )
+    monkeypatch.setattr("tools.skill_reference_guard.get_default_hermes_root", lambda: root)
+
+    from tools.skill_reference_guard import skill_exists_in_home
+
+    assert skill_exists_in_home("external-skill", root)
+    assert collect_protected_references()["complete"] is True
+
+
+def test_bounded_summary_preserves_scan_completeness():
+    result = summarize_protected_references(
+        {"by_name": {}, "complete": False, "collector_errors": {"kanban": "locked"}}
+    )
+
+    assert result["complete"] is False
+    assert result["collector_errors"] == {"kanban": "locked"}
 
 
 def test_protected_reference_summary_is_bounded_and_aggregated():
@@ -58,3 +161,25 @@ def test_protected_reference_summary_has_global_name_cap():
     assert len(result["summary_by_name"]) == 25
     assert result["protected_names_truncated"] is True
     assert result["names_omitted"] == 75
+
+
+def test_profile_config_migration_rewrites_every_profile_once(tmp_path, monkeypatch):
+    """Consolidation rewrites default and profile config skill defaults."""
+    import yaml
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    for home in (root, profile):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"default": ["old", "keep", "old"]}}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr("tools.skill_reference_guard.get_default_hermes_root", lambda: root)
+
+    result = migrate_profile_config_skill_refs("old", "new")
+
+    assert result["profiles_updated"] == 2
+    for home in (root, profile):
+        config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        assert config["skills"]["default"] == ["new", "keep"]

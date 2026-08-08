@@ -1079,6 +1079,14 @@ def _archive_skill_dir(skill_dir: Path, name: str) -> Tuple[bool, str]:
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+    """Archive a skill while holding the cross-store lifecycle lock."""
+    from tools.skill_reference_guard import skill_lifecycle_lock
+
+    with skill_lifecycle_lock():
+        return _delete_skill_locked(name, absorbed_into)
+
+
+def _delete_skill_locked(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
     """Archive a skill recoverably.
 
     ``absorbed_into`` declares intent:
@@ -1103,30 +1111,6 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     fail_closed = _curator_consolidation_delete_guard(name, absorbed_into)
     if fail_closed:
         return fail_closed
-
-    try:
-        from tools.skill_reference_guard import collect_protected_references
-
-        protected = collect_protected_references()
-        if name in set(protected.get("protected_names") or []):
-            refs = protected.get("by_name", {}).get(name, [])
-            sources = sorted(
-                {
-                    str(ref.get("source") or "unknown")
-                    for ref in refs
-                    if isinstance(ref, dict)
-                }
-            )
-            return {
-                "success": False,
-                "error": (
-                    f"Skill '{name}' is protected by live references "
-                    f"({', '.join(sources) or 'runtime ABI'}) and cannot be "
-                    "archived or deleted until those references are migrated."
-                ),
-            }
-    except Exception:
-        logger.debug("protected skill lookup failed for %s", name, exc_info=True)
 
     pinned_err = _pinned_guard(name)
     if pinned_err:
@@ -1155,6 +1139,22 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                     f"Create or patch the umbrella skill first, then retry the delete."
                 ),
             }
+
+    # Correctness-critical migration is part of the delete saga, never report
+    # generation. It performs prepare → migrate → complete rescan; any error
+    # returns before archive so the source remains active for a retry.
+    try:
+        from tools.skill_reference_guard import prepare_skill_archive
+        saga = prepare_skill_archive(name, absorbed_into)
+    except Exception:
+        logger.exception("skill archive safety saga failed for %s", name)
+        return {
+            "success": False,
+            "error": f"Skill '{name}' cannot be archived because reference migration failed.",
+            "_fail_closed": True,
+        }
+    if not saga.get("success"):
+        return saga
 
     skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
