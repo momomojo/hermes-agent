@@ -73,6 +73,36 @@ def test_read_run_report_normalizes_historical_v1_fixture(curator_env, tmp_path)
     assert normalized["llm_final"] == "historic"
 
 
+def test_write_run_report_bounds_and_sanitizes_entire_serialized_payload(curator_env):
+    """Untrusted model diagnostics cannot turn curator telemetry into a path leak."""
+    curator = curator_env["curator"]
+    home = curator_env["home"]
+    huge = "x" * (curator.MAX_RUN_REPORT_BYTES * 2)
+
+    run_dir = curator._write_run_report(
+        started_at=datetime.now(timezone.utc),
+        elapsed_seconds=1.0,
+        auto_counts={"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0},
+        auto_summary="no changes",
+        before_report=[],
+        before_names=set(),
+        after_report=[],
+        llm_meta=_make_llm_meta(
+            final=huge + str(home / "private"),
+            error={"nested": [huge, Path("/tmp/secret")]},
+            tool_calls=[{"name": "tool", "arguments": {"path": str(home), "blob": huge}}],
+        ),
+    )
+
+    encoded = (run_dir / "run.json").read_bytes()
+    payload = json.loads(encoded)
+    assert len(encoded) <= curator.MAX_RUN_REPORT_BYTES
+    assert payload["schema_version"] == 2
+    assert payload["counts"]["tool_calls_total"] == 1
+    assert str(home) not in encoded.decode("utf-8")
+    assert "/tmp/secret" not in encoded.decode("utf-8")
+
+
 def test_reports_root_is_under_logs_not_skills(curator_env):
     """Reports live in logs/curator/, not skills/ — operational telemetry
     belongs with the logs, not with user-authored skill data."""

@@ -37,6 +37,75 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 
+# Curator reports are durable operational telemetry, not a raw model trace.
+# Keep their full encoded representation bounded so a pathological model reply
+# or nested tool payload cannot exhaust disk or leak profile-local paths.
+MAX_RUN_REPORT_BYTES = 64 * 1024
+_REPORT_PATH_RE = re.compile(r"(?<![\w.-])(?:~|/[\w.~+@%=-]+)(?:/[\w.~+@%=-]+)+")
+
+
+def _sanitize_report_value(value: Any, *, string_limit: int, list_limit: int, depth: int = 0) -> Any:
+    """Return JSON-safe, path-safe telemetry with deterministic local bounds."""
+    if depth >= 12:
+        return "<nested value omitted>"
+    if isinstance(value, Path):
+        return "<path>"
+    if isinstance(value, str):
+        clean = _REPORT_PATH_RE.sub("<path>", value)
+        if len(clean) > string_limit:
+            return clean[:string_limit] + "…<truncated>"
+        return clean
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        items = list(value.items())[:list_limit]
+        result = {
+            str(key)[:128]: _sanitize_report_value(
+                item, string_limit=string_limit, list_limit=list_limit, depth=depth + 1
+            )
+            for key, item in items
+        }
+        if len(value) > len(items):
+            result["_omitted_items"] = len(value) - len(items)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)[:list_limit]
+        result = [
+            _sanitize_report_value(
+                item, string_limit=string_limit, list_limit=list_limit, depth=depth + 1
+            )
+            for item in items
+        ]
+        if len(value) > len(items):
+            result.append({"_omitted_items": len(value) - len(items)})
+        return result
+    return _sanitize_report_value(repr(value), string_limit=string_limit, list_limit=list_limit, depth=depth + 1)
+
+
+def _encode_bounded_run_report(payload: Dict[str, Any]) -> bytes:
+    """Serialize a v2 report under a fixed ceiling without dropping its audit core."""
+    for string_limit, list_limit in ((4096, 100), (512, 25), (96, 5)):
+        candidate = _sanitize_report_value(
+            payload, string_limit=string_limit, list_limit=list_limit
+        )
+        candidate["report_truncated"] = string_limit < 4096 or list_limit < 100
+        encoded = (json.dumps(candidate, indent=2, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+        if len(encoded) <= MAX_RUN_REPORT_BYTES:
+            return encoded
+    # Preserve the fields operators use to audit outcomes even for adversarial
+    # input that remains huge after structural trimming.
+    minimal = {
+        key: _sanitize_report_value(payload.get(key), string_limit=96, list_limit=5)
+        for key in (
+            "schema_version", "started_at", "duration_seconds", "model", "provider",
+            "counts", "tool_call_counts", "protected_references", "blocked_mutations",
+        )
+    }
+    minimal["report_truncated"] = True
+    minimal["report_omission"] = "payload exceeded curator report size ceiling"
+    return (json.dumps(minimal, indent=2, ensure_ascii=False, default=repr) + "\n").encode("utf-8")
+
+
 def _strip_aux_credential(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -1351,12 +1420,16 @@ def _write_run_report(
         "tool_calls": llm_meta.get("tool_calls", []),
     }
 
-    # run.json — machine-readable, full fidelity
+    # run.json — machine-readable, path-safe, and globally byte-bounded.
     try:
+        encoded_payload = _encode_bounded_run_report(payload)
         (run_dir / "run.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoded_payload.decode("utf-8"),
             encoding="utf-8",
         )
+        # The markdown view is another serialized report surface; render the
+        # exact sanitized representation rather than the raw model payload.
+        payload = json.loads(encoded_payload)
     except Exception as e:
         logger.debug("Curator run.json write failed: %s", e)
 

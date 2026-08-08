@@ -1079,6 +1079,14 @@ def _archive_skill_dir(skill_dir: Path, name: str) -> Tuple[bool, str]:
 
 
 def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
+    """Archive a skill while holding the cross-store lifecycle lock."""
+    from tools.skill_reference_guard import skill_lifecycle_lock
+
+    with skill_lifecycle_lock():
+        return _delete_skill_locked(name, absorbed_into)
+
+
+def _delete_skill_locked(name: str, absorbed_into: Optional[str] = None) -> Dict[str, Any]:
     """Archive a skill recoverably.
 
     ``absorbed_into`` declares intent:

@@ -15,11 +15,44 @@ import logging
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Iterable, Optional
+import threading
+from typing import Any, Iterable, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses the in-process lock.
+    fcntl = None
+
+
+_lifecycle_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def skill_lifecycle_lock() -> Iterator[None]:
+    """Serialize a reference migration and its source archive across processes.
+
+    The lock deliberately spans validation, migration, final rescan, and the
+    later archive operation in ``skill_manager_tool``.  That prevents another
+    managed deletion from removing the consolidation target in the narrow gap
+    between a successful rescan and archiving the source.
+    """
+    root = get_default_hermes_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with _lifecycle_lock:
+        handle = (root / ".skill-lifecycle.lock").open("a+", encoding="utf-8")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
 
 RUNTIME_ABI_SKILLS = frozenset(
