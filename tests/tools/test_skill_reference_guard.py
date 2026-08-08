@@ -1,5 +1,6 @@
 from tools.skill_reference_guard import (
     collect_protected_references,
+    migrate_profile_config_skill_refs,
     summarize_protected_references,
 )
 
@@ -91,3 +92,25 @@ def test_protected_reference_summary_has_global_name_cap():
     assert len(result["summary_by_name"]) == 25
     assert result["protected_names_truncated"] is True
     assert result["names_omitted"] == 75
+
+
+def test_profile_config_migration_rewrites_every_profile_once(tmp_path, monkeypatch):
+    """Consolidation rewrites default and profile config skill defaults."""
+    import yaml
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    for home in (root, profile):
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"skills": {"default": ["old", "keep", "old"]}}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr("tools.skill_reference_guard.get_default_hermes_root", lambda: root)
+
+    result = migrate_profile_config_skill_refs("old", "new")
+
+    assert result["profiles_updated"] == 2
+    for home in (root, profile):
+        config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        assert config["skills"]["default"] == ["new", "keep"]

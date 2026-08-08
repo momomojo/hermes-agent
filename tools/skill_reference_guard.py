@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Iterable, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -567,6 +568,96 @@ def _replace_ordered(skills: list[str], old: str, new: str) -> list[str]:
     return out
 
 
+def _write_yaml_mapping_atomically(path: Path, payload: dict[str, Any]) -> None:
+    """Replace a profile config only after its complete YAML serializes."""
+    import yaml
+
+    encoded = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def migrate_profile_config_skill_refs(old: str, new: str) -> dict[str, Any]:
+    """Rewrite configured profile skill defaults without changing profile scope.
+
+    All configs are read and validated before any write. A later write failure
+    leaves the source skill active, and completed profile rewrites are
+    intentionally idempotent so a retry only repairs the remaining profiles.
+    """
+    homes, error = _profile_homes()
+    if error:
+        raise RuntimeError(error)
+    prepared: list[tuple[str, Path, dict[str, Any]]] = []
+    for profile, home in homes:
+        path = home / "config.yaml"
+        config, config_error = _read_yaml(path)
+        if config_error:
+            raise ValueError(f"profile {profile} config invalid: {config_error}")
+        skills_cfg = config.get("skills")
+        if skills_cfg is None:
+            continue
+        if not isinstance(skills_cfg, dict):
+            raise ValueError(f"profile {profile} skills config is not a mapping")
+        updated = dict(config)
+        updated_skills = dict(skills_cfg)
+        changed = False
+        for key in _PROFILE_DEFAULT_KEYS:
+            value = updated_skills.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                names = [value]
+            elif isinstance(value, (list, tuple)):
+                names = list(value)
+            else:
+                raise ValueError(f"profile {profile} skills.{key} is malformed")
+            before = normalize_skill_names(names)
+            replacement = _replace_ordered(before, old, new)
+            if replacement != before:
+                updated_skills[key] = replacement
+                changed = True
+        if changed:
+            updated["skills"] = updated_skills
+            prepared.append((profile, path, updated))
+
+    updates: list[dict[str, Any]] = []
+    for profile, path, updated in prepared:
+        _write_yaml_mapping_atomically(path, updated)
+        updates.append({"profile": profile, "config": path.name})
+    return {"profiles_updated": len(updates), "updates": updates}
+
+
+def _migrate_cron_skill_refs(old: str, new: str) -> dict[str, Any]:
+    """Migrate each profile cron store under that store's own jobs lock."""
+    from cron.jobs import rewrite_skill_refs, use_cron_store
+
+    homes, error = _profile_homes()
+    if error:
+        raise RuntimeError(error)
+    reports: list[dict[str, Any]] = []
+    for profile, home in homes:
+        jobs_path = home / "cron" / "jobs.json"
+        if not jobs_path.exists():
+            continue
+        with use_cron_store(home):
+            report = rewrite_skill_refs(consolidated={old: new}, pruned=[])
+        reports.append({"profile": profile, **report})
+    return {
+        "profiles": reports,
+        "jobs_updated": sum(int(report["jobs_updated"]) for report in reports),
+        "jobs_scanned": sum(int(report["jobs_scanned"]) for report in reports),
+    }
+
+
 def migrate_kanban_skill_refs(old: str, new: str) -> dict[str, Any]:
     """Atomically migrate non-terminal Kanban references and audit each row."""
     from hermes_cli import kanban_db
@@ -623,8 +714,8 @@ def prepare_skill_archive(name: str, absorbed_into: Optional[str]) -> dict[str, 
         if not skill_exists_in_home(target, profile_home(profile or None)):
             return {"success": False, "error": f"Target '{target}' is not active for affected profile '{profile or 'default'}'.", "_fail_closed": True}
     try:
-        from cron.jobs import rewrite_skill_refs
-        cron = rewrite_skill_refs(consolidated={source: target}, pruned=[])
+        configs = migrate_profile_config_skill_refs(source, target)
+        cron = _migrate_cron_skill_refs(source, target)
         kanban = migrate_kanban_skill_refs(source, target)
     except Exception as exc:
         logger.warning("skill archive migration failed for %s: %s", source, exc, exc_info=True)
@@ -632,5 +723,8 @@ def prepare_skill_archive(name: str, absorbed_into: Optional[str]) -> dict[str, 
     verified = collect_protected_references()
     if not verified.get("complete", False) or source in set(verified.get("protected_names") or []):
         return {"success": False, "error": "post-migration complete rescan still finds source references", "_fail_closed": True}
-    return {"success": True, "migration": {"cron": cron, "kanban": kanban}}
+    return {
+        "success": True,
+        "migration": {"configs": configs, "cron": cron, "kanban": kanban},
+    }
 
