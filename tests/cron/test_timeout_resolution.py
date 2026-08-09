@@ -13,6 +13,10 @@ def test_configured_timeout_defaults_when_missing_or_invalid():
     assert configured_cron_inactivity_timeout_seconds(
         {"cron": {"inactivity_timeout_seconds": "not-a-number"}}
     ) == DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS
+    for value in (True, False, float("nan"), float("inf"), float("-inf")):
+        assert configured_cron_inactivity_timeout_seconds(
+            {"cron": {"inactivity_timeout_seconds": value}}
+        ) == DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS
 
 
 def test_configured_timeout_accepts_bounded_and_unlimited_values():

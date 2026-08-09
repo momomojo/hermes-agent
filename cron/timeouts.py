@@ -23,6 +23,12 @@ DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS = 600.0
 
 
 def _coerce_timeout(value: Any, source: str) -> float | None:
+    # ``bool`` is a subclass of ``int`` in Python.  Accepting a YAML boolean
+    # here would silently turn ``true`` into a one-second timeout and
+    # ``false`` into the explicit unlimited sentinel.
+    if isinstance(value, bool):
+        logger.warning("Invalid %s=%r; using the next cron timeout source", source, value)
+        return None
     try:
         timeout = float(value)
     except (TypeError, ValueError):

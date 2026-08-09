@@ -84,7 +84,10 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(
+        _script_path: str, *, timeout_s: float | None = None
+    ) -> tuple[bool, str]:
+        assert timeout_s is not None
         assert heartbeat_seen.wait(timeout=2), (
             "claim was not refreshed while script blocked"
         )
@@ -146,7 +149,10 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         heartbeat_seen.set()
         return updated
 
-    def _blocking_script(_script_path: str) -> tuple[bool, str]:
+    def _blocking_script(
+        _script_path: str, *, timeout_s: float | None = None
+    ) -> tuple[bool, str]:
+        assert timeout_s is not None
         assert heartbeat_seen.wait(timeout=2)
         return True, "done"
 
