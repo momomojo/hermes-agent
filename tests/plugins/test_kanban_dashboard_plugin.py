@@ -1374,12 +1374,14 @@ def test_task_detail_includes_runs(client):
     import hermes_cli.kanban_db as _kb
     conn = _kb.connect()
     try:
-        _kb.claim_task(conn, tid)
+        claimed = _kb.claim_task(conn, tid)
+        assert claimed is not None
         _kb.complete_task(
             conn, tid,
             result="done",
             summary="tested on rate limiter",
             metadata={"changed_files": ["limiter.py"]},
+            expected_run_id=claimed.current_run_id,
         )
     finally:
         conn.close()
@@ -1406,15 +1408,10 @@ def test_task_detail_runs_empty_before_claim(client):
 def test_patch_status_done_with_summary_and_metadata(client):
     """PATCH /tasks/:id with status=done + summary + metadata must
     reach complete_task, so the dashboard has CLI parity."""
-    # Create + claim.
+    # An operator can complete a ready task.  The dashboard does not steal an
+    # active worker run; running-task recovery uses the audited admin CLI.
     r = client.post("/api/plugins/kanban/tasks", json={"title": "x", "assignee": "worker"})
     tid = r.json()["task"]["id"]
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
@@ -1438,15 +1435,9 @@ def test_patch_status_done_with_summary_and_metadata(client):
 
 
 def test_patch_status_done_without_summary_still_works(client):
-    """Back-compat: PATCH without the new fields still completes."""
+    """Back-compat: a ready task can still be completed without new fields."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "y", "assignee": "worker"})
     tid = r.json()["task"]["id"]
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "done", "result": "legacy shape"},
@@ -1459,6 +1450,32 @@ def test_patch_status_done_without_summary_still_works(client):
         assert run.summary == "legacy shape"  # falls back to result
     finally:
         conn.close()
+
+
+def test_patch_status_done_cannot_steal_running_worker_run(client):
+    """The dashboard has no worker token and must leave an active run alone."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "owned", "assignee": "worker"},
+    )
+    tid = r.json()["task"]["id"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "done", "summary": "operator attempt"},
+    )
+
+    assert r.status_code == 409
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == run_id
+        assert run is not None and run.ended_at is None
 
 
 def test_patch_status_archive_closes_running_run(client):
@@ -1495,9 +1512,15 @@ def test_event_dict_includes_run_id(client):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        kb.claim_task(conn, tid)
-        run_id = kb.latest_run(conn, tid).id
-        kb.complete_task(conn, tid, summary="wss")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        kb.complete_task(
+            conn,
+            tid,
+            summary="wss",
+            expected_run_id=claimed.current_run_id,
+        )
     finally:
         conn.close()
 
@@ -2450,8 +2473,14 @@ def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     """Summary-only completions remain available to the drawer fallback."""
     conn = kb.connect()
     task_id = kb.create_task(conn, title="Task with only run summary")
-    kb.claim_task(conn, task_id)
-    kb.complete_task(conn, task_id, summary="Report written to /output/report.md")
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    kb.complete_task(
+        conn,
+        task_id,
+        summary="Report written to /output/report.md",
+        expected_run_id=claimed.current_run_id,
+    )
     conn.close()
 
     r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
@@ -2478,8 +2507,14 @@ def test_board_tasks_include_latest_summary(client):
     """Board cards already expose the summary used by the drawer fallback."""
     conn = kb.connect()
     task_id = kb.create_task(conn, title="Board card with summary only")
-    kb.claim_task(conn, task_id)
-    kb.complete_task(conn, task_id, summary="Done: see attachment")
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    kb.complete_task(
+        conn,
+        task_id,
+        summary="Done: see attachment",
+        expected_run_id=claimed.current_run_id,
+    )
     conn.close()
 
     r = client.get("/api/plugins/kanban/board")

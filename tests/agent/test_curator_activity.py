@@ -54,3 +54,28 @@ def test_recent_view_activity_prevents_false_stale_transition(curator_modules, m
 
     assert counts["marked_stale"] == 0
     assert skill_usage.get_record("recently-viewed")["state"] == "active"
+
+
+def test_reference_inventory_failure_skips_all_transitions(curator_modules, monkeypatch):
+    home, skill_usage, curator = curator_modules
+    skills_dir = home / "skills"
+    _write_skill(skills_dir, "must-not-archive-blindly")
+    now = datetime(2026, 4, 30, tzinfo=timezone.utc)
+    skill_usage.save_usage(
+        {
+            "must-not-archive-blindly": {
+                "created_at": (now - timedelta(days=365)).isoformat(),
+                "state": "stale",
+            }
+        }
+    )
+    monkeypatch.setattr(curator, "get_archive_after_days", lambda: 90)
+
+    import tools.skill_reference_guard as guard
+
+    monkeypatch.setattr(guard, "collect_protected_references", lambda: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    counts = curator.apply_automatic_transitions(now=now)
+
+    assert counts["protection_scan_failed"] == 1
+    assert counts["archived"] == 0
+    assert skill_usage.get_record("must-not-archive-blindly")["state"] == "stale"

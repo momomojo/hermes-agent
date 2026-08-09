@@ -628,14 +628,23 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+            run_id = _worker_run_id(tid)
+            if task and task.status == "running" and run_id is None:
+                return tool_error(
+                    f"cannot complete running task {tid} without its current "
+                    "dispatcher run token. This process is not the owner of "
+                    "that run (or HERMES_KANBAN_RUN_ID is missing/invalid). "
+                    "Do not retry against a different task; leave operator "
+                    "recovery to the audited local CLI path."
+                )
             try:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=run_id,
                     completion_source=(
-                        "worker" if _worker_run_id(tid) is not None else "manual"
+                        "worker" if run_id is not None else "manual"
                     ),
                     completed_by=os.environ.get("HERMES_PROFILE") or "worker",
                     worker_session_id=os.environ.get("HERMES_SESSION_ID"),

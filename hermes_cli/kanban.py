@@ -550,6 +550,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--force-running",
+        action="store_true",
+        help=(
+            "Administrative recovery only: complete an in-flight task without "
+            "its current run token. Requires exactly one task and --reason; "
+            "the override is written to the task audit log."
+        ),
+    )
+    p_complete.add_argument(
+        "--reason",
+        default=None,
+        help="Required audit reason when --force-running is used.",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -879,7 +893,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect retained scratch workspaces, old events, and old logs",
+    )
+    p_gc.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List eligible workspaces without deleting workspaces, events, or logs",
+    )
+    p_gc.add_argument(
+        "--terminal-workspace-retention-days",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help=(
+            "Also remove managed scratch workspaces for done tasks completed "
+            "at least DAYS ago (disabled unless explicitly set)"
+        ),
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
@@ -1980,6 +2009,28 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    force_running = bool(getattr(args, "force_running", False))
+    override_reason = (getattr(args, "reason", None) or "").strip()
+    if force_running:
+        if len(ids) != 1:
+            print(
+                "kanban: --force-running requires exactly one task_id",
+                file=sys.stderr,
+            )
+            return 2
+        if not override_reason:
+            print(
+                "kanban: --force-running requires a non-empty --reason",
+                file=sys.stderr,
+            )
+            return 2
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            print(
+                "kanban: --force-running is an interactive operator recovery "
+                "path and is unavailable inside a Kanban worker",
+                file=sys.stderr,
+            )
+            return 2
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
@@ -2047,20 +2098,46 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-                completion_source=(
-                    "worker" if _worker_run_id_for(tid) is not None else "manual"
-                ),
-                completed_by=_profile_author(),
-                worker_session_id=os.environ.get("HERMES_SESSION_ID"),
-            ):
+            run_id = _worker_run_id_for(tid)
+            if force_running:
+                ok = kb.admin_complete_running_task(
+                    conn,
+                    tid,
+                    actor=_profile_author(),
+                    reason=override_reason,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    worker_session_id=os.environ.get("HERMES_SESSION_ID"),
+                )
+            else:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=run_id,
+                    completion_source=("worker" if run_id is not None else "manual"),
+                    completed_by=_profile_author(),
+                    worker_session_id=os.environ.get("HERMES_SESSION_ID"),
+                )
+            if not ok:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                current = kb.get_task(conn, tid)
+                if current and current.status == "running" and run_id is None:
+                    print(
+                        f"cannot complete {tid}: task is running and requires "
+                        "its current run token; an operator may use "
+                        "--force-running --reason <audit reason> after verifying "
+                        "the worker result",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"cannot complete {tid} (unknown id, stale run token, "
+                        "or terminal state)",
+                        file=sys.stderr,
+                    )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2324,6 +2401,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(json.dumps({
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
+            "protocol_violations": res.protocol_violations,
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
@@ -2346,6 +2424,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Protocol:     {len(res.protocol_violations)}")
+    if res.protocol_violations:
+        print(f"  {', '.join(res.protocol_violations)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
@@ -2509,13 +2590,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if not verbose:
             return
         did_work = (
-            res.reclaimed or res.crashed or res.timed_out or res.promoted
+            res.reclaimed or res.crashed or res.protocol_violations
+            or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] "
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
+                f"protocol_violations={len(res.protocol_violations)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
@@ -2893,34 +2976,198 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
-    import shutil
-    scratch_root = kb.workspaces_root()
-    removed_ws = 0
-    with kb.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
-        ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+    """Remove eligible managed scratch workspaces and bounded telemetry.
 
+    Archived scratch workspaces retain the historical immediate-GC contract.
+    Done workspaces are opt-in and age-gated.  A candidate path is refused when
+    any task mapping that it would remove is not independently eligible, or
+    when it belongs to a terminal parent with an active child.  Unlike
+    completion's best-effort cleanup, this operator surface reports deletion
+    failures and exits non-zero instead of claiming success.
+    """
+    import shutil
+    import stat
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    terminal_days = getattr(args, "terminal_workspace_retention_days", None)
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
+    for label, value in (
+        ("terminal workspace retention", terminal_days),
+        ("event retention", event_days),
+        ("log retention", log_days),
+    ):
+        if value is not None and value < 0:
+            raise ValueError(f"{label} days must be non-negative")
+
+    scratch_root = kb.workspaces_root()
+    now = int(time.time())
+    terminal_cutoff = (
+        now - terminal_days * 24 * 3600 if terminal_days is not None else None
+    )
+    removed_ws = 0
+    failed_ws = 0
+    skipped_ws = 0
+    with kb.connect_closing() as conn:
+        all_rows = conn.execute(
+            "SELECT id, status, created_at, completed_at, workspace_kind, "
+            "workspace_path, current_run_id, claim_lock, worker_pid, "
+            "EXISTS (SELECT 1 FROM task_runs r "
+            "        WHERE r.task_id = tasks.id AND r.status = 'running') "
+            "AS has_running_run FROM tasks "
+            "ORDER BY COALESCE(completed_at, created_at), id"
+        ).fetchall()
+        active_parent_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT l.parent_id FROM task_links l "
+                "JOIN tasks t ON t.id = l.child_id "
+                "WHERE t.status NOT IN ('done', 'archived', 'failed', 'cancelled')"
+            ).fetchall()
+        }
+
+    def _resolved_workspace(row: Any) -> Optional[Path]:
+        raw_path = row["workspace_path"]
+        if raw_path:
+            candidate = Path(raw_path).expanduser()
+        elif str(row["workspace_kind"]) == "scratch":
+            candidate = scratch_root / str(row["id"])
+        else:
+            return None
+        try:
+            return candidate.resolve(strict=False)
+        except OSError:
+            return None
+
+    def _row_is_gc_eligible(row: Any) -> bool:
+        if str(row["workspace_kind"]) != "scratch":
+            return False
+        if (
+            row["current_run_id"] is not None
+            or row["claim_lock"] is not None
+            or row["worker_pid"] is not None
+            or bool(row["has_running_run"])
+        ):
+            return False
+        status = str(row["status"])
+        if status == "archived":
+            return True
+        terminal_at = row["completed_at"] or row["created_at"]
+        return (
+            status == "done"
+            and terminal_cutoff is not None
+            and int(terminal_at) <= terminal_cutoff
+        )
+
+    rows = [row for row in all_rows if _row_is_gc_eligible(row)]
+    protected_paths = [
+        path
+        for row in all_rows
+        if not _row_is_gc_eligible(row)
+        and (path := _resolved_workspace(row)) is not None
+    ]
+    active_scratch_paths = [
+        path
+        for row in all_rows
+        if str(row["workspace_kind"]) == "scratch"
+        and str(row["status"])
+        not in ("done", "archived", "failed", "cancelled")
+        and (path := _resolved_workspace(row)) is not None
+    ]
+    active_parent_paths = [
+        path
+        for row in all_rows
+        if str(row["id"]) in active_parent_ids
+        and (path := _resolved_workspace(row)) is not None
+    ]
+
+    def _paths_overlap(left: Path, right: Path) -> bool:
+        return (
+            left == right
+            or left.is_relative_to(right)
+            or right.is_relative_to(left)
+        )
+
+    def _candidate_would_remove(candidate: Path, mapped: Path) -> bool:
+        """Return whether deleting candidate would remove a mapped path.
+
+        A task mapped to an ancestor (for example a project root containing
+        the managed scratch root) is not itself removed when one scratch
+        child is collected.  Active scratch mappings retain the stricter
+        symmetric overlap rule below so an in-flight shared tree is never
+        disturbed.
+        """
+        return candidate == mapped or mapped.is_relative_to(candidate)
+
+    candidates: dict[Path, list[tuple[str, str]]] = {}
+    for row in rows:
+        task_id = str(row["id"])
+        path = _resolved_workspace(row)
+        if path is None or not kb._is_managed_scratch_path(path):
+            skipped_ws += 1
+            continue
+        if any(
+            _candidate_would_remove(path, protected)
+            for protected in protected_paths
+        ):
+            skipped_ws += 1
+            continue
+        if any(_paths_overlap(path, active) for active in active_scratch_paths):
+            skipped_ws += 1
+            continue
+        if any(
+            _candidate_would_remove(path, parent)
+            for parent in active_parent_paths
+        ):
+            skipped_ws += 1
+            continue
+        try:
+            if path.is_symlink() or not path.is_dir():
+                continue
+        except OSError:
+            skipped_ws += 1
+            continue
+        candidates.setdefault(path, []).append((task_id, str(row["status"])))
+
+    if dry_run:
+        for path, tasks in candidates.items():
+            task_text = ",".join(f"{task_id}:{status}" for task_id, status in tasks)
+            print(f"would remove workspace {path} ({task_text})")
+        print(
+            f"GC dry run: {len(candidates)} workspace(s) eligible, "
+            f"{skipped_ws} unsafe/active workspace(s) skipped; "
+            "event and log deletion not run"
+        )
+        return 0
+
+    def _make_managed_tree_removable(path: Path) -> None:
+        """Grant the owner directory permissions needed by ``rmtree``.
+
+        Review copies created with ``cp -R`` can preserve 0555 Git object/tree
+        directories. Files do not need write permission to be unlinked, but
+        their parent directories do. Candidates have already passed the
+        managed-scratch containment and active-mapping guards above; do not
+        follow directory symlinks while preparing the exact candidate tree.
+        """
+        for directory, _, _ in os.walk(path, topdown=True, followlinks=False):
+            directory_path = Path(directory)
+            mode = directory_path.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode) and mode & (stat.S_IWUSR | stat.S_IXUSR) != (
+                stat.S_IWUSR | stat.S_IXUSR
+            ):
+                directory_path.chmod(mode | stat.S_IWUSR | stat.S_IXUSR)
+
+    for path in candidates:
+        try:
+            _make_managed_tree_removable(path)
+            shutil.rmtree(path)
+            if path.exists():
+                raise OSError("path still exists after recursive removal")
+            removed_ws += 1
+        except OSError as exc:
+            failed_ws += 1
+            print(f"kanban: could not remove workspace {path}: {exc}", file=sys.stderr)
+
     with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
@@ -2928,9 +3175,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
-    return 0
+    print(
+        f"GC complete: {removed_ws} workspace(s), {failed_ws} workspace failure(s), "
+        f"{skipped_ws} unsafe/active workspace(s) skipped, "
+        f"{removed_events} event row(s), {removed_logs} log file(s) removed"
+    )
+    return 1 if failed_ws else 0
 
 
 # ---------------------------------------------------------------------------

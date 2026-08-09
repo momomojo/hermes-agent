@@ -17,6 +17,16 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _complete_as_current_run(conn, task_id, **kwargs):
+    """Mirror the dispatcher worker's current-run completion token in tests."""
+    if "expected_run_id" not in kwargs:
+        task = kb.get_task(conn, task_id)
+        if task is not None and task.status == "running":
+            assert task.current_run_id is not None
+            kwargs["expected_run_id"] = task.current_run_id
+    return kb.complete_task(conn, task_id, **kwargs)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -227,7 +237,7 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         p = kb.create_task(conn, title="parent")
         c = kb.create_task(conn, title="child", parents=[p])
         assert kb.get_task(conn, c).status == "todo"
-        kb.complete_task(conn, p, result="ok")
+        _complete_as_current_run(conn, p, result="ok")
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -286,7 +296,7 @@ def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
 def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
-        kb.complete_task(conn, a)
+        _complete_as_current_run(conn, a)
         b = kb.create_task(conn, title="b")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
@@ -318,9 +328,9 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         c = kb.create_task(conn, title="c", parents=[b])
         assert [kb.get_task(conn, x).status for x in (a, b, c)] == \
                ["ready", "todo", "todo"]
-        kb.complete_task(conn, a)
+        _complete_as_current_run(conn, a)
         assert kb.get_task(conn, b).status == "ready"
-        kb.complete_task(conn, b)
+        _complete_as_current_run(conn, b)
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -334,7 +344,7 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         # Complete the parent
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        _complete_as_current_run(conn, parent, result="ok")
         # Manually block the child with zero failures (simulates a
         # dependency block, not a circuit-breaker block).
         conn.execute(
@@ -358,9 +368,9 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         c = kb.create_task(conn, title="c", parents=[a, b])
-        kb.complete_task(conn, a)
+        _complete_as_current_run(conn, a)
         assert kb.get_task(conn, c).status == "todo"
-        kb.complete_task(conn, b)
+        _complete_as_current_run(conn, b)
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -419,7 +429,7 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "todo"
 
-        kb.complete_task(conn, parent)
+        _complete_as_current_run(conn, parent)
         assert kb.schedule_task(conn, child, reason="second timer") is True
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "ready"
@@ -1163,7 +1173,7 @@ def test_concurrent_claims_only_one_wins(kanban_home):
 def test_complete_records_result(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
-        assert kb.complete_task(conn, t, result="done and dusted")
+        assert _complete_as_current_run(conn, t, result="done and dusted")
         task = kb.get_task(conn, t)
     assert task.status == "done"
     assert task.result == "done and dusted"
@@ -1214,7 +1224,7 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
                                parents=[parent])
         # Complete the parent so the child's dependencies are satisfied.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, summary="done")
+        _complete_as_current_run(conn, parent, summary="done")
 
         # Simulate the child having exhausted its budget twice,
         # hitting the default failure limit (2).
@@ -1394,7 +1404,7 @@ def test_claim_succeeds_once_parents_done(kanban_home):
             conn, title="child", assignee="a", parents=[parent],
         )
         kb.claim_task(conn, parent)
-        assert kb.complete_task(conn, parent, result="ok")
+        assert _complete_as_current_run(conn, parent, result="ok")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
         claimed = kb.claim_task(conn, child, claimer="host:1")
@@ -1418,7 +1428,7 @@ def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
         # Complete parent; complete_task internally runs recompute_ready,
         # which promotes the child to 'ready'.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        _complete_as_current_run(conn, parent, result="ok")
         assert kb.get_task(conn, child).status == "ready"
 
 
@@ -1444,7 +1454,7 @@ def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
         assert kb.get_task(conn, child).status == "todo"
         # After parent completes + recompute, the child is ready.
         kb.claim_task(conn, parent)
-        kb.complete_task(conn, parent, result="ok")
+        _complete_as_current_run(conn, parent, result="ok")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
 
@@ -1493,7 +1503,7 @@ def test_list_tasks_assignee_filter_case_insensitive(kanban_home):
 def test_archive_hides_from_default_list(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
-        kb.complete_task(conn, t)
+        _complete_as_current_run(conn, t)
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
@@ -1505,7 +1515,7 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid, result="done")
+        _complete_as_current_run(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
         conn.execute(
             "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
@@ -1616,7 +1626,7 @@ def test_events_capture_lifecycle(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         kb.claim_task(conn, t)
-        kb.complete_task(conn, t, result="ok")
+        _complete_as_current_run(conn, t, result="ok")
         events = kb.list_events(conn, t)
     kinds = [e.kind for e in events]
     assert "created" in kinds
@@ -1627,7 +1637,7 @@ def test_events_capture_lifecycle(kanban_home):
 def test_worker_context_includes_parent_results_and_comments(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="p")
-        kb.complete_task(conn, p, result="PARENT_RESULT_MARKER")
+        _complete_as_current_run(conn, p, result="PARENT_RESULT_MARKER")
         c = kb.create_task(conn, title="child", parents=[p])
         kb.add_comment(conn, c, "user", "CLARIFICATION_MARKER")
         ctx = kb.build_worker_context(conn, c)
@@ -1719,7 +1729,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         p = kb.create_task(conn, title="p", assignee="alice")
         c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
         # Finish parent outside dispatch; promotion happens inside.
-        kb.complete_task(conn, p)
+        _complete_as_current_run(conn, p)
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
     # Spawned c (a was already done when dispatch was called).
     assert len(spawns) == 1
@@ -2359,7 +2369,7 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
         assert ws.is_dir()
-        kb.complete_task(conn, t, result="ok")
+        _complete_as_current_run(conn, t, result="ok")
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
@@ -2373,7 +2383,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
         artifact = ws / "chart.png"
         artifact.write_bytes(b"png-bytes")
 
-        assert kb.complete_task(
+        assert _complete_as_current_run(
             conn,
             t,
             result="ok",
@@ -2409,7 +2419,7 @@ def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
         missing = ws / "report.md"
 
         with pytest.raises(kb.ArtifactPreservationError, match="unavailable"):
-            kb.complete_task(
+            _complete_as_current_run(
                 conn,
                 t,
                 result="report complete",
@@ -2431,7 +2441,7 @@ def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
         report = ws / "report.md"
         report.write_text("legacy deliverable", encoding="utf-8")
 
-        assert kb.complete_task(
+        assert _complete_as_current_run(
             conn,
             t,
             summary=f"Task complete — delivered {report}",
@@ -2458,7 +2468,7 @@ def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
 
-        assert kb.complete_task(
+        assert _complete_as_current_run(
             conn,
             t,
             result="ok",
@@ -2489,7 +2499,7 @@ def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):
         first.write_text("first", encoding="utf-8")
         second.write_text("second", encoding="utf-8")
 
-        assert kb.complete_task(
+        assert _complete_as_current_run(
             conn,
             t,
             result="ok",
@@ -2517,7 +2527,7 @@ def test_complete_task_persists_board_scratch_artifacts_to_board_attachments(kan
         artifact = ws / "chart.png"
         artifact.write_bytes(b"board-png")
 
-        assert kb.complete_task(
+        assert _complete_as_current_run(
             conn,
             t,
             result="ok",
@@ -2556,7 +2566,7 @@ def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_pa
             ("scratch", str(real_source), t),
         )
         conn.commit()
-        kb.complete_task(conn, t, result="ok")
+        _complete_as_current_run(conn, t, result="ok")
 
     assert real_source.exists(), "User source tree must not be deleted by scratch cleanup"
     assert (real_source / ".git").exists()
@@ -2588,7 +2598,7 @@ def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeyp
             ("scratch", str(scratch_dir), t),
         )
         conn.commit()
-        kb.complete_task(conn, t, result="ok")
+        _complete_as_current_run(conn, t, result="ok")
 
     assert not scratch_dir.exists(), "Override-root scratch dir should be cleaned up"
 
@@ -2613,7 +2623,7 @@ def test_cleanup_workspace_deferred_while_child_active(kanban_home):
         kb.set_workspace_path(conn, parent, parent_ws)
         assert parent_ws.is_dir()
         # Parent completes; child is still 'todo' -> cleanup must be deferred.
-        kb.complete_task(conn, parent, result="handoff written")
+        _complete_as_current_run(conn, parent, result="handoff written")
 
     assert parent_ws.exists(), (
         "Parent scratch workspace must survive while a linked child is active"
@@ -2634,12 +2644,12 @@ def test_cleanup_workspace_swept_after_last_child_completes(kanban_home):
         child_ws = kb.resolve_workspace(c_task)
         kb.set_workspace_path(conn, child, child_ws)
 
-        kb.complete_task(conn, parent, result="ok")
+        _complete_as_current_run(conn, parent, result="ok")
         assert parent_ws.exists(), "deferred while child active"
 
         # Child completes -> recompute promotes nothing new; the child's
         # cleanup sweep should now reap the parent's deferred workspace.
-        kb.complete_task(conn, child, result="done")
+        _complete_as_current_run(conn, child, result="done")
 
     assert not parent_ws.exists(), (
         "Parent scratch workspace should be swept once all children are terminal"
@@ -2667,10 +2677,10 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         parent_ws = kb.resolve_workspace(p_task)
         kb.set_workspace_path(conn, parent, parent_ws)
 
-        kb.complete_task(conn, parent, result="handoff")
+        _complete_as_current_run(conn, parent, result="handoff")
         assert parent_ws.exists(), "deferred while dir child active"
 
-        kb.complete_task(conn, child, result="built")
+        _complete_as_current_run(conn, child, result="built")
 
     assert not parent_ws.exists(), (
         "A 'dir' child completing must trigger the parent scratch sweep"
@@ -2782,7 +2792,7 @@ def test_list_runs_state_filter_requires_pair_and_valid_type(kanban_home):
 def test_list_runs_filters_by_outcome_value(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="alice")
-        kb.complete_task(conn, tid, summary="ok")
+        _complete_as_current_run(conn, tid, summary="ok")
         matching = kb.list_runs(conn, tid, state_type="outcome", state_name="completed")
         empty = kb.list_runs(conn, tid, state_type="outcome", state_name="blocked")
     assert matching
@@ -3164,7 +3174,7 @@ def test_latest_summary_returns_summary_after_complete(kanban_home):
     handoff = "shipped 3 files, ran tests, opened PR #42"
     with kb.connect() as conn:
         t = kb.create_task(conn, title="work", assignee="alice")
-        kb.complete_task(conn, t, summary=handoff)
+        _complete_as_current_run(conn, t, summary=handoff)
         assert kb.latest_summary(conn, t) == handoff
 
 
@@ -3175,7 +3185,7 @@ def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
     summary surfaces."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="retry", assignee="alice")
-        kb.complete_task(conn, t, summary="first attempt")
+        _complete_as_current_run(conn, t, summary="first attempt")
         # Move back to ready by direct SQL — block_task / unblock_task
         # paths require an active claim, but we just want a second run
         # row to exist with a later ended_at.
@@ -3186,7 +3196,7 @@ def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
         # Sleep 1s so the second run's ended_at is provably later than
         # the first (complete_task uses int(time.time())).
         time.sleep(1.05)
-        kb.complete_task(conn, t, summary="second attempt — final")
+        _complete_as_current_run(conn, t, summary="second attempt — final")
         assert kb.latest_summary(conn, t) == "second attempt — final"
 
 
@@ -3195,7 +3205,7 @@ def test_latest_summary_skips_empty_string(kanban_home):
     populated one — empty strings carry no information."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="t", assignee="alice")
-        kb.complete_task(conn, t, summary="real handoff")
+        _complete_as_current_run(conn, t, summary="real handoff")
         # Inject a later run with empty summary directly. Workers
         # writing "" instead of None is a real shape we want to ignore.
         conn.execute(
@@ -3215,8 +3225,8 @@ def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
         t1 = kb.create_task(conn, title="a", assignee="alice")
         t2 = kb.create_task(conn, title="b", assignee="bob")
         t3 = kb.create_task(conn, title="c", assignee="carol")
-        kb.complete_task(conn, t1, summary="alpha")
-        kb.complete_task(conn, t3, summary="charlie")
+        _complete_as_current_run(conn, t1, summary="alpha")
+        _complete_as_current_run(conn, t3, summary="charlie")
         out = kb.latest_summaries(conn, [t1, t2, t3])
         assert out == {t1: "alpha", t3: "charlie"}
         # Empty input → empty dict, no SQL syntax error from "IN ()".
@@ -3302,7 +3312,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kb.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
-        kb.complete_task(conn, a)
+        _complete_as_current_run(conn, a)
 
         # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
@@ -4657,11 +4667,15 @@ def test_write_txn_preserves_original_exception_when_rollback_fails(kanban_home)
         f"write_txn surfaced the rollback failure instead of the original "
         f"OperationalError; got {msg!r}"
     )
+
+
 def test_write_txn_healthy_commit_no_exception(tmp_path):
     """Normal commit does not trigger the torn-extend check."""
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     # Should not raise
     with write_txn(conn) as c:
         c.execute(
@@ -4678,6 +4692,8 @@ def test_write_txn_raises_on_truncated_file(tmp_path):
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     # Get actual page size so we can fake a smaller file
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     original_getsize = os.path.getsize
@@ -4732,32 +4748,21 @@ def test_connect_sets_wal_autocheckpoint_100(tmp_path):
     conn.close()
 
 
-def test_write_txn_check_reads_correct_header_fields(tmp_path):
-    """Synthetic DB file with mismatched header page_count triggers the check."""
-    import struct
+def test_write_txn_check_does_not_open_live_database_file(tmp_path):
+    """The invariant probe uses SQLite PRAGMAs, not a second raw descriptor."""
     from hermes_cli.kanban_db import connect, _check_file_length_invariant
     db = tmp_path / "synthetic.db"
     conn = connect(db_path=db)
-    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    conn.close()
-    # Now corrupt the file: claim N pages but truncate to N-1 pages
-    with open(db, "rb") as f:
-        data = bytearray(f.read())
-    # Read current page_count from header bytes 28-31
-    real_page_count = struct.unpack(">I", data[28:32])[0]
-    if real_page_count < 2:
-        # Need at least 2 pages to fake a truncation
-        pytest.skip("DB too small for synthetic truncation test")
-    # Truncate to N-1 pages
-    truncated = bytes(data[: (real_page_count - 1) * page_size])
-    with open(db, "wb") as f:
-        f.write(truncated)
-    # Now open and check — should raise
-    # We can't use connect() because _validate_sqlite_header may block; use a raw connection
-    raw_conn = sqlite3.connect(str(db), isolation_level=None)
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        _check_file_length_invariant(raw_conn)
-    raw_conn.close()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        with unittest.mock.patch(
+            "builtins.open",
+            side_effect=AssertionError("raw database open is forbidden"),
+        ):
+            _check_file_length_invariant(conn)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

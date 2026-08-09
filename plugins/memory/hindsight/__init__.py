@@ -34,6 +34,7 @@ import re
 
 import asyncio
 import atexit
+import hashlib
 import importlib
 import json
 import logging
@@ -41,6 +42,7 @@ import os
 import queue
 import sys
 import threading
+import time
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -554,7 +556,13 @@ def _load_create_bank_request():
     retried here.
     """
     last_error: Exception | None = None
-    for attempt in range(4):
+    # A cold import of the generated client can hold its package import lock
+    # for several hundred milliseconds while Pydantic models are built.  Four
+    # 10ms-scale retries proved too short under parallel startup and produced
+    # an intermittent false "client unavailable" fallback.  Keep the retry
+    # bounded below one second, but long enough for that legitimate cold path.
+    attempts = 7
+    for attempt in range(attempts):
         try:
             from hindsight_client_api.models.create_bank_request import (
                 CreateBankRequest,
@@ -565,8 +573,8 @@ def _load_create_bank_request():
             if not isinstance(exc, ImportError) and exc.__class__.__name__ != "_DeadlockError":
                 raise
             last_error = exc
-            if attempt < 3:
-                threading.Event().wait(0.01 * (attempt + 1))
+            if attempt < attempts - 1:
+                threading.Event().wait(min(0.02 * (2 ** attempt), 0.25))
     raise ImportError("Hindsight request model is unavailable") from last_error
 
 
@@ -635,6 +643,21 @@ def _model_to_dict(value: Any) -> dict[str, Any] | None:
 def _extract_recall_scores(result: Any) -> dict[str, Any] | None:
     """Return a serializable per-result scores object if Hindsight returned one."""
     return _model_to_dict(getattr(result, "scores", None))
+
+
+def _private_jsonl_append(path: Any, record: dict[str, Any]) -> None:
+    """Append one content-free telemetry record with private permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _format_recall_result_line(index: int, result: Any, *, include_scores: bool = False) -> str:
@@ -2014,6 +2037,73 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _recall_profile(self) -> str:
+        if self._agent_identity:
+            return self._agent_identity
+        return {
+            "hermes-owner": "default",
+            "hermes-coding": "codex-coding",
+            "hermes-home-assistant": "home-assistant",
+        }.get(self._bank_id, self._bank_id.removeprefix("hermes-") or "default")
+
+    def _log_recall_telemetry(
+        self,
+        *,
+        method: str,
+        query: str,
+        started: float,
+        response: Any | None = None,
+        error: BaseException | None = None,
+        source: str = "prefetch",
+    ) -> None:
+        """Persist measurable recall metadata without recalled/query content."""
+        try:
+            results = list(getattr(response, "results", None) or [])
+            refs = []
+            for result in results:
+                ref: dict[str, Any] = {
+                    "id": str(getattr(result, "id", "") or ""),
+                    "type": str(getattr(result, "type", "") or ""),
+                }
+                scores = _extract_recall_scores(result)
+                if scores:
+                    ref["scores"] = {
+                        key: value
+                        for key, value in scores.items()
+                        if key in _RECALL_SCORE_KEYS and isinstance(value, (int, float))
+                    }
+                source_ids = getattr(result, "source_fact_ids", None)
+                if source_ids:
+                    ref["source_fact_ids"] = [str(value) for value in source_ids]
+                refs.append(ref)
+            session_ref = (
+                hashlib.sha256(self._session_id.encode("utf-8")).hexdigest()[:24]
+                if self._session_id
+                else ""
+            )
+            record: dict[str, Any] = {
+                "schema_version": 2,
+                "event": "hindsight_recall",
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "source": source,
+                "status": "error" if error is not None else "ok",
+                "method": method,
+                "profile": self._recall_profile(),
+                "bank_id": self._bank_id,
+                "session_ref": session_ref,
+                "turn_index": self._turn_index,
+                "query_chars": len(query),
+                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "latency_ms": round((time.monotonic() - started) * 1000, 2),
+                "result_count": len(results),
+                "results": refs,
+            }
+            if error is not None:
+                record["error_type"] = type(error).__name__
+            _private_jsonl_append(get_hermes_home() / "logs" / "recall-utilization.jsonl", record)
+        except Exception:
+            logger.debug("Hindsight recall telemetry logging failed", exc_info=True)
+
     def _normalize_prefetch_query(self, query: str) -> str:
         query = str(query or "")
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
@@ -2035,15 +2125,21 @@ class HindsightMemoryProvider(MemoryProvider):
         return "\n".join(parts) if parts else message
 
     def _prefetch_text(self, query: str) -> str:
+        started = time.monotonic()
         if self._prefetch_method == "reflect":
             logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-            resp = self._run_hindsight_operation(
-                lambda client: client.areflect(
-                    bank_id=self._bank_id,
-                    query=query,
-                    budget=self._budget,
+            try:
+                resp = self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id,
+                        query=query,
+                        budget=self._budget,
+                    )
                 )
-            )
+            except Exception as exc:
+                self._log_recall_telemetry(method="reflect", query=query, started=started, error=exc)
+                raise
+            self._log_recall_telemetry(method="reflect", query=query, started=started, response=resp)
             return resp.text or ""
 
         recall_kwargs: dict = {
@@ -2063,9 +2159,14 @@ class HindsightMemoryProvider(MemoryProvider):
             recall_kwargs["trace"] = True
         logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                      self._bank_id, len(query), self._budget)
-        resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        try:
+            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        except Exception as exc:
+            self._log_recall_telemetry(method="recall", query=query, started=started, error=exc)
+            raise
         num_results = len(resp.results) if resp.results else 0
         logger.debug("Prefetch: recall returned %d results", num_results)
+        self._log_recall_telemetry(method="recall", query=query, started=started, response=resp)
         return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -2386,6 +2487,7 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
+            started = time.monotonic()
             try:
                 recall_kwargs: dict = {
                     "bank_id": self._bank_id,
@@ -2435,6 +2537,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
+                self._log_recall_telemetry(
+                    method="recall", query=query, started=started, response=resp, source="tool"
+                )
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
                 include_scores = (
@@ -2455,6 +2560,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     result_payload["trace"] = resp.trace
                 return json.dumps(result_payload)
             except Exception as e:
+                self._log_recall_telemetry(
+                    method="recall", query=query, started=started, error=e, source="tool"
+                )
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
 
@@ -2462,6 +2570,7 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
+            started = time.monotonic()
             try:
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
@@ -2470,9 +2579,15 @@ class HindsightMemoryProvider(MemoryProvider):
                         bank_id=self._bank_id, query=query, budget=self._budget
                     )
                 )
+                self._log_recall_telemetry(
+                    method="reflect", query=query, started=started, response=resp, source="tool"
+                )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
+                self._log_recall_telemetry(
+                    method="reflect", query=query, started=started, error=e, source="tool"
+                )
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
 

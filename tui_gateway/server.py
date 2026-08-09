@@ -1638,15 +1638,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
 
-            try:
-                worker = _SlashWorker(
-                    key,
-                    getattr(agent, "model", _resolve_model()),
-                    profile_home=current.get("profile_home"),
-                )
-                _attach_worker(sid, current, worker)
-            except Exception:
-                pass
+            # ``slash.exec`` creates and attaches a persistent worker on first
+            # use.  Eager creation here multiplied MCP subprocesses for every
+            # restored or previewed desktop session.
+            current["slash_worker"] = None
 
             try:
                 from tools.approval import (
@@ -3127,11 +3122,17 @@ def _tool_progress_enabled(sid: str) -> bool:
 
 def _restart_slash_worker(sid: str, session: dict):
     worker = session.get("slash_worker")
-    if worker:
-        try:
-            worker.close()
-        except Exception:
-            pass
+    # Slash workers are lazy: most chat sessions never execute a slash command,
+    # while every worker initializes its own MCP clients.  Model switches and
+    # resets must not allocate that process tree for an unused session.  Once a
+    # session has used slash commands, retain the persistent-worker behavior.
+    if not worker:
+        session["slash_worker"] = None
+        return
+    try:
+        worker.close()
+    except Exception:
+        pass
     try:
         new_worker = _SlashWorker(
             session["session_key"],
@@ -5215,19 +5216,10 @@ def _init_session(
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
-    try:
-        _attach_worker(
-            sid,
-            _sessions[sid],
-            _SlashWorker(
-                key,
-                getattr(agent, "model", _resolve_model()),
-                profile_home=_sessions[sid].get("profile_home"),
-            ),
-        )
-    except Exception:
-        # Defer hard-failure to slash.exec; chat still works without slash worker.
-        _sessions[sid]["slash_worker"] = None
+    # Slash commands already have a first-use creation path.  Deferring the
+    # worker avoids a worker plus MCP subprocess tree for ordinary chat-only
+    # sessions while keeping it persistent after the first slash command.
+    _sessions[sid]["slash_worker"] = None
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 

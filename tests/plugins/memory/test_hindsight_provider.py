@@ -464,7 +464,7 @@ class TestConfig:
 
         def transient_import(name, *args, **kwargs):
             nonlocal attempts
-            if name == target and attempts == 0:
+            if name == target and attempts < 4:
                 attempts += 1
                 raise ImportError("transient concurrent import")
             return real_import(name, *args, **kwargs)
@@ -483,7 +483,7 @@ class TestConfig:
 
         p._sync_bank_mission_if_empty()
 
-        assert attempts == 1
+        assert attempts == 4
         banks.update_bank.assert_called_once()
         assert banks.update_bank.call_args.args[1].mission == "Configured mission"
 
@@ -1067,6 +1067,46 @@ class TestPrefetch:
         assert call_kwargs["prefer_observations"] is True
         assert call_kwargs["min_scores"] == {"final": 0.1}
         assert call_kwargs["trace"] is True
+
+    def test_recall_telemetry_records_ids_scores_latency_without_content(
+        self, provider, tmp_path
+    ):
+        import os
+
+        provider._agent_identity = "nas-ops"
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        id="memory-123",
+                        text="private recalled text",
+                        type="observation",
+                        source_fact_ids=["source-1"],
+                        scores=SimpleNamespace(
+                            semantic=0.7,
+                            keyword=None,
+                            reranker=0.8,
+                            final=0.9,
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert "private recalled text" in provider._prefetch_text("private query")
+        path = tmp_path / "logs" / "recall-utilization.jsonl"
+        raw = path.read_text(encoding="utf-8")
+        record = json.loads(raw.splitlines()[-1])
+        assert record["profile"] == "nas-ops"
+        assert record["bank_id"] == "test-bank"
+        assert record["session_ref"]
+        assert record["result_count"] == 1
+        assert record["results"][0]["id"] == "memory-123"
+        assert record["results"][0]["scores"]["final"] == 0.9
+        assert record["latency_ms"] >= 0
+        assert "private recalled text" not in raw
+        assert "private query" not in raw
+        assert os.stat(path).st_mode & 0o777 == 0o600
 
     def test_on_turn_start_prefetch_uses_current_message(self, provider):
         captured = {}

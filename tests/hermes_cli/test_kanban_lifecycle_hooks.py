@@ -74,8 +74,14 @@ def test_complete_fires_hook_with_summary(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="worker")
-        kb.claim_task(conn, tid)
-        assert kb.complete_task(conn, tid, summary="all done")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="all done",
+            expected_run_id=claimed.current_run_id,
+        )
     finally:
         conn.close()
     fired = [e for e in captured_hooks if e[0] == "kanban_task_completed"]
@@ -125,9 +131,15 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
         conn = kb.connect()
         try:
             tid = kb.create_task(conn, title="t", assignee="worker")
-            kb.claim_task(conn, tid)
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
             # Despite the raising hook, completion succeeds and persists.
-            assert kb.complete_task(conn, tid, summary="ok") is True
+            assert kb.complete_task(
+                conn,
+                tid,
+                summary="ok",
+                expected_run_id=claimed.current_run_id,
+            ) is True
             assert kb.get_task(conn, tid).status == "done"
         finally:
             conn.close()

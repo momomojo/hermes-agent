@@ -321,9 +321,34 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
-    cron_referenced = _cron_referenced_skills()
+    counts = {
+        "marked_stale": 0,
+        "archived": 0,
+        "reactivated": 0,
+        "checked": 0,
+        "seeded": 0,
+        "protected_skipped": 0,
+        "protection_scan_failed": 0,
+    }
 
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    # Auto-archive must fail closed. A missing protection snapshot means we
+    # cannot prove that a skill is not referenced by cron/Kanban/runtime state.
+    try:
+        from tools.skill_reference_guard import collect_protected_references
+
+        protected_snapshot = collect_protected_references()
+        protected_names = set(protected_snapshot.get("protected_names") or [])
+    except Exception as exc:
+        counts["protection_scan_failed"] = 1
+        logger.warning(
+            "Curator skipped automatic transitions because protected-reference "
+            "inventory failed: %s",
+            exc,
+            exc_info=True,
+        )
+        return counts
+
+    cron_referenced = _cron_referenced_skills()
 
     for row in _u.agent_created_report():
         counts["checked"] += 1

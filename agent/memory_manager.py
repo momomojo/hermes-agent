@@ -334,6 +334,30 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
+def _telemetry_profile(hermes_home: str) -> str:
+    """Resolve profile attribution without assuming HERMES_PROFILE is set."""
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    for key in ("HERMES_PROFILE", "HERMES_AGENT_PROFILE", "AGENT_PROFILE"):
+        value = str(_os.environ.get(key) or "").strip()
+        if value:
+            return value
+    home = _Path(hermes_home)
+    if home.parent.name == "profiles":
+        return home.name
+    try:
+        bank = str(_json.loads((home / "hindsight" / "config.json").read_text(encoding="utf-8")).get("bank_id") or "")
+    except Exception:
+        bank = ""
+    return {
+        "hermes-owner": "default",
+        "hermes-coding": "codex-coding",
+        "hermes-home-assistant": "home-assistant",
+    }.get(bank, bank.removeprefix("hermes-") or "default")
+
+
 def _log_memory_injection(clean: str) -> None:
     """Append one JSONL record per injected memory block.
 
@@ -343,23 +367,37 @@ def _log_memory_injection(clean: str) -> None:
     effort: never let telemetry break the hot path.
     """
     try:
+        import hashlib as _hashlib
         import json as _json
         import os as _os
-        import time as _time
+        from datetime import datetime as _datetime, timezone as _timezone
 
-        log_dir = _os.path.join(
-            _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")), "logs"
-        )
-        _os.makedirs(log_dir, exist_ok=True)
+        hermes_home = _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes"))
+        log_dir = _os.path.join(hermes_home, "logs")
+        _os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        try:
+            _os.chmod(log_dir, 0o700)
+        except OSError:
+            pass
         record = {
-            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "profile": _os.environ.get("HERMES_PROFILE", "default"),
+            "schema_version": 2,
+            "event": "memory_context_injected",
+            "ts": _datetime.now(_timezone.utc).isoformat(timespec="milliseconds"),
+            "profile": _telemetry_profile(hermes_home),
             "chars": len(clean),
             "items": clean.count("\n- ") + (1 if clean.lstrip().startswith("- ") else 0),
-            "head": clean[:200],
+            # No recalled content or excerpts are persisted. The digest lets
+            # operators correlate repeated injections without recovering it.
+            "content_sha256": _hashlib.sha256(clean.encode("utf-8")).hexdigest(),
         }
-        with open(_os.path.join(log_dir, "recall-utilization.jsonl"), "a", encoding="utf-8") as fh:
-            fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+        path = _os.path.join(log_dir, "recall-utilization.jsonl")
+        fd = _os.open(path, _os.O_WRONLY | _os.O_APPEND | _os.O_CREAT, 0o600)
+        try:
+            _os.chmod(path, 0o600)
+            payload = (_json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            _os.write(fd, payload)
+        finally:
+            _os.close(fd)
     except Exception:
         logger.debug("recall-utilization logging failed", exc_info=True)
 

@@ -7260,15 +7260,12 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
 
 
 @pytest.mark.real_agent_prewarm
-def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
-    """Regression guard: if session.close runs while session.create's
-    _build thread is still constructing the agent, the build thread
-    must detect the orphan and clean up the slash_worker + notify
-    registration it's about to install.  Without the cleanup those
-    resources leak — the subprocess stays alive until atexit and the
-    notify callback lingers in the global registry."""
+def test_session_create_close_race_does_not_allocate_worker_or_leak_notify(monkeypatch):
+    """A close racing deferred agent construction must keep the slash worker
+    lazy and clean up a notify registration installed after the close."""
     import threading
 
+    created_workers: list[str] = []
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
@@ -7276,6 +7273,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         def __init__(self, key, model, profile_home=None):
             self.key = key
             self._closed = False
+            created_workers.append(key)
 
         def close(self):
             self._closed = True
@@ -7347,9 +7345,8 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     # never exercise the orphan-cleanup path.
     assert build_started.wait(timeout=2.0), "build thread never entered _make_agent"
 
-    # Build thread is blocked in _slow_make_agent.  Close the session
-    # NOW — this pops _sessions[sid] before _build can install the
-    # worker/notify.
+    # Build thread is blocked in _slow_make_agent. Close the session NOW —
+    # this pops _sessions[sid] before _build can install its notify callback.
     close_resp = server.handle_request(
         {
             "id": "2",
@@ -7359,23 +7356,20 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
     assert close_resp.get("result", {}).get("closed") is True
 
-    # At this point session.close saw slash_worker=None (not yet
-    # installed) so it didn't close anything.  Release the build thread
-    # and let it finish — it should detect the orphan and clean up the
-    # worker it just allocated + unregister the notify.
+    # Release the build thread. It must not allocate the lazy slash worker,
+    # and it must detect and remove its late notify registration.
     release_build.set()
 
-    # Give the build thread a moment to run through its finally.
+    # Give the build thread a moment to run through its finally block.
     for _ in range(100):
-        if closed_workers:
+        if unregistered_keys:
             break
         import time
 
         time.sleep(0.02)
 
-    assert (
-        len(closed_workers) == 1
-    ), f"orphan worker was not cleaned up — closed_workers={closed_workers}"
+    assert created_workers == []
+    assert closed_workers == []
     # Notify may be unregistered by both session.close (unconditional)
     # and the orphan-cleanup path; the key guarantee is that the build
     # thread does at least one unregister call (any prior close
@@ -7387,16 +7381,16 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
 
 
 @pytest.mark.real_agent_prewarm
-def test_session_create_no_race_keeps_worker_alive(monkeypatch):
-    """Regression guard: when session.close does NOT race, the build
-    thread must install the worker + notify normally and leave them
-    alone (no over-eager cleanup)."""
+def test_session_create_no_race_keeps_worker_lazy_and_notify_alive(monkeypatch):
+    """A normal deferred build keeps the worker lazy and its notify active."""
+    created_workers: list[str] = []
     closed_workers: list[str] = []
     unregistered_keys: list[str] = []
 
     class _FakeWorker:
         def __init__(self, key, model, profile_home=None):
             self.key = key
+            created_workers.append(key)
 
         def close(self):
             closed_workers.append(self.key)
@@ -7473,8 +7467,9 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             own_unregistered == []
         ), f"build thread unregistered its own notify despite no race: {own_unregistered}"
 
-        # Session should have the live worker installed.
-        assert session.get("slash_worker") is not None
+        # Chat-only sessions must not allocate a worker or its MCP tree.
+        assert session.get("slash_worker") is None
+        assert created_workers == []
     finally:
         # Cleanup + restore sibling sessions we snapshotted.
         server._sessions.clear()
@@ -10182,24 +10177,37 @@ def test_restart_slash_worker_closes_orphan_when_session_reaped(monkeypatch):
     fired while `running` flipped false) must close the fresh worker, not orphan it."""
     closed = []
 
+    class _OldWorker:
+        def close(self):
+            closed.append("old")
+
     class _FakeWorker:
         def __init__(self, *a, **k):
             pass
 
         def close(self):
-            closed.append(True)
+            closed.append("new")
 
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     server._sessions.pop("reaped", None)
-    reaped = {"session_key": "k"}  # not in _sessions -> torn down concurrently
+    reaped = {
+        "session_key": "k",
+        "slash_worker": _OldWorker(),
+    }  # not in _sessions -> torn down concurrently
     server._restart_slash_worker("reaped", reaped)
 
-    assert closed == [True]
-    assert reaped.get("slash_worker") is None
+    assert closed == ["old", "new"]
+    assert isinstance(reaped.get("slash_worker"), _OldWorker)
     assert "reaped" not in server._sessions
 
 
 def test_restart_slash_worker_stores_on_live_session(monkeypatch):
+    closed = []
+
+    class _OldWorker:
+        def close(self):
+            closed.append(True)
+
     class _FakeWorker:
         def __init__(self, *a, **k):
             pass
@@ -10208,10 +10216,11 @@ def test_restart_slash_worker_stores_on_live_session(monkeypatch):
             pass
 
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
-    live = {"session_key": "k", "slash_worker": None}
+    live = {"session_key": "k", "slash_worker": _OldWorker()}
     server._sessions["live-restart"] = live
     try:
         server._restart_slash_worker("live-restart", live)
+        assert closed == [True]
         assert isinstance(live["slash_worker"], _FakeWorker)
     finally:
         server._sessions.pop("live-restart", None)

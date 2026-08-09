@@ -430,6 +430,60 @@ def test_disabled_profile_cron_errors_are_quarantined_from_health_pages():
     assert guard._check_cron_failures(["coder"]) == []
 
 
+def test_config_only_profile_is_not_treated_as_gateway(monkeypatch):
+    guard = _load_health_guard_module()
+    launch_agents = guard.HOME / "fake-launch-agents"
+    launch_agents.mkdir()
+    (launch_agents / "ai.hermes.gateway-coder.plist").write_text("plist", encoding="utf-8")
+    monkeypatch.setattr(guard, "LAUNCH_AGENTS_DIR", launch_agents)
+
+    assert guard._gateway_profile_names(["coder", "isolated"]) == ["coder"]
+
+
+def test_cron_dns_outage_is_grouped_but_independent_failure_stays_actionable():
+    guard = _load_health_guard_module()
+    _write_cron_jobs(
+        guard.HOME,
+        [
+            {
+                "id": "dns-a",
+                "name": "remote backup",
+                "enabled": True,
+                "last_status": "error",
+                "last_error": "ssh: Could not resolve hostname nas.example",
+            },
+            {
+                "id": "logic-a",
+                "name": "ledger monitor",
+                "enabled": True,
+                "last_status": "error",
+                "last_error": "expected current ledger was not found",
+            },
+        ],
+    )
+    profile_home = guard.HOME / "profiles" / "coder"
+    _write_cron_jobs(
+        profile_home,
+        [
+            {
+                "id": "dns-b",
+                "name": "API refresh",
+                "enabled": True,
+                "last_status": "error",
+                "last_error": "RuntimeError: Connection error",
+                "last_delivery_error": "NameResolutionError: failed to resolve api.example",
+            }
+        ],
+    )
+    (profile_home / "config.yaml").write_text("cron:\n  enabled: true\n", encoding="utf-8")
+
+    failures = guard._check_cron_failures(["coder"])
+
+    assert len(failures) == 2
+    assert failures[0].startswith("cron job failing for default: ledger monitor:")
+    assert failures[1].startswith("cron common-cause DNS failure: 2 job(s) across 2 profile(s)")
+
+
 def test_post_alert_accepts_async_agent_webhook_response(monkeypatch):
     guard = _load_health_guard_module()
 
@@ -517,6 +571,39 @@ def test_backup_freshness_accepts_clean_zero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(guard, "BACKUP_LOG", log)
 
     assert guard._check_backup_freshness() == []
+
+
+def test_backup_freshness_accepts_transactional_snapshot_success(monkeypatch, tmp_path):
+    guard = _load_health_guard_module()
+    log = tmp_path / "home-backup.log"
+    stamp = _backup_timestamp(hours_ago=1)
+    log.write_text(
+        f"=== hermes home backup started {stamp} ===\n"
+        "DATABASE SNAPSHOT OK files=42 sqlite=41 raw=1\n"
+        f"=== finished {stamp} rsync_rc=0/0 database_snapshot_rc=0 ===\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "BACKUP_LOG", log)
+
+    assert guard._check_backup_freshness() == []
+
+
+def test_backup_freshness_rejects_failed_transactional_snapshot(monkeypatch, tmp_path):
+    guard = _load_health_guard_module()
+    log = tmp_path / "home-backup.log"
+    old_stamp = _backup_timestamp(hours_ago=48)
+    new_stamp = _backup_timestamp(hours_ago=1)
+    log.write_text(
+        f"=== finished {old_stamp} rsync_rc=0/0 ===\n"
+        f"=== hermes home backup started {new_stamp} ===\n"
+        f"=== finished {new_stamp} rsync_rc=0/0 database_snapshot_rc=1 ===\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(guard, "BACKUP_LOG", log)
+
+    failures = guard._check_backup_freshness()
+    assert len(failures) == 1
+    assert f"home-backup stale: last success {old_stamp}" in failures[0]
 
 
 def test_backup_freshness_accepts_wrapper_classified_vanished_source_race(

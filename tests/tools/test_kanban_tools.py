@@ -166,10 +166,13 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -372,6 +375,22 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_SESSION_ID", "session-trusted")
 
+    # An unscoped/orchestrator tool call may manually complete a ready task,
+    # but it may not steal a running worker's run. Close the fixture run via
+    # the normal block/unblock lifecycle first so this test remains about
+    # trusted session metadata rather than completion ownership.
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        current = kb.get_task(conn, worker_env)
+        assert current is not None and current.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            worker_env,
+            reason="prepare unscoped manual completion test",
+            expected_run_id=current.current_run_id,
+        )
+        assert kb.unblock_task(conn, worker_env)
+
     out = kt._handle_complete({
         "task_id": worker_env,
         "summary": "done outside worker scope",
@@ -379,7 +398,6 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
     })
     assert json.loads(out)["ok"] is True
 
-    from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
@@ -640,10 +658,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -698,10 +719,13 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
@@ -763,10 +787,13 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -1923,10 +1950,6 @@ def test_board_param_routes_complete_to_alt_board(multi_board_env):
     from tools import kanban_tools as kt
 
     alt_seed = multi_board_env["alt_seed"]
-    # Make alt task running so complete is valid.
-    with kb.connect(board="alt") as conn:
-        kb.claim_task(conn, alt_seed)
-
     out = kt._handle_complete({
         "task_id": alt_seed,
         "summary": "alt close",

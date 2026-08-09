@@ -1224,8 +1224,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
-    -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    -- outcome: completed | blocked | crashed | protocol_violation | timed_out |
+    --          spawn_failed | gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -2234,12 +2234,28 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
+    """Compare SQLite's logical page count with the main file size.
 
-    Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    Raises :class:`sqlite3.DatabaseError` when a rollback-journal database is
+    shorter than SQLite's own page count claims (a torn extend).  WAL mode is
+    deliberately excluded: a committed page may still live only in ``-wal``,
+    so the main file can legitimately be shorter than ``PRAGMA page_count``.
+
+    Do not read the SQLite header with a second ``open()`` here.  On POSIX,
+    closing any descriptor for a file can cancel advisory locks this process
+    holds on that file.  ``PRAGMA page_count`` keeps the check on the existing
+    SQLite connection and therefore preserves the connection's locks.
     """
     try:
+        journal_row = conn.execute("PRAGMA journal_mode").fetchone()
+        journal_mode = (
+            str(journal_row[0]).strip().lower()
+            if journal_row and journal_row[0] is not None
+            else ""
+        )
+        if journal_mode == "wal":
+            return
+
         row = conn.execute("PRAGMA database_list").fetchone()
         if row is None:
             return
@@ -2248,22 +2264,17 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
             return  # in-memory or unnamed DB; skip
         path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
         file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
+        if page_count == 0:
             return  # new/empty DB; skip
         actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
+        if actual_pages < page_count:
             raise sqlite3.DatabaseError(
                 f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
+                f"SQLite claims {page_count} pages, "
                 f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
+                f"(missing {page_count - actual_pages} pages, "
                 f"file_size={file_size}, page_size={page_size})"
             )
     except sqlite3.DatabaseError:
@@ -2700,6 +2711,26 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if task_status == "blocked":
+                    # ``recompute_ready`` distinguishes an intentional,
+                    # sticky gate from a transient circuit-breaker state by
+                    # the latest blocked/unblocked event.  A task created
+                    # directly in ``blocked`` used to have only its ``created``
+                    # event, so the next dispatcher tick treated it as a
+                    # transient block and promoted it immediately when it had
+                    # no unfinished parents.  Persist the gate atomically with
+                    # creation; only ``unblock_task`` may clear it.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "kind": None,
+                            "source": "creation",
+                            "initial_status": "blocked",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3329,6 +3360,175 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+TERMINAL_RUN_ORPHAN_GRACE_SECONDS = 3600
+
+
+def reconcile_terminal_orphan_runs(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    grace_seconds: int = TERMINAL_RUN_ORPHAN_GRACE_SECONDS,
+) -> list[str]:
+    """Reclaim run state stranded behind an already-terminal task.
+
+    A terminal task is authoritative: it must not retain a live run pointer,
+    claim fields, or an unended ``task_runs.status='running'`` attempt.  Older
+    code paths and manual terminal transitions could violate that invariant in
+    two shapes: a pointed run whose task was already marked done, or an orphan
+    running row left behind after a later synthetic/manual completion.
+
+    This bounded maintenance repair waits for ``grace_seconds`` after the
+    terminal transition, marks every still-running attempt ``reclaimed``,
+    clears task/run claim state, and appends one durable audit event per task.
+    It never changes the task's terminal status and never deletes history.
+    Safe to call on every dispatcher tick; conditional updates make retries
+    idempotent.
+    """
+    if grace_seconds < 0:
+        raise ValueError("terminal run orphan grace must be non-negative")
+    observed_at = int(time.time()) if now is None else int(now)
+    cutoff = observed_at - int(grace_seconds)
+    reconciled: list[str] = []
+    terminal_statuses = ("done", "archived", "failed", "cancelled", "superseded")
+
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT t.id, t.status, t.completed_at, t.created_at,
+                   t.current_run_id, t.claim_lock, t.claim_expires,
+                   t.worker_pid,
+                   COALESCE(
+                       t.completed_at,
+                       (SELECT MAX(e.created_at)
+                          FROM task_events e
+                         WHERE e.task_id = t.id
+                           AND e.kind IN ('completed', 'archived', 'superseded')),
+                       t.created_at
+                   ) AS terminal_at
+              FROM tasks t
+             WHERE t.status IN (?, ?, ?, ?, ?)
+               AND COALESCE(
+                       t.completed_at,
+                       (SELECT MAX(e.created_at)
+                          FROM task_events e
+                         WHERE e.task_id = t.id
+                           AND e.kind IN ('completed', 'archived', 'superseded')),
+                       t.created_at
+                   ) <= ?
+               AND (
+                    t.current_run_id IS NOT NULL
+                    OR t.claim_lock IS NOT NULL
+                    OR t.claim_expires IS NOT NULL
+                    OR t.worker_pid IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1 FROM task_runs r
+                         WHERE r.task_id = t.id
+                           AND r.status = 'running'
+                           AND r.ended_at IS NULL
+                    )
+               )
+             ORDER BY terminal_at, t.id
+            """,
+            (*terminal_statuses, cutoff),
+        ).fetchall()
+
+        for row in rows:
+            task_id = str(row["id"])
+            run_rows = conn.execute(
+                "SELECT id, claim_lock, claim_expires, worker_pid "
+                "FROM task_runs WHERE task_id = ? "
+                "AND status = 'running' AND ended_at IS NULL ORDER BY id",
+                (task_id,),
+            ).fetchall()
+            reclaimed_run_ids: list[int] = []
+            for run in run_rows:
+                run_id = int(run["id"])
+                cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reclaimed',
+                           outcome = 'reclaimed',
+                           summary = COALESCE(
+                               summary,
+                               'maintenance reclaimed orphan run after task became terminal'
+                           ),
+                           error = COALESCE(
+                               error,
+                               'terminal task retained an unended running attempt'
+                           ),
+                           ended_at = ?,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ? AND task_id = ?
+                       AND status = 'running' AND ended_at IS NULL
+                    """,
+                    (observed_at, run_id, task_id),
+                )
+                if cur.rowcount == 1:
+                    reclaimed_run_ids.append(run_id)
+
+            pointer_run_id = (
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None
+                else None
+            )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET current_run_id = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ? AND status = ?
+                   AND (
+                        current_run_id IS NOT NULL
+                        OR claim_lock IS NOT NULL
+                        OR claim_expires IS NOT NULL
+                        OR worker_pid IS NOT NULL
+                        OR EXISTS (
+                            SELECT 1 FROM task_runs r
+                             WHERE r.task_id = tasks.id
+                               AND r.status = 'running'
+                               AND r.ended_at IS NULL
+                        )
+                        OR ? > 0
+                   )
+                """,
+                (task_id, row["status"], len(reclaimed_run_ids)),
+            )
+            if cur.rowcount != 1 and not reclaimed_run_ids:
+                continue
+
+            _append_event(
+                conn,
+                task_id,
+                "terminal_run_reconciled",
+                {
+                    "reason": "terminal_task_retained_active_run_state",
+                    "task_status": str(row["status"]),
+                    "terminal_at": int(row["terminal_at"]),
+                    "observed_at": observed_at,
+                    "grace_seconds": int(grace_seconds),
+                    "pointer_run_id": pointer_run_id,
+                    "reclaimed_run_ids": reclaimed_run_ids,
+                    "stale_task_claim": {
+                        "claim_lock": row["claim_lock"],
+                        "claim_expires": row["claim_expires"],
+                        "worker_pid": row["worker_pid"],
+                    },
+                },
+                run_id=(
+                    reclaimed_run_ids[0]
+                    if len(reclaimed_run_ids) == 1
+                    else None
+                ),
+            )
+            reconciled.append(task_id)
+
+    return reconciled
 
 
 def _synthesize_ended_run(
@@ -4137,12 +4337,22 @@ def complete_task(
     completion_source: Optional[str] = None,
     completed_by: Optional[str] = None,
     worker_session_id: Optional[str] = None,
+    _admin_override_actor: Optional[str] = None,
+    _admin_override_reason: Optional[str] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition a task to ``done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    A ``running`` task is owned by its current run and can only be completed
+    when ``expected_run_id`` matches ``tasks.current_run_id``.  This is the
+    completion compare-and-swap token passed to dispatcher workers as
+    ``HERMES_KANBAN_RUN_ID``.  Calls without a token remain valid for
+    never-claimed ``ready`` or deliberately parked ``blocked`` tasks, but can
+    no longer close an in-flight worker's run.
+
+    Privileged operator recovery goes through
+    :func:`admin_complete_running_task`, which supplies the private override
+    fields and records a dedicated audit event.  Callers must not set those
+    fields directly.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -4166,6 +4376,21 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    admin_override = bool(_admin_override_actor or _admin_override_reason)
+    if admin_override and not (
+        isinstance(_admin_override_actor, str)
+        and _admin_override_actor.strip()
+        and isinstance(_admin_override_reason, str)
+        and _admin_override_reason.strip()
+    ):
+        raise ValueError(
+            "admin running-task completion requires non-empty actor and reason"
+        )
+    if admin_override and expected_run_id is not None:
+        raise ValueError(
+            "admin running-task completion cannot also supply expected_run_id"
+        )
+
     now = int(time.time())
     completion_source = (
         completion_source
@@ -4213,7 +4438,8 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
-        if expected_run_id is None:
+        overridden_run_id: Optional[int] = None
+        if expected_run_id is not None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4226,7 +4452,35 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status = 'running'
+                   AND current_run_id = ?
+                """,
+                (result, now, task_id, int(expected_run_id)),
+            )
+        elif admin_override:
+            run_row = conn.execute(
+                "SELECT current_run_id FROM tasks "
+                "WHERE id = ? AND status = 'running'",
+                (task_id,),
+            ).fetchone()
+            overridden_run_id = (
+                int(run_row["current_run_id"])
+                if run_row and run_row["current_run_id"] is not None
+                else None
+            )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
                 """,
                 (result, now, task_id),
             )
@@ -4243,10 +4497,10 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                   AND status IN ('ready', 'blocked')
+                   AND current_run_id IS NULL
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now, task_id),
             )
         if cur.rowcount != 1:
             return False
@@ -4268,6 +4522,19 @@ def complete_task(
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
+        if admin_override:
+            _append_event(
+                conn,
+                task_id,
+                "admin_completion_override",
+                {
+                    "actor": _admin_override_actor.strip(),
+                    "reason": _admin_override_reason.strip(),
+                    "overridden_run_id": overridden_run_id,
+                    "completion_source": completion_source,
+                },
+                run_id=overridden_run_id,
+            )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
@@ -4293,6 +4560,7 @@ def complete_task(
             "worker_session_id": worker_session_id or None,
             "run_id": run_id,
             "expected_run_id": int(expected_run_id) if expected_run_id is not None else None,
+            "admin_override": admin_override or None,
             "evidence_present": bool(ev_summary or result or metadata),
         }
         if verified_cards:
@@ -4356,6 +4624,50 @@ def complete_task(
         summary=(summary if summary is not None else result),
     )
     return True
+
+
+def admin_complete_running_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    worker_session_id: Optional[str] = None,
+) -> bool:
+    """Privileged, audited recovery path for an in-flight task.
+
+    Normal completion of ``status='running'`` is run-token gated by
+    :func:`complete_task`.  This helper is intentionally explicit for the rare
+    operator case where the worker is gone or its token cannot be recovered
+    but the result has been independently verified.  Both ``actor`` and
+    ``reason`` are mandatory and are persisted in an
+    ``admin_completion_override`` event in the same transaction as completion.
+
+    The caller is responsible for authenticating/authorizing the operator.
+    Hermes' local CLI is an administrative surface; model-facing Kanban tools
+    never call this helper.
+    """
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("admin completion override requires a non-empty actor")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("admin completion override requires a non-empty reason")
+    return complete_task(
+        conn,
+        task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        completion_source="admin_override",
+        completed_by=actor.strip(),
+        worker_session_id=worker_session_id,
+        _admin_override_actor=actor.strip(),
+        _admin_override_reason=reason.strip(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6083,6 +6395,9 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+    terminal_runs_reconciled: list[str] = field(default_factory=list)
+    """Terminal task ids whose orphan running attempts/claims were reclaimed
+    by the invariant repair at the start of this dispatcher tick."""
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
@@ -6112,6 +6427,10 @@ class DispatchResult:
     "task is genuinely stuck"."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
+    protocol_violations: list[str] = field(default_factory=list)
+    """Task ids whose worker exited successfully without making a terminal
+    lifecycle transition.  Their run is finalized as ``failed`` with outcome
+    ``protocol_violation``; bounded retry/block policy is applied separately."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     skill_blocked: list[dict[str, Any]] = field(default_factory=list)
@@ -6789,6 +7108,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
+        if outcome == "protocol_violation":
+            streak += 1
+            continue
         if outcome == "crashed":
             is_violation = False
             raw_meta = row["metadata"]
@@ -6823,9 +7145,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). Give it a bounded,
+    violation-only retry streak before tripping the circuit breaker;
+    successful, rate-limited, and other failure outcomes do not extend
+    that streak.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -6833,10 +7156,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     to ``ready`` WITHOUT counting a failure (so a long quota window can't
     trip the breaker) and stamped with a quota-blocker error so
     ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+    Protocol violations are exposed through ``_last_protocol_violations`` so
+    :func:`dispatch_once` can report them separately from real crashes.  The
+    direct return retains them for compatibility with older callers that
+    interpret it as "dead workers handled" rather than a strict crash metric.
+
+    Rate-limited ids are returned via the ``_last_rate_limited`` function
+    attribute (the public return stays the dead-worker ``list[str]``).
     """
     crashed: list[str] = []
+    protocol_violations: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
@@ -6943,10 +7272,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                    _run_status = "rate_limited"
+                elif protocol_violation:
+                    _run_outcome = "protocol_violation"
+                    _run_status = "failed"
+                else:
+                    _run_outcome = "crashed"
+                    _run_status = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
+                    outcome=_run_outcome, status=_run_status,
                     error=error_text,
                     metadata=dict(event_payload),
                 )
@@ -6979,6 +7316,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             "WHERE id = ?",
                             (error_text[:500], row["id"]),
                         )
+                        protocol_violations.append(row["id"])
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
@@ -7039,7 +7377,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 tripped = _record_task_failure(
                     conn, tid,
                     error=error_text,
-                    outcome="crashed",
+                    outcome="protocol_violation",
                     failure_limit=violation_limit,
                     force_trip=True,
                     release_claim=False,
@@ -7072,6 +7410,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # and tests that destructure the result; ``dispatch_once`` reads this
     # side-channel attribute to populate ``DispatchResult.auto_blocked``.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_protocol_violations = protocol_violations  # type: ignore[attr-defined]
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
@@ -7619,6 +7958,7 @@ def _dispatch_once_locked(
     """Run one dispatcher tick.
 
     Steps:
+      0. Reconcile orphan run/claim state retained by terminal tasks.
       1. Reclaim stale running tasks (TTL expired).
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
@@ -7649,11 +7989,19 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    result.terminal_runs_reconciled = reconcile_terminal_orphan_runs(conn)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
+    _protocol_violations = list(getattr(
+        detect_crashed_workers, "_last_protocol_violations", []
+    ))
+    if _protocol_violations:
+        result.protocol_violations.extend(_protocol_violations)
+        protocol_ids = set(_protocol_violations)
+        result.crashed = [tid for tid in result.crashed if tid not in protocol_ids]
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.

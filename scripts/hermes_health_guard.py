@@ -33,6 +33,12 @@ STATE_PATH = BASE / "state.json"
 HISTORY_PATH = BASE / "history.jsonl"
 HTML_PATH = BASE / "index.html"
 LOG_PATH = HOME / "logs" / "hermes_health_guard.log"
+LAUNCH_AGENTS_DIR = Path(
+    os.environ.get(
+        "HERMES_HEALTH_LAUNCH_AGENTS_DIR",
+        str(Path.home() / "Library" / "LaunchAgents"),
+    )
+).expanduser()
 LOG_MAX_BYTES = int(os.environ.get("HERMES_HEALTH_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
 HISTORY_MAX_BYTES = int(os.environ.get("HERMES_HEALTH_HISTORY_MAX_BYTES", str(2 * 1024 * 1024)))
 HISTORY_MAX_ENTRIES = int(os.environ.get("HERMES_HEALTH_HISTORY_MAX_ENTRIES", "500"))
@@ -180,6 +186,36 @@ def _profile_names() -> list[str]:
     ordered = [name for name in DEFAULT_EXPECTED_PROFILES if name in found]
     ordered.extend(sorted(found - set(ordered)))
     return ordered
+
+
+def _gateway_profile_names(profiles: list[str]) -> list[str]:
+    """Return profiles that intentionally own a launchd gateway service.
+
+    A profile directory is durable configuration, not proof that a messaging
+    gateway should exist.  Isolated profiles can deliberately retain config,
+    memory and cron state while having no gateway.  Treating every directory
+    as a service contract caused the guard to page continuously and encouraged
+    operators to reinstall intentionally removed gateways.
+    """
+    configured = os.environ.get("HERMES_HEALTH_GATEWAY_PROFILES", "").strip()
+    if configured:
+        requested = {
+            item.strip()
+            for item in configured.split(",")
+            if item.strip() and item.strip() != "default"
+        }
+        return [profile for profile in profiles if profile in requested]
+
+    installed: set[str] = set()
+    try:
+        candidates = LAUNCH_AGENTS_DIR.glob("ai.hermes.gateway-*.plist")
+        for path in candidates:
+            profile = path.stem.removeprefix("ai.hermes.gateway-")
+            if profile:
+                installed.add(profile)
+    except OSError:
+        return []
+    return [profile for profile in profiles if profile in installed]
 
 
 def _profile_home(profile: str | None) -> Path:
@@ -447,13 +483,32 @@ def _check_duplicate_cron_registries(profiles: list[str]) -> list[str]:
     return failures
 
 
-def _check_cron_failures(profiles: list[str]) -> list[str]:
-    """One failure line per enabled, unpaused cron job whose latest run errored.
+_NETWORK_FAILURE_MARKERS = (
+    "could not resolve",
+    "failed to resolve",
+    "name resolution",
+    "nameresolutionerror",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+)
 
-    This is what catches a daily no_agent script that starts exiting
-    nonzero — previously invisible unless a human read jobs.json.
+
+def _compact_failure_detail(value: Any, *, limit: int = 220) -> str:
+    detail = re.sub(r"\s+", " ", str(value or "error")).strip()
+    if len(detail) > limit:
+        return detail[: limit - 3].rstrip() + "..."
+    return detail
+
+
+def _check_cron_failures(profiles: list[str]) -> list[str]:
+    """Report current cron failures without multiplying common-cause outages.
+
+    Independent job failures remain individually actionable.  Explicit DNS
+    failures are grouped fleet-wide because one resolver outage can otherwise
+    turn into dozens of indistinguishable pages and hide the real outlier.
     """
     failures: list[str] = []
+    network_failures: list[tuple[str, str, str]] = []
     paths = [(None, HOME / "cron" / "jobs.json")]
     paths += [(p, HOME / "profiles" / p / "cron" / "jobs.json") for p in profiles]
     for profile, path in paths:
@@ -473,7 +528,28 @@ def _check_cron_failures(profiles: list[str]) -> list[str]:
             if job.get("last_status") == "error":
                 name = job.get("name") or job.get("id") or "?"
                 detail = job.get("last_error") or "error"
-                failures.append(f"cron job failing for {label}: {name}: {detail}")
+                combined = " ".join(
+                    str(part or "")
+                    for part in (detail, job.get("last_delivery_error"))
+                ).lower()
+                compact = _compact_failure_detail(detail)
+                if any(marker in combined for marker in _NETWORK_FAILURE_MARKERS):
+                    network_failures.append((label, str(name), compact))
+                else:
+                    failures.append(f"cron job failing for {label}: {name}: {compact}")
+    if network_failures:
+        profiles_affected = sorted({item[0] for item in network_failures})
+        sample_names = [f"{profile}/{name}" for profile, name, _ in network_failures[:5]]
+        extra = len(network_failures) - len(sample_names)
+        sample_text = ", ".join(sample_names)
+        if extra:
+            sample_text += f", +{extra} more"
+        failures.append(
+            "cron common-cause DNS failure: "
+            f"{len(network_failures)} job(s) across {len(profiles_affected)} profile(s) "
+            f"({', '.join(profiles_affected)}): {sample_text}; "
+            f"example: {network_failures[0][2]}"
+        )
     return failures
 
 
@@ -697,7 +773,8 @@ def _check_managed_layer_drift() -> list[str]:
 def _last_successful_backup_timestamp(text: str) -> str | None:
     """Return the newest run timestamp accepted by the backup's own contract.
 
-    A clean rsync ends ``0/0``. The backup wrapper also deliberately accepts
+    A clean rsync ends ``0/0``. New-format runs must also report a successful
+    transactional database snapshot. The backup wrapper deliberately accepts
     rsync 23/24 when every diagnostic is a verified vanished-source race and
     records that decision with ``BACKUP OK with benign ... rc=X/Y``. Keep the
     health guard aligned with that fail-closed classifier instead of treating
@@ -706,12 +783,15 @@ def _last_successful_backup_timestamp(text: str) -> str | None:
     """
     finish_re = re.compile(
         r"^=== finished (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
-        r"rsync_rc=(\d+)/(\d+) ===$",
+        r"rsync_rc=(\d+)/(\d+)"
+        r"(?: database_snapshot_rc=(\d+|not_run))? ===$",
         re.MULTILINE,
     )
     last: str | None = None
     for match in finish_re.finditer(text):
-        timestamp, rc1, rc2 = match.groups()
+        timestamp, rc1, rc2, database_snapshot_rc = match.groups()
+        if database_snapshot_rc is not None and database_snapshot_rc != "0":
+            continue
         if rc1 == "0" and rc2 == "0":
             last = timestamp
             continue
@@ -1035,8 +1115,9 @@ def _check_kanban_flow() -> dict[str, Any]:
 
 def collect_health() -> dict[str, Any]:
     profiles = _profile_names()
+    gateway_profile_names = _gateway_profile_names(profiles)
     preflight_profiles = [None, *profiles]
-    gateway_profiles = [None, *profiles]
+    gateway_profiles = [None, *gateway_profile_names]
     preflights = [_check_kanban_preflight(profile) for profile in preflight_profiles]
     gateways = [_check_gateway_state(profile) for profile in gateway_profiles]
     listeners = [_check_listener(name, port) for name, port in sorted(CRITICAL_LISTENERS.items())]
@@ -1062,7 +1143,7 @@ def collect_health() -> dict[str, Any]:
     outbound_source_failures = _check_outbound_source_selection()
     failures.extend(outbound_source_failures)
     failures.extend(_check_managed_layer_drift())
-    failures.extend(_check_gateway_staleness(profiles))
+    failures.extend(_check_gateway_staleness(gateway_profile_names))
     hindsight_failures = _check_hindsight_configs(profiles)
     # Consolidate bank-reachability failures when the root cause is shared
     # (e.g. NAS service down — don't spam 7 identical lines).
@@ -1093,6 +1174,7 @@ def collect_health() -> dict[str, Any]:
         "failures": failures,
         "preflights": preflights,
         "gateways": gateways,
+        "gateway_profiles": ["default", *gateway_profile_names],
         "listeners": listeners,
         "kanban_flow": kanban_flow,
         "provider_health": _provider_health_summary(),
@@ -1100,7 +1182,7 @@ def collect_health() -> dict[str, Any]:
             "ok": not outbound_source_failures,
             "failures": outbound_source_failures,
         },
-        "hindsight_checks": _check_hindsight_configs(profiles),
+        "hindsight_checks": hindsight_failures,
     }
 
 
