@@ -1007,9 +1007,9 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_status()
 
         output = capsys.readouterr().out
-        assert "launchd-managed (PID 1234)" in output
+        assert "supervised by launchd (PID 1234)" in output
 
-    def test_launchd_status_warns_when_loaded_pid_is_detached(self, tmp_path, monkeypatch, capsys):
+    def test_launchd_status_trusts_the_pid_reported_by_launchd(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("plist\n", encoding="utf-8")
 
@@ -1032,7 +1032,8 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_status()
 
         output = capsys.readouterr().out
-        assert "loaded but PID 4321 has parent 999" in output
+        assert "supervised by launchd (PID 4321)" in output
+        assert "parent 999" not in output
 
     def test_launchd_status_prints_runtime_platform_health(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -1707,6 +1708,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
@@ -1752,6 +1754,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
@@ -1811,6 +1814,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -1841,6 +1845,7 @@ class TestGatewaySystemServiceRouting:
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(

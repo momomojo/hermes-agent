@@ -39,6 +39,7 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from cron.timeouts import resolve_cron_inactivity_timeout_seconds
 from utils import atomic_replace
 
 try:
@@ -190,9 +191,6 @@ ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 # headroom over any healthy run before we treat a claim as stale.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
-_DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
-
-
 def _oneshot_run_claim_ttl_seconds() -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
 
@@ -206,13 +204,7 @@ def _oneshot_run_claim_ttl_seconds() -> float:
     - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
       tiny configured timeout can never expire a claim mid-run.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if raw:
-        try:
-            timeout = float(raw)
-        except (ValueError, TypeError):
-            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    timeout = resolve_cron_inactivity_timeout_seconds()
     if timeout <= 0:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
