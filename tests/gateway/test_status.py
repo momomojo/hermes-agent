@@ -670,6 +670,30 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_new_gateway_run_resets_stale_platform_records(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="running",
+            platform="feishu",
+            platform_state="connected",
+        )
+        status.write_runtime_status(
+            gateway_state="starting",
+            reset_platforms=True,
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "starting"
+        assert payload["platforms"] == {}
+
+        status.write_runtime_status(
+            platform="telegram",
+            platform_state="connected",
+        )
+        payload = status.read_runtime_status()
+        assert set(payload["platforms"]) == {"telegram"}
+
 
 class TestGetProcessStartTime:
     """Start-time fingerprint backing the PID-reuse guard (#43846 / #50468).

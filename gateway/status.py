@@ -884,12 +884,22 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    reset_platforms: bool = False,
 ) -> None:
-    """Persist gateway runtime health information for diagnostics/status."""
+    """Persist gateway runtime health information for diagnostics/status.
+
+    ``reset_platforms`` is used once at the beginning of a new gateway run.
+    Without it, the normal read/merge/write behavior preserves adapters from a
+    previous process forever, so ``gateway status`` can report a platform as
+    connected even though the replacement process never configured it.
+    """
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
+    if reset_platforms:
+        payload["platforms"] = {}
+    else:
+        payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
