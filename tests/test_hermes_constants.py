@@ -57,6 +57,18 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == native
 
+    def test_nested_non_profile_home_does_not_collapse_to_native(
+        self, tmp_path, monkeypatch
+    ):
+        """A task-local test home beneath ~/.hermes remains isolated."""
+        native = tmp_path / ".hermes"
+        sandbox = native / "kanban" / "workspaces" / "t_test" / "isolated-home"
+        sandbox.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(sandbox))
+
+        assert get_default_hermes_root() == sandbox
+
     def test_hermes_home_is_docker(self, tmp_path, monkeypatch):
         """When HERMES_HOME points outside ~/.hermes (Docker), returns HERMES_HOME."""
         docker_home = tmp_path / "opt" / "data"

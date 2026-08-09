@@ -172,22 +172,20 @@ def get_default_hermes_root() -> Path:
     env_home = os.environ.get("HERMES_HOME", "")
     if not env_home:
         return native_home
-    env_path = Path(env_home)
-    try:
-        env_path.resolve().relative_to(native_home.resolve())
-        # HERMES_HOME is under ~/.hermes (normal or profile mode)
+    env_path = Path(env_home).expanduser()
+    if env_path.resolve() == native_home.resolve():
         return native_home
-    except ValueError:
-        pass
 
-    # Docker / custom deployment.
-    # Check if this is a profile path: <root>/profiles/<name>
-    # If the immediate parent dir is named "profiles", the root is
-    # the grandparent — this covers Docker profiles correctly.
+    # Collapse only the documented profile shape: <root>/profiles/<name>.
+    # Do not collapse every arbitrary path beneath ~/.hermes. Task workspaces
+    # and test sandboxes often live there; treating one as the native root can
+    # silently route a synthetic test into the production Kanban database.
+    # This lexical shape also covers Docker/custom profile roots correctly.
     if env_path.parent.name == "profiles":
         return env_path.parent.parent
 
-    # Not a profile path — HERMES_HOME itself is the root
+    # Not the native home or a direct profile path: HERMES_HOME itself is the
+    # root, even when it happens to be nested beneath the native home.
     return env_path
 
 

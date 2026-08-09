@@ -2981,6 +2981,22 @@ class TestSharedBoardPaths:
         assert kb.kanban_home() == custom_root
         assert kb.kanban_db_path() == custom_root / "kanban.db"
 
+    def test_task_local_home_beneath_native_root_stays_isolated(
+        self, tmp_path, monkeypatch
+    ):
+        """A worker test home must never fall through to the live board."""
+        native = tmp_path / ".hermes"
+        sandbox = native / "kanban" / "workspaces" / "t_test" / "harness-home"
+        sandbox.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(sandbox))
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+
+        assert kb.kanban_home() == sandbox
+        assert kb.kanban_db_path() == sandbox / "kanban.db"
+        assert kb.kanban_db_path() != native / "kanban.db"
+
     def test_docker_profile_layout_uses_grandparent(
         self, tmp_path, monkeypatch
     ):
