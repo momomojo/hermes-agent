@@ -16803,7 +16803,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
             return text, []
 
-    def _build_process_event_source(self, evt: dict):
+    def _build_process_event_source(
+        self, evt: dict, *, warn_unresolvable: bool = True,
+    ):
         """Resolve the canonical source for a synthetic background-process event.
 
         Prefer the persisted session-store origin for the event's session key.
@@ -16844,13 +16846,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
-            logger.warning(
-                "Synthetic event source unresolvable: "
-                "session_key=%r platform=%r chat_type=%r chat_id=%r "
-                "evt_type=%s",
-                session_key, platform_name, chat_type, chat_id,
-                evt.get("type", "?"),
-            )
+            if warn_unresolvable:
+                logger.warning(
+                    "Synthetic event source unresolvable: "
+                    "session_key=%r platform=%r chat_type=%r chat_id=%r "
+                    "evt_type=%s",
+                    session_key, platform_name, chat_type, chat_id,
+                    evt.get("type", "?"),
+                )
             return None
 
         try:
@@ -16866,10 +16869,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     raise ValueError(platform_name)
         except Exception:
-            logger.warning(
-                "Synthetic process event has invalid platform metadata: %r",
-                platform_name,
-            )
+            if warn_unresolvable:
+                logger.warning(
+                    "Synthetic process event has invalid platform metadata: %r",
+                    platform_name,
+                )
             return None
 
         return SessionSource(
@@ -16907,7 +16911,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = a
                 break
         if not adapter:
-            return None
+            logger.warning(
+                "Watch notification route %s has no active adapter; retrying",
+                platform_name,
+            )
+            return False
         try:
             metadata = {}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
@@ -16991,6 +16999,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     identity in self._completion_deliveries_inflight
                     or identity in self._completion_deliveries_delivered
                 ):
+                    if durable_claim_id:
+                        try:
+                            from tools.async_delegation import release_completion_delivery
+
+                            release_completion_delivery(
+                                durable_delegation_id, durable_claim_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not release duplicate durable completion claim",
+                                exc_info=True,
+                            )
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
@@ -17098,6 +17118,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    # The process registry is shared by every frontend using
+                    # this Hermes home. Durable restore therefore places CLI
+                    # and TUI completions in gateway memory too. Only a
+                    # positively routable gateway event belongs to this
+                    # consumer; leave foreign completions pending for their
+                    # resumable owner without claiming or warning on every
+                    # gateway restart.
+                    if self._build_process_event_source(
+                        evt, warn_unresolvable=False,
+                    ) is None:
+                        logger.debug(
+                            "Skipping non-gateway async completion %s",
+                            evt.get("delegation_id", "unknown"),
+                        )
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue

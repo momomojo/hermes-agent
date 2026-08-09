@@ -131,6 +131,115 @@ def test_unroutable_async_event_is_not_requeued_forever(
     assert isolated.empty()
 
 
+def test_gateway_does_not_claim_restored_cli_completion(
+    monkeypatch, isolated_registry,
+):
+    """Foreign durable work stays pending for its resumable CLI owner."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_cli_foreign")
+    event["session_key"] = "20260809_142346_06e370"
+    async_delegation._persist_dispatch({
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": event["session_key"],
+        "dispatched_at": event["dispatched_at"],
+    })
+    async_delegation._persist_completion(event, {"status": "completed"})
+
+    isolated = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(isolated) == 1
+    restored_event = isolated.get_nowait()
+    assert restored_event["restored"] is True
+    isolated.put(restored_event)
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_not_awaited()
+    durable = async_delegation.get_durable_delegation(
+        event["delegation_id"]
+    )
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 0
+    assert async_delegation.claim_event_delivery(
+        restored_event, "rightful-owner",
+    )
+
+
+def test_routable_completion_without_adapter_remains_retryable(
+    monkeypatch, isolated_registry,
+):
+    """A valid route is not discarded just because its adapter is unavailable."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_adapter_retry")
+    async_delegation._persist_dispatch({
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": event["dispatched_at"],
+    })
+    async_delegation._persist_completion(event, {"status": "completed"})
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.adapters = {}
+
+    result = asyncio.run(
+        runner._deliver_completion_notification(
+            "completion", event,
+        )
+    )
+
+    assert result is False
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 1
+    assert async_delegation.claim_event_delivery(event, "retry-owner")
+
+
+def test_duplicate_identity_releases_a_recovered_durable_claim(
+    monkeypatch, isolated_registry,
+):
+    """A prior in-process acceptance cannot strand a later SQLite claim."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_ack_recovery")
+    identity = GatewayRunner._completion_delivery_identity(event)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner._completion_deliveries_delivered[identity] = None
+
+    claims = []
+    releases = []
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_completion_delivery",
+        lambda delegation_id, claim_id: claims.append(
+            (delegation_id, claim_id)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_completion_delivery",
+        lambda delegation_id, claim_id: releases.append(
+            (delegation_id, claim_id)
+        ) or True,
+    )
+
+    result = asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    )
+
+    assert result is None
+    assert len(claims) == 1
+    assert releases == claims
+
+
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     """Concurrent consumers in one runner cannot both enter the adapter."""
     entered = asyncio.Event()
