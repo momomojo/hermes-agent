@@ -4662,6 +4662,8 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     # Should not raise
     with write_txn(conn) as c:
         c.execute(
@@ -4678,6 +4680,8 @@ def test_write_txn_raises_on_truncated_file(tmp_path):
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
     # Get actual page size so we can fake a smaller file
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     original_getsize = os.path.getsize
@@ -4732,32 +4736,21 @@ def test_connect_sets_wal_autocheckpoint_100(tmp_path):
     conn.close()
 
 
-def test_write_txn_check_reads_correct_header_fields(tmp_path):
-    """Synthetic DB file with mismatched header page_count triggers the check."""
-    import struct
+def test_write_txn_check_does_not_open_live_database_file(tmp_path):
+    """The invariant probe uses SQLite PRAGMAs, not a second raw descriptor."""
     from hermes_cli.kanban_db import connect, _check_file_length_invariant
     db = tmp_path / "synthetic.db"
     conn = connect(db_path=db)
-    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    conn.close()
-    # Now corrupt the file: claim N pages but truncate to N-1 pages
-    with open(db, "rb") as f:
-        data = bytearray(f.read())
-    # Read current page_count from header bytes 28-31
-    real_page_count = struct.unpack(">I", data[28:32])[0]
-    if real_page_count < 2:
-        # Need at least 2 pages to fake a truncation
-        pytest.skip("DB too small for synthetic truncation test")
-    # Truncate to N-1 pages
-    truncated = bytes(data[: (real_page_count - 1) * page_size])
-    with open(db, "wb") as f:
-        f.write(truncated)
-    # Now open and check — should raise
-    # We can't use connect() because _validate_sqlite_header may block; use a raw connection
-    raw_conn = sqlite3.connect(str(db), isolation_level=None)
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        _check_file_length_invariant(raw_conn)
-    raw_conn.close()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        with unittest.mock.patch(
+            "builtins.open",
+            side_effect=AssertionError("raw database open is forbidden"),
+        ):
+            _check_file_length_invariant(conn)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
