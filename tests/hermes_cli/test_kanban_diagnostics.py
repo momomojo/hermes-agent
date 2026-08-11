@@ -277,7 +277,7 @@ def test_failure_rules_exempt_terminal_statuses():
     # streak survives in run history — but done means done: neither
     # failure rule may keep flagging a terminal card.
     runs = [_run(outcome="crashed", run_id=1), _run(outcome="crashed", run_id=2)]
-    for status in ("done", "archived"):
+    for status in ("done", "archived", "superseded"):
         task = _task(status=status, assignee="crashy", consecutive_failures=3)
         assert kd.compute_task_diagnostics(task, [], runs) == []
 

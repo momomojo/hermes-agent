@@ -3369,6 +3369,47 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
             "parent is archived"
         )
 
+
+def test_supersede_task_keeps_duplicate_children_parked_and_out_of_active_lists(kanban_home):
+    """Supersession is terminal for triage but intentionally not a dependency success.
+
+    A historical circuit-broken incident can be replaced by a completed
+    canonical recovery. Its duplicate child must remain parked rather than
+    being promoted just because the obsolete parent was terminalized.
+    """
+    with kb.connect() as conn:
+        canonical = kb.create_task(conn, title="canonical recovery")
+        obsolete = kb.create_task(conn, title="circuit-broken provenance")
+        duplicate = kb.create_task(conn, title="parked duplicate", parents=[obsolete])
+        assert kb.complete_task(conn, canonical, result="recovered")
+        assert kb.get_task(conn, duplicate).status == "todo"
+
+        assert kb.supersede_task(
+            conn,
+            obsolete,
+            superseded_by=canonical,
+            reason="canonical recovery already completed",
+        )
+        assert kb.get_task(conn, obsolete).status == "superseded"
+        assert kb.get_task(conn, duplicate).status == "todo"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, duplicate).status == "todo"
+
+        events = kb.list_events(conn, obsolete)
+        assert events[-1].kind == "superseded"
+        assert events[-1].payload["superseded_by"] == canonical
+        assert obsolete not in {task.id for task in kb.list_tasks(conn)}
+        assert obsolete in {task.id for task in kb.list_tasks(conn, include_archived=True)}
+
+
+def test_supersede_task_requires_an_existing_distinct_replacement(kanban_home):
+    """Administrative reconciliation cannot discard a task on a typo or self-link."""
+    with kb.connect() as conn:
+        obsolete = kb.create_task(conn, title="obsolete")
+        assert not kb.supersede_task(conn, obsolete, superseded_by="t_missing")
+        assert not kb.supersede_task(conn, obsolete, superseded_by=obsolete)
+        assert kb.get_task(conn, obsolete).status == "ready"
+
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
 # ---------------------------------------------------------------------------

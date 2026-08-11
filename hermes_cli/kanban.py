@@ -663,6 +663,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    p_supersede = sub.add_parser(
+        "supersede",
+        help="Administratively terminalize an obsolete task without releasing dependent children",
+    )
+    p_supersede.add_argument("task_id", help="Obsolete task to terminalize")
+    p_supersede.add_argument(
+        "--by",
+        dest="superseded_by",
+        required=True,
+        help="Existing canonical replacement task id",
+    )
+    p_supersede.add_argument(
+        "--note",
+        dest="reason",
+        default=None,
+        help="Optional audit note explaining why the replacement supersedes this task",
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1017,6 +1035,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "supersede": _cmd_supersede,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "preflight": _cmd_preflight,
@@ -1750,9 +1769,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 )
             }
         else:
-            # Fleet mode: pull all non-archived tasks + their events/runs.
+            # Fleet mode: pull all non-terminal tasks + their events/runs.
             rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
+                "SELECT * FROM tasks WHERE status NOT IN ('archived', 'superseded')"
             ).fetchall())
             ids = [r["id"] for r in rows]
             if not ids:
@@ -2329,6 +2348,25 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_supersede(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.supersede_task(
+            conn,
+            args.task_id,
+            superseded_by=args.superseded_by,
+            reason=args.reason,
+        )
+    if not ok:
+        print(
+            f"cannot supersede {args.task_id}: task must be non-terminal and "
+            f"replacement {args.superseded_by} must exist",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Superseded {args.task_id} by {args.superseded_by}")
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

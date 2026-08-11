@@ -71,13 +71,48 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == kb.VALID_STATUSES - {"archived", "superseded"}
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_board_superseded_task_is_hidden_by_default_and_history_bucketed(client):
+    """Superseded cards stay out of active lanes and never fall back to todo."""
+    conn = kb.connect()
+    try:
+        canonical = kb.create_task(conn, title="canonical", assignee="worker")
+        obsolete = kb.create_task(conn, title="obsolete", assignee="worker")
+        assert kb.supersede_task(
+            conn,
+            obsolete,
+            superseded_by=canonical,
+            reason="duplicate incident",
+        )
+    finally:
+        conn.close()
+
+    active = client.get("/api/plugins/kanban/board")
+    assert active.status_code == 200
+    active_columns = {c["name"]: c["tasks"] for c in active.json()["columns"]}
+    assert "superseded" not in active_columns
+    assert all(
+        task["id"] != obsolete
+        for tasks in active_columns.values()
+        for task in tasks
+    )
+
+    history = client.get(
+        "/api/plugins/kanban/board",
+        params={"include_archived": True},
+    )
+    assert history.status_code == 200
+    history_columns = {c["name"]: c["tasks"] for c in history.json()["columns"]}
+    assert [task["id"] for task in history_columns["superseded"]] == [obsolete]
+    assert all(task["id"] != obsolete for task in history_columns["todo"])
 
 
 # ---------------------------------------------------------------------------

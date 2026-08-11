@@ -167,6 +167,24 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_run_slash_supersede_is_administrative_and_terminal(kanban_home):
+    import re
+
+    canonical = kc.run_slash("create 'canonical recovery'")
+    obsolete = kc.run_slash("create 'obsolete incident'")
+    canonical_match = re.search(r"(t_[a-f0-9]+)", canonical)
+    obsolete_match = re.search(r"(t_[a-f0-9]+)", obsolete)
+    assert canonical_match and obsolete_match
+    canonical_id = canonical_match.group(1)
+    obsolete_id = obsolete_match.group(1)
+
+    out = kc.run_slash(
+        f"supersede {obsolete_id} --by {canonical_id} --note 'replacement verified'"
+    )
+    assert f"Superseded {obsolete_id} by {canonical_id}" in out
+    assert '"status": "superseded"' in kc.run_slash(f"show {obsolete_id} --json")
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

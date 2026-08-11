@@ -163,11 +163,16 @@ class GatewayKanbanWatchersMixin:
             return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        # writes — surface those transitions to subscribers too. Explicit
+        # final lifecycle events must also be claimed, even when silent, so
+        # their subscriptions reach the final-status cleanup below.
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "superseded", "unblocked",
+        )
         # Subscriptions are removed only when the task reaches a truly final
-        # status (done / archived). We used to also unsub on any terminal
-        # event kind (gave_up / crashed / timed_out / blocked), but that
+        # status (done / archived / superseded). We used to also unsubscribe
+        # on any terminal event kind (gave_up / crashed / timed_out / blocked), but that
         # silently dropped the user out of the loop whenever the dispatcher
         # respawned the task: a worker that crashes, gets reclaimed, runs
         # again, and crashes a second time would only notify on the first
@@ -397,12 +402,13 @@ class GatewayKanbanWatchersMixin:
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
+                            # archived / superseded / unblocked are claimed by
+                            # TERMINAL_KINDS (so the cursor advances past them
+                            # and they can't wedge a later completed/blocked
+                            # event behind an unclaimed row) but are
+                            # intentionally SILENT: terminal-history cleanup
+                            # needs no user ping, and unblocked is an internal
+                            # transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
                         metadata: dict[str, Any] = {}
@@ -482,13 +488,13 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
+                        # final status (done / archived / superseded). For blocked /
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = task and task.status in {"done", "archived", "superseded"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
