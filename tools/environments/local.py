@@ -448,6 +448,33 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+_KANBAN_LIFECYCLE_ENV_VARS = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_CLAIM_LOCK",
+)
+
+
+def _strip_suppressed_kanban_lifecycle_env(env: dict) -> None:
+    """Drop inherited worker lifecycle bindings for nested cron subprocesses.
+
+    ``cron_scheduler_context`` is ContextVar-local, while child processes only
+    inherit this environment dict. Preserve profile and board routing pins, but
+    never hand a nested cron terminal/script/non-terminal child the parent
+    worker's task/run/workspace/branch/claim identity.
+    """
+    try:
+        from agent.kanban_context import lifecycle_task_suppressed
+
+        if lifecycle_task_suppressed():
+            for key in _KANBAN_LIFECYCLE_ENV_VARS:
+                env.pop(key, None)
+    except Exception:
+        pass
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -484,6 +511,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _strip_suppressed_kanban_lifecycle_env(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -611,6 +639,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _strip_suppressed_kanban_lifecycle_env(env)
 
     return env
 
@@ -1168,6 +1197,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _strip_suppressed_kanban_lifecycle_env(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

@@ -29,6 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.kanban_context import has_lifecycle_task
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -260,6 +261,11 @@ _LEGACY_TOOLSET_MAP = {
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
+
+def _has_kanban_lifecycle_task() -> bool:
+    """Context-aware worker check for model tool schema assembly."""
+    return has_lifecycle_task()
+
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
 # (per-session toolset sets, config edits, kanban-task toggles); without a
@@ -321,7 +327,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _has_kanban_lifecycle_task(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -366,7 +372,7 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        if _has_kanban_lifecycle_task() and "kanban" not in effective_enabled_toolsets:
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets

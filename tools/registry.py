@@ -160,6 +160,16 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    # A few policy checks intentionally depend on ContextVars (for example a
+    # nested cron session suppressing an ambient Kanban worker lifecycle). A
+    # process-wide TTL cache would leak one thread's verdict into another, so
+    # those cheap checks opt out explicitly.
+    if getattr(fn, "_hermes_skip_ttl_cache", False):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)

@@ -638,7 +638,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # It can run inline in a dispatcher worker, so make the whole immediate
+        # fire an independent scheduler context before it constructs anything.
+        # This is ContextVar-scoped rather than an os.environ mutation: parallel
+        # scheduler jobs and the caller's lifecycle cannot race or observe a
+        # temporary mask.
+        from agent.kanban_context import cron_scheduler_context
+        with cron_scheduler_context():
+            processed = run_one_job(job)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
