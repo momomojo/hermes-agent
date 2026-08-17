@@ -670,9 +670,15 @@ def init_agent(
     # stream chunk.  Used by the gateway timeout handler to report what the
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
+    # All watchdog-facing activity fields are one coherent state.  Tool
+    # workers call into this from other threads, so readers must never combine
+    # the timestamp from one update with the description/tool from another.
+    agent._activity_lock = threading.Lock()
     agent._last_activity_ts: float = time.time()
+    agent._last_activity_monotonic: float = time.monotonic()
     agent._last_activity_desc: str = "initializing"
     agent._current_tool: str | None = None
+    agent._activity_sequence: int = 0
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
