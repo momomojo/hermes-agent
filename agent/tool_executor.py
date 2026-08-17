@@ -567,8 +567,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
-    agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    agent._touch_activity(
+        f"executing {num_tools} tools concurrently: {tool_names_str}",
+        current_tool=tool_names_str,
+    )
 
     def _run_tool(index, tool_call, function_name, function_args, middleware_trace):
         """Worker function executed in a thread."""
@@ -939,8 +941,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
-        agent._current_tool = None
-        agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+        agent._touch_activity(
+            f"tool completed: {name} ({tool_duration:.1f}s)", current_tool=None,
+        )
 
         if not blocked and agent.tool_complete_callback:
             try:
@@ -1157,8 +1160,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
         if not _execution_blocked:
-            agent._current_tool = function_name
-            agent._touch_activity(f"executing tool: {function_name}")
+            agent._touch_activity(
+                f"executing tool: {function_name}", current_tool=function_name,
+            )
 
         # Set activity callback for long-running tool execution (terminal
         # commands, etc.) so the gateway's inactivity monitor doesn't kill
@@ -1630,8 +1634,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-        agent._current_tool = None
-        agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+        agent._touch_activity(
+            f"tool completed: {function_name} ({tool_duration:.1f}s)", current_tool=None,
+        )
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")

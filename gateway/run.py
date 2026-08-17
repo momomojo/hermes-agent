@@ -18209,8 +18209,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn makes its first API call (#9051).
         """
         if interrupt_depth == 0:
-            agent._last_activity_ts = time.time()
-            agent._last_activity_desc = "starting new turn (cached)"
+            if isinstance(getattr(agent, "_activity_lock", None), type(threading.Lock())):
+                agent._touch_activity("starting new turn (cached)", current_tool=None)
+            else:
+                # Minimal test doubles from external integrations may not have
+                # the production activity API yet.
+                agent._last_activity_ts = time.time()
+                agent._last_activity_desc = "starting new turn (cached)"
             # Reset the SessionDB flush cursor so the new turn's messages are
             # fully persisted — a stale value from the previous turn would
             # cause `_flush_messages_to_session_db` to skip new rows (#44327).

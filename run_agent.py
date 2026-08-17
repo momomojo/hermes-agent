@@ -38,6 +38,8 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
+
+
 import os
 import re
 import sys
@@ -46,6 +48,9 @@ import time
 import threading
 import uuid
 from typing import List, Dict, Any, Optional, Callable
+
+
+_ACTIVITY_TOOL_UNCHANGED = object()
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -3213,7 +3218,12 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
-    def _touch_activity(self, desc: str) -> None:
+    def _touch_activity(
+        self,
+        desc: str,
+        *,
+        current_tool: str | None | object = _ACTIVITY_TOOL_UNCHANGED,
+    ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
         Also bridges to the kanban board's heartbeat fields when this
@@ -3222,8 +3232,23 @@ class AIAgent:
         worker as stale (#31752). Bridge is rate-limited (60s) and
         best-effort — it never raises into the agent loop.
         """
-        self._last_activity_ts = time.time()
-        self._last_activity_desc = desc
+        # Keep the wall clock for diagnostics/backwards compatibility, but
+        # calculate watchdog idleness from monotonic time so wall-clock jumps
+        # cannot manufacture negative or stale elapsed values.  The bridge is
+        # deliberately outside this lock: it may perform I/O.
+        if not callable(getattr(getattr(self, "_activity_lock", None), "__enter__", None)):
+            # A few focused tests build a bare AIAgent without __init__.
+            # Production construction always initializes this before workers.
+            self._activity_lock = threading.Lock()
+            self._last_activity_monotonic = time.monotonic()
+            self._activity_sequence = getattr(self, "_activity_sequence", 0)
+        with self._activity_lock:
+            self._last_activity_ts = time.time()
+            self._last_activity_monotonic = time.monotonic()
+            self._last_activity_desc = desc
+            if current_tool is not _ACTIVITY_TOOL_UNCHANGED:
+                self._current_tool = current_tool
+            self._activity_sequence += 1
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3437,16 +3462,36 @@ class AIAgent:
         Called by the gateway timeout handler to report what the agent was doing
         when it was killed, and by the periodic "still working" notifications.
         """
-        elapsed = time.time() - self._last_activity_ts
+        # Copy the whole state while holding the producer lock.  Do not read
+        # individual attributes after calculating elapsed: a worker heartbeat
+        # may otherwise produce an impossible hybrid snapshot.
+        if not callable(getattr(getattr(self, "_activity_lock", None), "__enter__", None)):
+            self._activity_lock = threading.Lock()
+            self._last_activity_monotonic = getattr(
+                self, "_last_activity_monotonic", time.monotonic(),
+            )
+            self._activity_sequence = getattr(self, "_activity_sequence", 0)
+        with self._activity_lock:
+            last_activity_ts = self._last_activity_ts
+            last_activity_monotonic = self._last_activity_monotonic
+            last_activity_desc = self._last_activity_desc
+            current_tool = self._current_tool
+            activity_sequence = self._activity_sequence
+            api_call_count = self._api_call_count
+            max_iterations = self.max_iterations
+            budget_used = self.iteration_budget.used
+            budget_max = self.iteration_budget.max_total
+        elapsed = max(0.0, time.monotonic() - last_activity_monotonic)
         return {
-            "last_activity_ts": self._last_activity_ts,
-            "last_activity_desc": self._last_activity_desc,
+            "last_activity_ts": last_activity_ts,
+            "last_activity_desc": last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
+            "current_tool": current_tool,
+            "activity_sequence": activity_sequence,
+            "api_call_count": api_call_count,
+            "max_iterations": max_iterations,
+            "budget_used": budget_used,
+            "budget_max": budget_max,
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
