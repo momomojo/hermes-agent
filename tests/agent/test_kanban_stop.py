@@ -6,6 +6,7 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    is_successful_kanban_terminal_result,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
@@ -93,6 +94,29 @@ def test_nudge_budget_exhausted(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None
     assert build_kanban_stop_nudge(messages=[], attempts=1, max_attempts=1) is None
     assert build_kanban_stop_nudge(messages=[], attempts=0, max_attempts=1) is not None
+
+
+@pytest.mark.parametrize("tool_name", ["kanban_complete", "kanban_block"])
+def test_successful_terminal_result_requires_worker_owned_task(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_owned")
+
+    assert is_successful_kanban_terminal_result(
+        tool_name, '{"ok": true, "task_id": "t_owned"}'
+    ) is True
+    assert is_successful_kanban_terminal_result(
+        tool_name, '{"ok": true, "task_id": "t_other"}'
+    ) is False
+    assert is_successful_kanban_terminal_result(
+        tool_name, '{"error": "refused"}'
+    ) is False
+
+
+def test_non_terminal_kanban_results_do_not_stop_worker(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_owned")
+
+    assert is_successful_kanban_terminal_result(
+        "kanban_comment", '{"ok": true, "task_id": "t_owned"}'
+    ) is False
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
