@@ -68,7 +68,7 @@ def is_safe_path(path: Path) -> bool:
 
     Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
     """
-    hermes_home = get_hermes_home().resolve()
+    hermes_home = get_hermes_home()
     try:
         path.resolve().relative_to(hermes_home)
         return True
@@ -110,12 +110,12 @@ def load_tracked() -> List[Dict[str, Any]]:
         return []
 
     try:
-        return json.loads(tf.read_text())
+        return json.loads(tf.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, ValueError):
         bak = tf.with_suffix(".json.bak")
         if bak.exists():
             try:
-                data = json.loads(bak.read_text())
+                data = json.loads(bak.read_text(encoding="utf-8"))
                 _log("WARN: tracked.json corrupted — restored from .bak")
                 return data
             except Exception:
@@ -129,7 +129,7 @@ def save_tracked(tracked: List[Dict[str, Any]]) -> None:
     tf = get_tracked_file()
     tf.parent.mkdir(parents=True, exist_ok=True)
     tmp = tf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tracked, indent=2))
+    tmp.write_text(json.dumps(tracked, indent=2), encoding="utf-8")
     if tf.exists():
         shutil.copy2(tf, tf.with_suffix(".json.bak"))
     tmp.replace(tf)
@@ -147,7 +147,10 @@ ALLOWED_CATEGORIES = {
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     "logs", "memories", "sessions", "cron", "cronjobs",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "desktop-build", "backups", "profiles", ".worktrees", "scripts",
+    "hermes-agent", "backups", "profiles", ".worktrees",
+    # User-authored project trees — never sweep empty directories
+    # inside these (#75403).
+    "patches", "projects", "skins", "themes", "contributors",
 })
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
@@ -177,7 +180,7 @@ def _is_protected_cron_path(p: Path) -> bool:
     # Lazily build the set once per process so HERMES_HOME is resolved
     # exactly once.
     if not _PROTECTED_CRON_PATHS:
-        hermes_home = get_hermes_home().resolve()
+        hermes_home = get_hermes_home()
         for parent in ("cron", "cronjobs"):
             base = hermes_home / parent
             _PROTECTED_CRON_PATHS.add(str(base))
@@ -186,32 +189,6 @@ def _is_protected_cron_path(p: Path) -> bool:
             _PROTECTED_CRON_PATHS.add(str(base / ".tick.lock"))
     resolved = str(p.resolve())
     return resolved in _PROTECTED_CRON_PATHS
-
-
-def _is_durable_source_path(p: Path) -> bool:
-    """Return True for durable source trees that quick() must not prune.
-
-    ``HERMES_HOME`` is profile-local in ordinary agent runs, but fleet-level
-    cleanup runs use the shared root. Cover both layouts, plus the managed
-    desktop build that supplies the runtime plugin used by worker cleanup.
-    """
-    try:
-        rel = p.resolve().relative_to(get_hermes_home().resolve())
-    except (ValueError, OSError):
-        return False
-    parts = rel.parts
-    if not parts:
-        return False
-    if parts[0] in {
-        "scripts", "skills", "plugins", "hermes-agent", "desktop-build",
-        ".worktrees",
-    }:
-        return True
-    return (
-        len(parts) >= 3
-        and parts[0] == "profiles"
-        and parts[2] in {"scripts", "skills", "plugins", ".worktrees"}
-    )
 
 
 def fmt_size(n: float) -> str:
@@ -240,10 +217,6 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 
     if not is_safe_path(path):
         _log(f"REJECT: {path} (outside HERMES_HOME)")
-        return False
-
-    if _is_durable_source_path(path):
-        _log(f"REJECT: {path} (durable source path)")
         return False
 
     size = path.stat().st_size if path.is_file() else 0
@@ -306,11 +279,6 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
                 # Stale entry — would be skipped by quick(); omit from
                 # dry-run output too.
                 continue
-        if _is_durable_source_path(p):
-            # Old or manually edited tracked state can misclassify durable
-            # source under any deletion category. Never advertise it as a
-            # cleanup candidate; quick() drops the stale entry.
-            continue
 
         if cat == "test":
             auto.append(item)
@@ -371,10 +339,20 @@ def quick() -> Dict[str, Any]:
                 # Drop the stale entry — it was misclassified.
                 continue
 
-        if _is_durable_source_path(p):
-            _log(f"SKIP stale cleanup entry for durable source path: {p}")
-            # Drop the stale entry regardless of category — source is durable.
-            continue
+        # ---- stale-state migration for 'test' category (fixes #75403) ----
+        # Old tracked.json entries may carry a "test" category for paths
+        # that are now under protected project directories (patches/,
+        # projects/, etc.).  guess_category() was tightened in the fix for
+        # #75403, but existing entries are never re-validated.  Re-classify
+        # here so stale entries for protected paths are not deleted.
+        if cat == "test":
+            re_cat = guess_category(p)
+            if re_cat != "test":
+                _log(
+                    f"SKIP stale test entry: {p} "
+                    f"(re-classified as {re_cat!r} — under protected tree)"
+                )
+                continue
 
         # Hard safety net: never delete cron control-plane state even if
         # the category somehow slipped through re-validation above.
@@ -408,7 +386,7 @@ def quick() -> Dict[str, Any]:
     # durable state trees.  Some installs place the Hermes checkout, venv,
     # and desktop build under HERMES_HOME; a full rglob over that tree can
     # stall the gateway event loop for minutes.
-    hermes_home = get_hermes_home().resolve()
+    hermes_home = get_hermes_home()
     empty_removed = 0
     sweep_stack: List[Tuple[Path, bool]] = []
     try:
@@ -595,14 +573,19 @@ def guess_category(path: Path) -> Optional[str]:
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
-    hermes_home = get_hermes_home().resolve()
+    hermes_home = get_hermes_home()
     try:
         rel = path.resolve().relative_to(hermes_home)
         top = rel.parts[0] if rel.parts else ""
-        if _is_durable_source_path(path) or top in {
+        if top in {
             "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
             "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
-            "auth.json", "hermes-agent", "scripts",
+            "auth.json", "hermes-agent",
+            # User-authored and project trees — never auto-delete files
+            # inside these just because they happen to be named test_* or
+            # tmp_* (#75403, also #32164, #37721).
+            "patches", "projects", "skins", "themes", "contributors",
+            "profiles", "backups", "optional-skills",
         }:
             return None
         if top == "cron" or top == "cronjobs":

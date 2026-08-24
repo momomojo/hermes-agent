@@ -92,6 +92,79 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
+def _notification_scope_ids(
+    note: dict,
+) -> tuple[Optional[str], Optional[str]]:
+    """Extract the thread/turn identity carried by a notification."""
+    if not isinstance(note, dict):
+        return None, None
+    params = note.get("params") or {}
+    if not isinstance(params, dict):
+        return None, None
+
+    nested_turn = params.get("turn") or {}
+    nested_item = params.get("item") or {}
+
+    observed_thread_id = params.get("threadId") or params.get("thread_id")
+    if observed_thread_id is None and isinstance(nested_turn, dict):
+        observed_thread_id = (
+            nested_turn.get("threadId")
+            or nested_turn.get("thread_id")
+        )
+    if observed_thread_id is None and isinstance(nested_item, dict):
+        observed_thread_id = (
+            nested_item.get("threadId")
+            or nested_item.get("thread_id")
+        )
+
+    observed_turn_id = params.get("turnId") or params.get("turn_id")
+    if observed_turn_id is None and isinstance(nested_turn, dict):
+        observed_turn_id = nested_turn.get("id") or nested_turn.get("turnId")
+    if observed_turn_id is None and isinstance(nested_item, dict):
+        observed_turn_id = (
+            nested_item.get("turnId")
+            or nested_item.get("turn_id")
+        )
+
+    return observed_thread_id, observed_turn_id
+
+
+def _notification_belongs_to_turn(
+    note: dict,
+    *,
+    thread_id: Optional[str],
+    turn_id: Optional[str],
+) -> bool:
+    """Return whether a multiplexed notification belongs to this turn.
+
+    Codex app-server can carry parent and hosted subagent threads over one
+    JSON-RPC connection.  An explicitly foreign child or
+    stale-turn event must not mutate the active parent's transcript or mark
+    its turn complete.  Unscoped notifications remain accepted for protocol
+    compatibility.
+    """
+    if not isinstance(note, dict):
+        return False
+
+    observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+
+    if (
+        thread_id is not None
+        and observed_thread_id is not None
+        and str(observed_thread_id) != str(thread_id)
+    ):
+        return False
+
+    if (
+        turn_id is not None
+        and observed_turn_id is not None
+        and str(observed_turn_id) != str(turn_id)
+    ):
+        return False
+
+    return True
+
+
 def _coerce_turn_input_text(user_input: Any) -> str:
     """Collapse Hermes/OpenAI rich content into app-server text input.
 
@@ -227,6 +300,8 @@ class CodexAppServerSession:
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
+        self._active_turn_id: Optional[str] = None
+        self._active_turn_lock = threading.Lock()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
         # bridge when codex sends item/fileChange/requestApproval. The
@@ -301,6 +376,8 @@ class CodexAppServerSession:
         if self._closed:
             return
         self._closed = True
+        with self._active_turn_lock:
+            self._active_turn_id = None
         if self._client is not None:
             try:
                 self._client.close()
@@ -321,6 +398,33 @@ class CodexAppServerSession:
         """Idempotent: signal the active turn loop to issue turn/interrupt
         and unwind. Called by AIAgent's _interrupt_requested path."""
         self._interrupt_event.set()
+
+    def request_steer(self, text: str) -> bool:
+        """Append user guidance to the active Codex turn via ``turn/steer``."""
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return False
+        with self._active_turn_lock:
+            turn_id = self._active_turn_id
+            thread_id = self._thread_id
+            client = self._client
+        if not turn_id or not thread_id or client is None:
+            return False
+        try:
+            response = client.request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": cleaned}],
+                    "expectedTurnId": turn_id,
+                },
+                timeout=10,
+            )
+        except (CodexAppServerError, TimeoutError):
+            logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
+            return False
+        accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
+        return accepted_turn_id in {None, turn_id}
 
     # ---------- diagnostics ----------
 
@@ -370,20 +474,10 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
-        turn_max_seconds: float = 0.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
-
-        turn_timeout: IDLE timeout, not a wall-clock cap — every codex
-        event (notification or server-initiated request) resets it. A turn
-        only dies on this when codex has emitted nothing at all for this
-        many seconds. Long healthy turns that keep streaming run as long
-        as they need.
-
-        turn_max_seconds: optional hard wall-clock cap on the whole turn
-        regardless of activity. 0 (default) = unbounded.
 
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
@@ -406,11 +500,18 @@ class CodexAppServerSession:
             # Subprocess almost certainly unhealthy — retire so the next
             # turn re-spawns cleanly.
             result.should_retire = True
+            self._interrupt_event.clear()
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
 
-        self._interrupt_event.clear()
+        # Do not clear here: a hard stop can arrive while ensure_started() is
+        # spawning/initializing the subprocess. Honor it before launching a
+        # Codex turn instead of erasing the signal.
+        if self._interrupt_event.is_set():
+            result.interrupted = True
+            self._interrupt_event.clear()
+            return result
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
@@ -442,6 +543,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     "turn/start failed", exc
                 )
+            self._interrupt_event.clear()
             return result
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
@@ -451,19 +553,13 @@ class CodexAppServerSession:
                 "turn/start timed out", exc
             )
             result.should_retire = True
+            self._interrupt_event.clear()
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
-        started_at = time.monotonic()
-        # Liveness-based deadline: any event from codex (notification or
-        # server-initiated request) is proof the turn is alive and extends
-        # the window. turn_timeout therefore bounds *silence*, not total
-        # turn duration — a long healthy turn that streams items for 30
-        # minutes is fine; a turn that goes quiet for turn_timeout is not.
-        # turn_max_seconds (0 = unbounded) is the optional hard wall-clock
-        # cap for callers that need one.
-        last_activity = started_at
-        timeout_reason: Optional[str] = None
+        with self._active_turn_lock:
+            self._active_turn_id = result.turn_id
+        deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -471,20 +567,7 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while not turn_complete:
-            now = time.monotonic()
-            if now - last_activity >= turn_timeout:
-                timeout_reason = (
-                    f"turn idle-timed out after {turn_timeout:.0f}s "
-                    f"without any codex events"
-                )
-                break
-            if turn_max_seconds > 0 and now - started_at >= turn_max_seconds:
-                timeout_reason = (
-                    f"turn exceeded the hard cap of {turn_max_seconds:.0f}s "
-                    f"(codex_app_server.max_turn_seconds)"
-                )
-                break
+        while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -529,7 +612,6 @@ class CodexAppServerSession:
             # reading notifications, so the codex side isn't blocked.
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
-                last_activity = time.monotonic()
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -538,6 +620,17 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
+                    if not _notification_belongs_to_turn(
+                        pending,
+                        thread_id=self._thread_id,
+                        turn_id=result.turn_id,
+                    ):
+                        logger.debug(
+                            "ignoring foreign codex notification while draining "
+                            "server request: method=%s",
+                            pending.get("method"),
+                        )
+                        continue
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -581,9 +674,18 @@ class CodexAppServerSession:
             )
             if note is None:
                 continue
-            last_activity = time.monotonic()
 
             method = note.get("method", "")
+            if not _notification_belongs_to_turn(
+                note,
+                thread_id=self._thread_id,
+                turn_id=result.turn_id,
+            ):
+                logger.debug(
+                    "ignoring foreign codex notification: method=%s", method
+                )
+                continue
+
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -669,19 +771,21 @@ class CodexAppServerSession:
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
-            # Hit a deadline (idle or hard cap). Issue interrupt to stop
-            # wasted compute, and tell the caller to retire the session — a
-            # turn that never finished is a strong sign codex is wedged in a
-            # way the next turn shouldn't inherit.
+            # Hit the deadline. Issue interrupt to stop wasted compute, and
+            # tell the caller to retire the session — a turn that never
+            # finished is a strong sign codex is wedged in a way the next
+            # turn shouldn't inherit.
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    timeout_reason
-                    or f"turn timed out after {turn_timeout}s"
+                    f"turn timed out after {turn_timeout}s"
                 )
             result.should_retire = True
 
+        with self._active_turn_lock:
+            self._active_turn_id = None
+        self._interrupt_event.clear()
         return result
 
     def compact_thread(
@@ -772,6 +876,48 @@ class CodexAppServerSession:
                 continue
 
             method = note.get("method", "")
+            observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+            if result.turn_id is None:
+                if method == "turn/started":
+                    if (
+                        observed_thread_id is not None
+                        and str(observed_thread_id) != str(self._thread_id)
+                    ):
+                        logger.debug(
+                            "ignoring foreign compact turn/started: thread=%s",
+                            observed_thread_id,
+                        )
+                        continue
+                    if observed_turn_id is None:
+                        logger.debug(
+                            "ignoring compact turn/started without a turn id"
+                        )
+                        continue
+                    result.turn_id = str(observed_turn_id)
+                elif observed_turn_id is not None or method in {
+                    "item/completed",
+                    "turn/completed",
+                }:
+                    # thread/compact/start does not return a turn id. Until the
+                    # new turn/started arrives, any terminal/projectable event
+                    # is stale or cannot be safely attributed to this compaction.
+                    logger.debug(
+                        "ignoring codex notification before compact turn start: "
+                        "method=%s",
+                        method,
+                    )
+                    continue
+
+            if not _notification_belongs_to_turn(
+                note,
+                thread_id=self._thread_id,
+                turn_id=result.turn_id,
+            ):
+                logger.debug(
+                    "ignoring foreign codex notification: method=%s", method
+                )
+                continue
+
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -908,6 +1054,18 @@ class CodexAppServerSession:
             )
 
     def _decide_exec_approval(self, params: dict) -> str:
+        """Decide a Codex exec approval request.
+
+        This is protocol-level routing only — it carries NO Hermes
+        approval-mode/timeout logic. The Hermes-side resolution happens
+        upstream: ``agent/codex_runtime.py`` derives
+        ``auto_approve_exec`` from the canonical
+        ``tools.approval.is_approval_bypass_active()`` (which reads
+        ``approvals.mode`` via ``tools.approval._get_approval_mode``),
+        and ``self._approval_callback`` itself runs the shared approval
+        gate (mode + ``approvals.timeout``) in ``tools/approval.py``.
+        Keep it that way — do not re-read approval config here.
+        """
         if self._routing.auto_approve_exec:
             return "accept"
         command = params.get("command") or ""
@@ -931,6 +1089,12 @@ class CodexAppServerSession:
         return "decline"  # fail-closed when no callback wired
 
     def _decide_apply_patch_approval(self, params: dict) -> str:
+        """Decide a Codex apply_patch approval request.
+
+        Protocol-level routing only; Hermes approval-mode/timeout
+        resolution is delegated to ``tools/approval.py`` upstream — see
+        the docstring on ``_decide_exec_approval``.
+        """
         if self._routing.auto_approve_apply_patch:
             return "accept"
         if self._approval_callback is not None:
@@ -1085,11 +1249,18 @@ def _approval_choice_to_codex_decision(choice: str) -> str:
     Codex expects 'accept', 'acceptForSession', 'decline', or 'cancel'
     (verified against codex-rs/app-server-protocol/src/protocol/v2/item.rs
     on codex 0.130.0).
+
+    This mapping is Codex-protocol-semantic and intentionally lives here,
+    NOT in tools/approval.py: the Hermes approval mode/timeout resolution
+    and the choice itself come from the shared core (tools/approval.py);
+    only the wire-value translation is local.
     """
     if choice in {"once",}:
         return "accept"
     if choice in {"session", "always"}:
         return "acceptForSession"
+    # "deny" and "timeout" both map to decline — codex has no wire value for
+    # "prompt expired"; the Hermes-side messaging already distinguishes them.
     return "decline"
 
 

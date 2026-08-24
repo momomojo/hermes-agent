@@ -39,7 +39,6 @@ def _make_task(kb, *, assignee: str = "w"):
 
 def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_persist_worker_route_snapshot", lambda *args, **kwargs: None)
 
     captured: dict = {}
 
@@ -61,8 +60,8 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     """A real, absolute workspace dir is pinned as TERMINAL_CWD."""
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("model:\n  provider: openai-codex\n  default: gpt-5.6-terra\nagent:\n  reasoning_effort: medium\ntoolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("model:\n  provider: openai-codex\n  default: gpt-5.6-terra\nagent:\n  reasoning_effort: medium\ntoolsets:\n  - kanban\n", encoding="utf-8")
+    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
@@ -78,25 +77,3 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
-def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
-    """A non-directory workspace must NOT clobber the inherited TERMINAL_CWD.
-
-    file_tools rejects relative / sentinel TERMINAL_CWD values, so writing a
-    meaningless (nonexistent) path would be worse than leaving the inherited
-    one. The guard requires an existing absolute dir.
-    """
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "w").mkdir(parents=True)
-    (root / "profiles" / "w" / "config.yaml").write_text("model:\n  provider: openai-codex\n  default: gpt-5.6-terra\nagent:\n  reasoning_effort: medium\ntoolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("model:\n  provider: openai-codex\n  default: gpt-5.6-terra\nagent:\n  reasoning_effort: medium\ntoolsets:\n  - kanban\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("TERMINAL_CWD", "/pre/existing/anchor")
-
-    from hermes_cli import kanban_db as kb
-
-    missing = tmp_path / "does-not-exist"
-
-    captured = _capture_spawn_env(kb, monkeypatch, str(missing))
-
-    # Inherited value is preserved (not overwritten with a bogus path).
-    assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"

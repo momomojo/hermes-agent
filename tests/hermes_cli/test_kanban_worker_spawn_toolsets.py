@@ -38,9 +38,6 @@ def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path)
     profile.mkdir(parents=True)
     profile.joinpath("config.yaml").write_text(
         """
-model:
-  provider: openai-codex
-  default: gpt-5.6-terra
 platform_toolsets:
   cli:
     - clarify
@@ -48,7 +45,6 @@ platform_toolsets:
     - delegation
     - file
     - memory
-    - messaging
     - session_search
     - skills
     - terminal
@@ -56,7 +52,6 @@ platform_toolsets:
 toolsets:
   - hermes-cli
 agent:
-  reasoning_effort: medium
   disabled_toolsets: []
 """.lstrip(),
         encoding="utf-8",
@@ -67,8 +62,6 @@ agent:
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    events = []
-    monkeypatch.setattr(kb, "_persist_worker_route_snapshot", lambda *args, **kwargs: events.append("persist"))
 
     captured = {}
 
@@ -79,7 +72,6 @@ agent:
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs.get("env") or {})
         captured["cwd"] = kwargs.get("cwd")
-        events.append("popen")
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -89,52 +81,12 @@ agent:
     pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
-    assert events == ["persist", "popen"]
-    assert captured["env"]["HERMES_KANBAN_MODEL"] == "gpt-5.6-terra"
-    assert captured["env"]["HERMES_KANBAN_REASONING_EFFORT"] == "medium"
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
-    assert "messaging" not in pinned
-
-
-def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
-    """Workers are headless: an inherited HERMES_TUI=1 (or a TUI-default
-    config) must not send the quiet chat run into the Ink TUI, whose no-TTY
-    bail-out exits 0 without doing the task — every attempt then ends in
-    "protocol violation". The spawn pins --cli (highest-precedence interface
-    flag) and strips HERMES_TUI from the child env."""
-    root = tmp_path / ".hermes"
-    (root / "profiles" / "elias").mkdir(parents=True)
-    root.joinpath("config.yaml").write_text("display:\n  interface: tui\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("HERMES_TUI", "1")
-
-    from hermes_cli import kanban_db as kb
-
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-
-    captured = {}
-
-    class FakeProc:
-        pid = 4243
-
-    def fake_popen(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["env"] = dict(kwargs.get("env") or {})
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
-
-    assert "--cli" in captured["cmd"]
-    assert "HERMES_TUI" not in captured["env"]
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):

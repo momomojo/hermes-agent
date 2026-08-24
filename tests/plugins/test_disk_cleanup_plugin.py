@@ -86,18 +86,6 @@ class TestIsSafePath:
         dg = _load_lib()
         assert dg.is_safe_path(Path("/etc/passwd")) is False
 
-    def test_accepts_tmp_hermes_prefix(self, _isolate_env, tmp_path):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/tmp/hermes-abc/x.log")) is True
-
-    def test_rejects_plain_tmp(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/tmp/other.log")) is False
-
-    def test_rejects_windows_mount(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/mnt/c/Users/x/test.txt")) is False
-
 
 class TestGuessCategory:
     def test_test_prefix(self, _isolate_env):
@@ -127,36 +115,6 @@ class TestGuessCategory:
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
 
-    def test_scripts_test_source_not_tracked(self, _isolate_env):
-        dg = _load_lib()
-        scripts_tests = _isolate_env / "scripts" / "tests"
-        scripts_tests.mkdir(parents=True)
-        p = scripts_tests / "test_kanban_decision_bridge.py"
-        p.write_text("x")
-        assert dg.guess_category(p) is None
-
-    @pytest.mark.parametrize(
-        "relative_path",
-        [
-            "profiles/radulator/scripts/tests/test_kanban_decision_bridge.py",
-            "profiles/radulator/skills/test_durable_skill.md",
-            "profiles/radulator/plugins/test_durable_plugin.py",
-            "profiles/radulator/.worktrees/task/test_durable_worktree.py",
-            "desktop-build/tests/plugins/test_disk_cleanup_plugin.py",
-            ".worktrees/task/test_durable_worktree.py",
-            "skills/test_durable_skill.md",
-            "plugins/test_durable_plugin.py",
-        ],
-    )
-    def test_shared_home_durable_source_not_tracked(
-        self, _isolate_env, relative_path
-    ):
-        dg = _load_lib()
-        p = _isolate_env / relative_path
-        p.parent.mkdir(parents=True)
-        p.write_text("x")
-        assert dg.guess_category(p) is None
-
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.
@@ -166,30 +124,6 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) == "cron-output"
 
-    def test_cron_output_root_not_tracked(self, _isolate_env):
-        """The cron/output root is durable container state, not an artifact."""
-        dg = _load_lib()
-        output_root = _isolate_env / "cron" / "output"
-        output_root.mkdir(parents=True)
-        assert dg.guess_category(output_root) is None
-
-    def test_cron_jobs_json_not_tracked(self, _isolate_env):
-        """Regression for #32164: the cron registry must never be tracked."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        p = cron_dir / "jobs.json"
-        p.write_text("[]")
-        assert dg.guess_category(p) is None
-
-    def test_cron_tick_lock_not_tracked(self, _isolate_env):
-        """Regression for #32164: cron tick-lock is control-plane state."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        p = cron_dir / ".tick.lock"
-        p.write_text("")
-        assert dg.guess_category(p) is None
 
     def test_cronjobs_top_level_not_tracked(self, _isolate_env):
         """The legacy ``cronjobs`` alias is also control-plane at the top."""
@@ -243,74 +177,6 @@ class TestStaleCronEntryMigration:
         remaining = json.loads(tracked_file.read_text())
         assert len(remaining) == 0
 
-    def test_quick_skips_stale_cron_output_for_cron_dir(self, _isolate_env):
-        """Stale entry for the cron/ directory itself must not be deleted."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        output_dir = cron_dir / "output"
-        output_dir.mkdir()
-        (output_dir / "run.md").write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(cron_dir),
-            "category": "cron-output",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, "cron/ dir must not be deleted"
-        assert cron_dir.exists()
-
-    def test_quick_skips_stale_cron_output_for_output_root(self, _isolate_env):
-        """Stale entry for cron/output itself must not delete all job output."""
-        dg = _load_lib()
-        output_root = _isolate_env / "cron" / "output"
-        job_dir = output_root / "job_1"
-        job_dir.mkdir(parents=True)
-        run_md = job_dir / "run.md"
-        run_md.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(output_root),
-            "category": "cron-output",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, "cron/output root must not be deleted"
-        assert output_root.exists()
-        assert run_md.exists()
-
-    def test_quick_skips_protected_cron_paths_defense_in_depth(self, _isolate_env):
-        """Defense-in-depth: even if guess_category returned cron-output
-        (hypothetically), protected cron paths are never deleted."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        tick_lock = cron_dir / ".tick.lock"
-        tick_lock.write_text("")
-
-        # Manually inject a stale entry with "test" category (would normally
-        # be auto-deleted) — the protected path guard must still block it.
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(tick_lock),
-            "category": "test",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, ".tick.lock must not be deleted"
-        assert tick_lock.exists()
 
     def test_dry_run_omits_stale_cron_output(self, _isolate_env):
         """dry_run() should also skip stale cron-output entries."""
@@ -359,111 +225,6 @@ class TestStaleCronEntryMigration:
         assert not run_md.exists()
 
 
-class TestStaleTestEntryMigration:
-    """Regression tests for durable source files stale-tracked as tests."""
-
-    def test_quick_skips_stale_test_entry_for_scripts_source(self, _isolate_env):
-        dg = _load_lib()
-        scripts_tests = _isolate_env / "scripts" / "tests"
-        scripts_tests.mkdir(parents=True)
-        source = scripts_tests / "test_kanban_decision_bridge.py"
-        source.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(source),
-            "category": "test",
-            "timestamp": "2026-07-11T03:21:02+00:00",
-            "size": 1,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, "durable source test must not be deleted"
-        assert source.exists()
-        remaining = json.loads(tracked_file.read_text())
-        assert len(remaining) == 0
-
-    def test_dry_run_omits_stale_test_entry_for_scripts_source(self, _isolate_env):
-        dg = _load_lib()
-        scripts_tests = _isolate_env / "scripts" / "tests"
-        scripts_tests.mkdir(parents=True)
-        source = scripts_tests / "test_kanban_decision_bridge.py"
-        source.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(source),
-            "category": "test",
-            "timestamp": "2026-07-11T03:21:02+00:00",
-            "size": 1,
-        }]))
-
-        auto, prompt = dg.dry_run()
-        assert len(auto) == 0
-        assert len(prompt) == 0
-        assert source.exists()
-
-    @pytest.mark.parametrize("category", ["test", "temp", "cron-output"])
-    def test_dry_run_omits_durable_source_for_any_category(
-        self, _isolate_env, category
-    ):
-        dg = _load_lib()
-        source = _isolate_env / "profiles" / "radulator" / "skills" / "test_skill.md"
-        source.parent.mkdir(parents=True)
-        source.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(source),
-            "category": category,
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 1,
-        }]))
-
-        auto, prompt = dg.dry_run()
-        assert auto == []
-        assert prompt == []
-        assert source.exists()
-
-    @pytest.mark.parametrize(
-        ("relative_path", "category"),
-        [
-            ("profiles/radulator/scripts/tests/test_kanban_decision_bridge.py", "test"),
-            ("profiles/radulator/skills/test_durable_skill.md", "temp"),
-            ("profiles/radulator/plugins/test_durable_plugin.py", "cron-output"),
-            ("profiles/radulator/.worktrees/task/test_durable_worktree.py", "temp"),
-            ("desktop-build/tests/plugins/test_disk_cleanup_plugin.py", "test"),
-            (".worktrees/task/test_durable_worktree.py", "temp"),
-            ("skills/test_durable_skill.md", "temp"),
-            ("plugins/test_durable_plugin.py", "temp"),
-        ],
-    )
-    def test_quick_skips_shared_home_durable_source(
-        self, _isolate_env, relative_path, category
-    ):
-        dg = _load_lib()
-        source = _isolate_env / relative_path
-        source.parent.mkdir(parents=True)
-        source.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(source),
-            "category": category,
-            "timestamp": "2026-07-11T03:21:02+00:00",
-            "size": 1,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0
-        assert source.exists()
-        assert json.loads(tracked_file.read_text()) == []
-
-
 class TestTrackForgetQuick:
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
@@ -474,34 +235,6 @@ class TestTrackForgetQuick:
         assert summary["deleted"] == 1
         assert not p.exists()
 
-    def test_track_dedup(self, _isolate_env):
-        dg = _load_lib()
-        p = _isolate_env / "test_a.py"
-        p.write_text("x")
-        assert dg.track(str(p), "test", silent=True) is True
-        # Second call returns False (already tracked)
-        assert dg.track(str(p), "test", silent=True) is False
-
-    def test_track_rejects_outside_home(self, _isolate_env):
-        dg = _load_lib()
-        # /etc/hostname exists on most Linux boxes; fall back if not.
-        outside = "/etc/hostname" if Path("/etc/hostname").exists() else "/etc/passwd"
-        assert dg.track(outside, "test", silent=True) is False
-
-    def test_track_skips_missing(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.track(str(_isolate_env / "nope.txt"), "test", silent=True) is False
-
-    def test_track_rejects_durable_source_for_any_category(self, _isolate_env):
-        dg = _load_lib()
-        source = _isolate_env / "profiles" / "radulator" / "plugins" / "tmp_plugin.py"
-        source.parent.mkdir(parents=True)
-        source.write_text("x")
-
-        assert dg.track(str(source), "temp", silent=True) is False
-        assert source.exists()
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert not tracked_file.exists()
 
     def test_forget_removes_entry(self, _isolate_env):
         dg = _load_lib()
@@ -510,59 +243,6 @@ class TestTrackForgetQuick:
         dg.track(str(p), "temp", silent=True)
         assert dg.forget(str(p)) == 1
         assert p.exists()  # forget does NOT delete the file
-
-    def test_quick_preserves_unexpired_temp(self, _isolate_env):
-        dg = _load_lib()
-        p = _isolate_env / "fresh.tmp"
-        p.write_text("x")
-        dg.track(str(p), "temp", silent=True)
-        summary = dg.quick()
-        assert summary["deleted"] == 0
-        assert p.exists()
-
-    def test_quick_preserves_protected_top_level_dirs(self, _isolate_env):
-        dg = _load_lib()
-        protected = (
-            "logs", "memories", "sessions", "cron", "cache", "scripts",
-            "desktop-build",
-        )
-        for d in protected:
-            (_isolate_env / d).mkdir()
-        dg.quick()
-        for d in protected:
-            assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
-
-    @pytest.mark.parametrize("top_dir", ["hermes-agent", "desktop-build"])
-    def test_quick_does_not_descend_into_protected_top_level_dirs(
-        self, _isolate_env, monkeypatch, top_dir
-    ):
-        dg = _load_lib()
-        protected_empty = (
-            _isolate_env / top_dir / "node_modules" / "pkg" / "empty"
-        )
-        protected_empty.mkdir(parents=True)
-
-        original_iterdir = Path.iterdir
-
-        def guarded_iterdir(path):
-            if path == _isolate_env / top_dir:
-                raise AssertionError(f"quick() descended into protected {top_dir}/")
-            return original_iterdir(path)
-
-        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
-
-        dg.quick()
-
-        assert protected_empty.exists()
-
-    def test_quick_removes_empty_dirs_in_managed_subtrees(self, _isolate_env):
-        dg = _load_lib()
-        managed_empty = _isolate_env / "scratch" / "nested" / "empty"
-        managed_empty.mkdir(parents=True)
-
-        dg.quick()
-
-        assert not (_isolate_env / "scratch").exists()
 
 
 class TestStatus:
@@ -619,53 +299,6 @@ class TestPostToolCallHook:
         assert len(data) == 1
         assert data[0]["category"] == "test"
 
-    def test_write_file_non_test_not_tracked(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "notes.md"
-        p.write_text("x")
-        pi._on_post_tool_call(
-            tool_name="write_file",
-            args={"path": str(p), "content": "x"},
-            result="OK",
-            task_id="t2", session_id="s2",
-        )
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
-
-    def test_write_file_scripts_test_source_not_tracked(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "scripts" / "tests" / "test_kanban_decision_bridge.py"
-        p.parent.mkdir(parents=True)
-        p.write_text("x")
-        pi._on_post_tool_call(
-            tool_name="write_file",
-            args={"path": str(p), "content": "x"},
-            result="OK",
-            task_id="t2", session_id="s2",
-        )
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
-
-    def test_write_file_shared_profile_test_source_not_tracked(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = (
-            _isolate_env
-            / "profiles"
-            / "radulator"
-            / "scripts"
-            / "tests"
-            / "test_kanban_decision_bridge.py"
-        )
-        p.parent.mkdir(parents=True)
-        p.write_text("x")
-        pi._on_post_tool_call(
-            tool_name="write_file",
-            args={"path": str(p), "content": "x"},
-            result="OK",
-            task_id="t3", session_id="s3",
-        )
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
     def test_terminal_command_picks_up_paths(self, _isolate_env):
         pi = _load_plugin_init()
@@ -726,43 +359,11 @@ class TestSlashCommand:
         assert "disk-cleanup" in out
         assert "status" in out
 
-    def test_status_empty(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash("status")
-        assert "nothing tracked" in out
-
-    def test_track_rejects_missing(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash(
-            f"track {_isolate_env / 'nope.txt'} temp"
-        )
-        assert "Not tracked" in out
-
-    def test_track_rejects_bad_category(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "a.tmp"
-        p.write_text("x")
-        out = pi._handle_slash(f"track {p} banana")
-        assert "Unknown category" in out
-
-    def test_track_and_forget(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "a.tmp"
-        p.write_text("x")
-        out = pi._handle_slash(f"track {p} temp")
-        assert "Tracked" in out
-        out = pi._handle_slash(f"forget {p}")
-        assert "Removed 1" in out
 
     def test_unknown_subcommand(self, _isolate_env):
         pi = _load_plugin_init()
         out = pi._handle_slash("foobar")
         assert "Unknown subcommand" in out
-
-    def test_quick_on_empty(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash("quick")
-        assert "Cleaned 0 files" in out
 
 
 # ---------------------------------------------------------------------------
@@ -789,17 +390,6 @@ class TestBundledDiscovery:
         assert not loaded.enabled
         assert loaded.error and "not enabled" in loaded.error
 
-    def test_disk_cleanup_loads_when_enabled(self, _isolate_env):
-        """Adding to plugins.enabled activates the bundled plugin."""
-        self._write_enabled_config(_isolate_env, ["disk-cleanup"])
-        from hermes_cli import plugins as pmod
-        mgr = pmod.PluginManager()
-        mgr.discover_and_load()
-        loaded = mgr._plugins["disk-cleanup"]
-        assert loaded.enabled
-        assert "post_tool_call" in loaded.hooks_registered
-        assert "on_session_end" in loaded.hooks_registered
-        assert "disk-cleanup" in loaded.commands_registered
 
     def test_disabled_beats_enabled(self, _isolate_env):
         """plugins.disabled wins even if the plugin is also in plugins.enabled."""

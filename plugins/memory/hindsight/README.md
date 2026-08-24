@@ -14,7 +14,7 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy ret
 hermes memory setup    # select "hindsight"
 ```
 
-The setup wizard will install dependencies automatically via `uv` and walk you through configuration.
+The setup wizard installs dependencies automatically via `uv`, walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank.
 
 Or manually (cloud mode with defaults):
 ```bash
@@ -74,13 +74,11 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
-| `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` / `exact` |
+| `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
-| `recall_prefer_observations` | `false` | Hindsight 0.8+ opt-in: when recalling `observation` together with raw `world`/`experience`, drop raw facts that returned observations supersede and backfill with next-best results. Disabled by default to preserve exact recall behavior. |
-| `recall_min_scores` | — | Hindsight 0.8+ optional per-stage recall score floors as an object with any of `semantic`, `keyword`, `reranker`, `final`. Use sparingly; reranker scores are not calibrated across queries. |
-| `recall_trace` | `false` | Hindsight 0.8+ opt-in trace/debug output for recall requests. |
-| `recall_include_scores` | `false` | Include per-result recall `scores` in `hindsight_recall` tool output when the server returns them. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
+| `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
+| `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
@@ -88,7 +86,7 @@ Config file: `~/.hermes/hindsight/config.json`
 >
 > Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
 >
-> Restore broad default recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`, or use the `hindsight_recall` tool's per-call `types` argument for one-off broad history/provenance searches. Narrowing the default still narrows both auto-recall and tool calls that omit `types`.
+> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
 
 ### Retain
 
@@ -99,7 +97,8 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
-| `retain_source` | — | Optional `metadata.source` attached to retained memories |
+| `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
+| `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 
@@ -131,7 +130,7 @@ Available in `hybrid` and `tools` memory modes:
 | Tool | Description |
 |------|-------------|
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
-| `hindsight_recall` | Multi-strategy search (semantic + entity graph); supports per-call `types`, `tags`, `tags_match`, `query_timestamp`, `budget`, `max_tokens`, and Hindsight 0.8+ opt-ins `prefer_observations`, `min_scores`, `trace`, `include_scores` |
+| `hindsight_recall` | Multi-strategy search (semantic + entity graph) |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
 
 ## Environment Variables
@@ -148,4 +147,4 @@ Available in `hybrid` and `tools` memory modes:
 
 ## Client Version
 
-Requires `hindsight-client >= 0.8.4`. The plugin auto-upgrades on session start if an older version is detected.
+Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.

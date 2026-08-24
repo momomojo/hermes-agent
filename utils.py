@@ -1,18 +1,15 @@
 """Shared utility functions for hermes-agent."""
 
-import contextlib
 import errno
-import hashlib
 import json
 import logging
 import os
 import shutil
 import stat
-import sys
 import tempfile
-import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -92,6 +89,108 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+_IS_WINDOWS = os.name == "nt"
+
+# Windows rename failures that can be caused by another handle on the target
+# rather than by a permission problem.  ``os.replace`` onto a file that any
+# other handle has open is denied because CPython opens files without
+# ``FILE_SHARE_DELETE``:
+#
+#   5  ERROR_ACCESS_DENIED    — what a held *target* handle actually reports
+#   32 ERROR_SHARING_VIOLATION — reported when the *source* temp file is held
+#   33 ERROR_LOCK_VIOLATION    — byte-range lock on the target
+#
+# Measured on Windows 11 (build 26200, CPython 3.11): a plain reader on the
+# target — in-process or cross-process — yields winerror 5, NOT 32.  Keying
+# recovery on 32 alone therefore misses every real occurrence of this bug.
+# These codes are ambiguous (a genuine ACL denial is also 5), which is why
+# recovery is bounded and any still-failing write is re-raised unchanged
+# rather than being classified up front.
+_WINDOWS_CONTENDED_REPLACE_ERRORS = frozenset({5, 32, 33})
+
+# Retry budget for the atomic rename.  A rename that wins here keeps the write
+# fully atomic, so the budget is sized to cover a realistic contended hold: an
+# observed desktop auth-init holds auth.json past 100 ms, while an ordinary
+# status read is ~0.05 ms.  Measured on Windows 11 build 26200, this recovers
+# holds up to ~200 ms atomically (~310 ms worst case).
+#
+# The cap matters as much as the attempt count.  gateway_state.json is
+# rewritten at every turn boundary, so a permanently-held target pays the full
+# budget on every write: a longer 6 x 20..400 ms budget cost ~1.3 s per write
+# under a persistent reader, versus ~0.3 s here for the same atomic coverage.
+# Jittered so concurrent writers don't retry in lockstep.
+_REPLACE_RETRY_ATTEMPTS = 4
+_REPLACE_RETRY_BASE_DELAY_S = 0.02
+_REPLACE_RETRY_MAX_DELAY_S = 0.1
+
+
+def _is_contended_windows_replace_error(exc: OSError) -> bool:
+    """Return True for Windows rename failures a retry might clear.
+
+    Only a *candidate* classification: ``ERROR_ACCESS_DENIED`` covers both a
+    concurrent handle and a real ACL denial, and the two are not reliably
+    distinguishable up front.  Probing the target with ``os.access`` does not
+    work — ``os.replace`` needs delete-child rights on the *parent directory*,
+    so a directory-level denial reports the target as writable.  Instead of
+    guessing, both cases enter the same bounded retry and a genuine denial
+    falls through to the caller with its original error.
+    """
+    return _IS_WINDOWS and getattr(exc, "winerror", None) in (
+        _WINDOWS_CONTENDED_REPLACE_ERRORS
+    )
+
+
+def _rewrite_in_place(tmp_str: str, real_path: str) -> None:
+    """Overwrite *real_path* with the contents of *tmp_str*, in place.
+
+    Last-resort path for a target whose handle is still held after the retry
+    budget: writing through the existing file works where renaming onto it
+    does not.  Unlike ``shutil.copyfile`` this never truncates the target to
+    zero first — a concurrent reader would otherwise be able to observe an
+    empty ``auth.json`` / ``gateway_state.json`` mid-write (measured: a
+    4-thread poller sees a 0-byte read during a plain copyfile).  A single
+    ``os.write`` of the full payload followed by ``ftruncate`` keeps the
+    visible content going straight from old to new.
+
+    This is still not atomic — it is a strictly smaller window than a copy,
+    not the absence of one — so it runs only after the rename has genuinely
+    failed.  Writing through the target also preserves its ACL, which
+    ``os.replace`` does not (the temp file's inherited ACL wins there).
+    """
+    with open(tmp_str, "rb") as src:
+        data = src.read()
+    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(real_path, flags)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.ftruncate(fd, len(data))
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+    os.unlink(tmp_str)
+
+
+def _copy_fallback(tmp_str: str, real_path: str) -> None:
+    """Copy/fsync/unlink fallback for cross-device and bind-mount renames."""
+    shutil.copyfile(tmp_str, real_path)
+    try:
+        shutil.copystat(tmp_str, real_path)
+    except OSError:
+        pass
+    try:
+        with open(real_path, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    os.unlink(tmp_str)
+
+
 def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
@@ -105,9 +204,21 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     This helper resolves the symlink first so ``os.replace`` writes to
     the real file in-place while the symlink survives.  For non-symlink
     and non-existent paths the behavior is identical to a plain
-    ``os.replace`` call unless the rename fails with ``EXDEV`` or ``EBUSY``;
-    those cases fall back to copy/fsync/unlink for cross-device, bind-mount,
-    and busy-file deployments.
+    ``os.replace`` call unless the rename fails with:
+
+    * ``EXDEV`` / ``EBUSY`` (any platform) — cross-device, bind-mount, and
+      busy-file deployments fall back to copy/fsync/unlink immediately.
+      These never clear on retry.
+    * A Windows rename contended by another open handle (winerror 5/32/33).
+      CPython opens files without ``FILE_SHARE_DELETE``, so *any* concurrent
+      reader of the target blocks the rename.  The rename is retried with
+      jittered backoff first — a retry that wins keeps the write atomic —
+      and only a target whose handle outlives the budget is rewritten in
+      place, so the update lands instead of being silently dropped.
+
+    A genuine Windows permission failure produces the same winerror as a
+    contended one, so it is not classified up front: it exhausts the retry
+    budget, fails the in-place rewrite too, and is re-raised unchanged.
 
     Returns the resolved real path used for the replace, so callers that
     need to re-apply permissions can target it instead of the symlink.
@@ -117,203 +228,119 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     tmp_str = str(tmp_path)
     try:
         os.replace(tmp_str, real_path)
+        return real_path
     except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
+        contended = _is_contended_windows_replace_error(exc)
+        if exc.errno not in (errno.EXDEV, errno.EBUSY) and not contended:
             raise
+        if contended:
+            # Lazy import: keeps ``utils`` free of a package-level dependency
+            # on ``agent`` for every consumer that never hits this path.
+            from agent.retry_utils import jittered_backoff
+
+            for attempt in range(1, _REPLACE_RETRY_ATTEMPTS + 1):
+                time.sleep(
+                    jittered_backoff(
+                        attempt,
+                        base_delay=_REPLACE_RETRY_BASE_DELAY_S,
+                        max_delay=_REPLACE_RETRY_MAX_DELAY_S,
+                    )
+                )
+                try:
+                    os.replace(tmp_str, real_path)
+                    return real_path
+                except OSError as retry_exc:
+                    if retry_exc.errno in (errno.EXDEV, errno.EBUSY):
+                        # Not contention after all — stop burning the budget.
+                        exc = retry_exc
+                        contended = False
+                        break
+                    if not _is_contended_windows_replace_error(retry_exc):
+                        raise
+                    exc = retry_exc
         logger.debug(
-            "atomic_replace: %s -> %s failed with %s; falling back to copy",
+            "atomic_replace: %s -> %s failed with %s; falling back to %s",
             tmp_str,
             real_path,
-            errno.errorcode.get(exc.errno, exc.errno),
+            getattr(exc, "winerror", None)
+            or errno.errorcode.get(exc.errno or 0, exc.errno),
+            "in-place rewrite" if contended else "copy",
         )
-        shutil.copyfile(tmp_str, real_path)
-        try:
-            shutil.copystat(tmp_str, real_path)
-        except OSError:
-            pass
-        try:
-            with open(real_path, "rb") as f:
-                os.fsync(f.fileno())
-        except OSError:
-            pass
-        os.unlink(tmp_str)
+        if contended:
+            # Re-raises the rewrite's own error (not the rename's) when the
+            # target is genuinely unwritable — an ACL denial stays an ACL
+            # denial rather than being reported as contention.
+            _rewrite_in_place(tmp_str, real_path)
+        else:
+            _copy_fallback(tmp_str, real_path)
     return real_path
 
 
-# ─── Config Write Locking ─────────────────────────────────────────────────────
-#
-# atomic_yaml_write makes individual writes crash-safe, but two concurrent
-# read-modify-write cycles still race last-writer-wins: both read the same
-# config.yaml, each applies its own edit, and whichever os.replace lands
-# second silently drops the other's change.  The helpers below add the
-# missing serialization, mirroring the kanban _cross_process_init_lock
-# pattern (hermes_cli/kanban_db.py): an advisory lock on a sidecar file
-# (flock on POSIX, msvcrt byte-range on Windows) held across the FULL
-# read→edit→os.replace cycle, plus an mtime+hash stale-write guard as a
-# backstop against writers that don't take the lock (older binaries,
-# manual edits mid-cycle).
+def atomic_write_text(
+    path: Union[str, Path],
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    tmp_prefix: str = ".tmp_",
+    preserve_mode: bool = False,
+    create_mode: "int | None" = None,
+) -> None:
+    """Write *content* to *path* via temp file + fsync + atomic rename.
 
-_IS_WINDOWS = sys.platform == "win32"
+    Ensures the target file is never left in a partially-written state if
+    the process crashes or is interrupted.  ``atomic_replace`` preserves
+    symlinks and handles cross-device / busy-file fallbacks.
 
-# Sentinel distinguishing "no stale check requested" from "file was absent
-# at read time" (where the snapshot itself is None).
-_STATE_UNCHECKED = object()
+    Used by the memory store, skill manager, and agent importer so that
+    every destructive file rewrite in the codebase shares one implementation.
 
-# Returned by a locked_yaml_mutate() mutate callback to skip the write
-# entirely (e.g. the value is already set).
-SKIP_WRITE = object()
-
-
-class ConfigWriteConflictError(RuntimeError):
-    """Config file changed on disk between read and write.
-
-    Raised by the stale-write guard when a concurrent writer (one not
-    holding the config lock) modified the file mid read-modify-write
-    cycle.  Persisting anyway would silently revert that writer's change.
-    """
-
-
-def file_write_state(path: Union[str, Path]) -> "tuple | None":
-    """Snapshot (mtime_ns, size, sha256) of *path*, or ``None`` if absent.
-
-    Capture this at read time and pass it as ``expected_state`` to
-    :func:`atomic_yaml_write` to detect writes that raced the cycle.
-    Follows symlinks, matching :func:`atomic_replace` semantics.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                digest.update(chunk)
-    except OSError:
-        return None
-    return (st.st_mtime_ns, st.st_size, digest.hexdigest())
-
-
-def config_lock_path(path: Union[str, Path]) -> Path:
-    """Sidecar lock file guarding read-modify-write cycles on *path*.
-
-    For ``~/.hermes/config.yaml`` this is ``~/.hermes/.config.lock``; for a
-    profile's ``~/.hermes/profiles/<p>/config.yaml`` it is
-    ``~/.hermes/profiles/<p>/.config.lock`` — one lock per config file, so
-    profiles don't serialize against each other or against global config.
+    Args:
+        preserve_mode: When True, carry an existing target's permission bits
+            and (POSIX, best-effort) owner across the replace, like
+            ``atomic_yaml_write`` does unconditionally.  ``os.replace`` swaps
+            in mkstemp's 0600 temp file owned by the writing user, so without
+            this a root-run rewrite of a user-owned file flips its owner and
+            tightens its mode.  The mode is applied to the temp fd *before*
+            the replace, so the file never transits through 0600.  Off by
+            default: the historical callers (memory store, skill manager,
+            cron) own their 0600-is-fine files.
+        create_mode: Permission bits to apply when the target does not yet
+            exist (otherwise the new file keeps mkstemp's 0600).  Never
+            applied to an existing file.
     """
     path = Path(path)
-    return path.parent / f".{path.stem}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
 
+    original_mode = _preserve_file_mode(path) if preserve_mode else None
+    original_owner = _preserve_file_owner(path) if preserve_mode else None
+    effective_mode = original_mode
+    if effective_mode is None and create_mode is not None and not path.exists():
+        effective_mode = create_mode
 
-class _ConfigLockState:
-    """Per-lock-path state: thread gate + re-entrancy depth + OS handle."""
-
-    __slots__ = ("thread_lock", "depth", "handle")
-
-    def __init__(self) -> None:
-        self.thread_lock = threading.RLock()
-        self.depth = 0
-        self.handle = None
-
-
-_CONFIG_LOCK_STATES: "dict[str, _ConfigLockState]" = {}
-_CONFIG_LOCK_REGISTRY_GUARD = threading.Lock()
-
-
-def _reset_config_locks_after_fork() -> None:
-    """Drop inherited lock state in a forked child.
-
-    A child forked while the parent holds a config lock inherits a registry
-    whose depth>0 entry would make the child skip the flock and write inside
-    the parent's critical section.  Resetting forces the child to acquire
-    fresh (it blocks until the parent releases).  The inherited handle is
-    abandoned, not closed here — the parent's fd keeps the flock alive, and
-    closing one duplicate of a shared open-file description doesn't release
-    it anyway.
-    """
-    global _CONFIG_LOCK_STATES, _CONFIG_LOCK_REGISTRY_GUARD
-    _CONFIG_LOCK_REGISTRY_GUARD = threading.Lock()
-    _CONFIG_LOCK_STATES = {}
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_config_locks_after_fork)
-
-
-@contextlib.contextmanager
-def config_file_lock(path: Union[str, Path]):
-    """Advisory cross-process lock for a config read-modify-write cycle.
-
-    Hold this across the FULL cycle (read → edit → os.replace), not just
-    the write — locking only the write still loses updates because both
-    writers read the same starting state.
-
-    Re-entrant within a thread (``save_config`` may run inside a caller's
-    locked cycle); distinct threads in one process serialize on a per-path
-    RLock, and distinct processes serialize on the sidecar file lock.
-    """
-    lock_path = config_lock_path(path)
-    key = str(lock_path)
-    with _CONFIG_LOCK_REGISTRY_GUARD:
-        state = _CONFIG_LOCK_STATES.setdefault(key, _ConfigLockState())
-    with state.thread_lock:
-        if state.depth == 0:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = lock_path.open("a+b")
-            try:
-                if _IS_WINDOWS:
-                    import msvcrt
-
-                    # Byte-range lock on the first byte; seek explicitly
-                    # because msvcrt.locking starts at the file position.
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            except BaseException:
-                handle.close()
-                raise
-            state.handle = handle
-        state.depth += 1
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            if effective_mode is not None and hasattr(os, "fchmod"):
+                # fchmod the temp fd BEFORE the replace so the target never
+                # transits through mkstemp's 0600. fchmod is Unix-only; on
+                # Windows the post-replace chmod below applies the mode.
+                os.fchmod(handle.fileno(), effective_mode)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        if preserve_mode:
+            _restore_file_owner(Path(real_path), original_owner)
+        if effective_mode is not None and not hasattr(os, "fchmod"):
+            _restore_file_mode(Path(real_path), effective_mode)
+    except BaseException:
         try:
-            yield
-        finally:
-            state.depth -= 1
-            if state.depth == 0:
-                handle = state.handle
-                state.handle = None
-                try:
-                    if _IS_WINDOWS:
-                        import msvcrt
-
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                finally:
-                    handle.close()
-
-
-def _replace_with_guard(tmp_path: str, path: Path, expected_state: Any) -> str:
-    """Atomically swap *tmp_path* onto *path*, enforcing the stale guard.
-
-    The re-stat happens immediately before ``os.replace``; the residual
-    window is closed by callers holding :func:`config_file_lock` — the
-    guard exists to catch writers that bypass the lock.
-    """
-    if expected_state is not _STATE_UNCHECKED:
-        current = file_write_state(path)
-        if current != expected_state:
-            raise ConfigWriteConflictError(
-                f"{path} changed on disk since it was read; aborting write to "
-                f"avoid reverting the concurrent change (re-read and retry)"
-            )
-    return atomic_replace(tmp_path, path)
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def atomic_json_write(
@@ -388,6 +415,47 @@ def atomic_json_write(
         raise
 
 
+def warn_if_credential_file_broadly_readable(
+    path: Union[str, Path],
+    *,
+    label: str = "",
+    log: logging.Logger | None = None,
+) -> bool:
+    """Warn (once per call) when a credential file is group/world-readable.
+
+    Secret-bearing files that users create by hand (or that older Hermes
+    versions wrote without an explicit mode) commonly end up 0o644 under the
+    default umask. This helper is the shared read-time check for that class:
+    call it before loading any token/credential file so the owner gets a
+    remediation hint in the logs.
+
+    Returns True when a warning was emitted. No-ops (returns False) on
+    platforms without POSIX permission bits semantics (best effort), when the
+    file is missing, or when permissions are already tight.
+    """
+    p = Path(path)
+    _log = log or logger
+    try:
+        file_mode = p.stat().st_mode
+    except OSError:
+        return False
+    if os.name != "posix":
+        # Windows ACLs don't map onto POSIX group/other bits; st_mode there
+        # is synthesized and would false-positive.
+        return False
+    if not (file_mode & (stat.S_IRGRP | stat.S_IROTH)):
+        return False
+    _log.warning(
+        "%s%s is group/world-readable (mode 0%o) and contains secrets. "
+        "Run: chmod 600 %s",
+        f"{label} " if label else "",
+        p.name,
+        stat.S_IMODE(file_mode),
+        p,
+    )
+    return True
+
+
 class IndentDumper(yaml.SafeDumper):
     """PyYAML dumper that indents list items under mapping keys (2-space).
 
@@ -411,7 +479,7 @@ def atomic_yaml_write(
     default_flow_style: bool = False,
     sort_keys: bool = False,
     extra_content: str | None = None,
-    expected_state: Any = _STATE_UNCHECKED,
+    create_mode: "int | None" = None,
 ) -> None:
     """Write YAML data to a file atomically.
 
@@ -426,17 +494,17 @@ def atomic_yaml_write(
         sort_keys: Whether to sort dict keys (default False).
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
-        expected_state: Stale-write guard for read-modify-write callers —
-            pass the :func:`file_write_state` snapshot captured when the
-            file was read (``None`` if it was absent).  If the file
-            changed since, raises :class:`ConfigWriteConflictError`
-            instead of replacing.  Omit for plain overwrites.
+        create_mode: Permission bits to apply when the target does not yet
+            exist (a created file otherwise keeps mkstemp's 0600).  Never
+            applied to an existing file, whose mode is always preserved.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     original_mode = _preserve_file_mode(path)
     original_owner = _preserve_file_owner(path)
+    if original_mode is None and create_mode is not None and not path.exists():
+        original_mode = create_mode
 
     fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent),
@@ -445,6 +513,12 @@ def atomic_yaml_write(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if original_mode is not None and hasattr(os, "fchmod"):
+                # Apply the mode to the temp fd BEFORE the replace so the
+                # target never transits through mkstemp's 0600 (the
+                # post-replace _restore_file_mode below then re-applies it
+                # harmlessly, and remains the sole path on Windows).
+                os.fchmod(f.fileno(), original_mode)
             # allow_unicode=True writes emoji/kaomoji (e.g. personalities, skin
             # cursors) as real UTF-8 instead of fragile escape sequences. Without
             # it, PyYAML emits astral-plane chars as `\UXXXXXXXX` (8-digit) escapes
@@ -465,7 +539,7 @@ def atomic_yaml_write(
             f.flush()
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
-        real_path = _replace_with_guard(tmp_path, path, expected_state)
+        real_path = atomic_replace(tmp_path, path)
         real_path_obj = Path(real_path)
         _restore_file_owner(real_path_obj, original_owner)
         _restore_file_mode(real_path_obj, original_mode)
@@ -483,8 +557,6 @@ def atomic_roundtrip_yaml_update(
     path: Union[str, Path],
     key_path: str,
     value: Any,
-    *,
-    max_attempts: int = 3,
 ) -> None:
     """Update one dotted YAML key while preserving comments and readable text.
 
@@ -492,13 +564,6 @@ def atomic_roundtrip_yaml_update(
     user-edited config files where comments, ordering, quoting, and Unicode
     should survive a single setting mutation.  Writes still use the same temp
     file + fsync + atomic replace pattern.
-
-    The full read-modify-write cycle runs under :func:`config_file_lock`,
-    so concurrent updaters serialize instead of losing each other's keys.
-    If a non-locking writer still lands mid-cycle (stale-write guard), the
-    cycle re-reads and re-applies up to *max_attempts* times — safe because
-    setting one dotted key is idempotent — then raises
-    :class:`ConfigWriteConflictError`.
     """
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
@@ -512,116 +577,165 @@ def atomic_roundtrip_yaml_update(
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
 
-    with config_file_lock(path):
-        for attempt in range(max_attempts):
-            snapshot = file_write_state(path)
-            if path.exists():
-                with path.open("r", encoding="utf-8") as f:
-                    config = yaml_rt.load(f) or CommentedMap()
-            else:
-                config = CommentedMap()
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            config = yaml_rt.load(f) or CommentedMap()
+    else:
+        config = CommentedMap()
 
-            if not isinstance(config, CommentedMap):
-                config = CommentedMap(config)
+    if not isinstance(config, CommentedMap):
+        config = CommentedMap(config)
 
-            current = config
-            keys = key_path.split(".")
-            for key in keys[:-1]:
-                next_value = current.get(key)
-                if not isinstance(next_value, CommentedMap):
-                    next_value = CommentedMap()
-                    current[key] = next_value
-                current = next_value
-            current[keys[-1]] = value
+    current = config
+    keys = key_path.split(".")
+    for key in keys[:-1]:
+        next_value = current.get(key)
+        if not isinstance(next_value, CommentedMap):
+            next_value = CommentedMap()
+            current[key] = next_value
+        current = next_value
+    current[keys[-1]] = value
 
-            original_mode = _preserve_file_mode(path)
-            original_owner = _preserve_file_owner(path)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent),
-                prefix=f".{path.stem}_",
-                suffix=".tmp",
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    yaml_rt.dump(config, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-                real_path = _replace_with_guard(tmp_path, path, snapshot)
-                real_path_obj = Path(real_path)
-                _restore_file_owner(real_path_obj, original_owner)
-                _restore_file_mode(real_path_obj, original_mode)
-                return
-            except BaseException as exc:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                if (
-                    isinstance(exc, ConfigWriteConflictError)
-                    and attempt < max_attempts - 1
-                ):
-                    continue
-                raise
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(config, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
-def locked_yaml_mutate(
+def atomic_roundtrip_yaml_save(
     path: Union[str, Path],
-    mutate: Callable[[dict], Any],
-    *,
-    sort_keys: bool = False,
-    default_flow_style: bool = False,
-    extra_content: "str | None" = None,
-    max_attempts: int = 3,
-) -> Optional[dict]:
-    """Run a full read→modify→write cycle on a YAML mapping file, safely.
+    new_state: dict,
+) -> None:
+    """Persist a full config-state dict while preserving comments and ordering.
 
-    Serializes the WHOLE cycle under :func:`config_file_lock` (not just the
-    write) so two concurrent updates compose instead of last-writer-wins,
-    and verifies the stale-write guard before replacing in case a
-    non-locking writer raced anyway — in which case the cycle re-reads and
-    re-applies *mutate*, up to *max_attempts* times.
+    Behaves like ``atomic_yaml_write`` (writes the whole file in one shot from
+    ``new_state``), but routes through ruamel.yaml round-trip mode so existing
+    comments, key order, quotes, and readable Unicode survive.
 
-    *mutate* receives the parsed dict (``{}`` if the file is absent or
-    unparseable, matching the raw-read behavior of the call sites this
-    replaces).  It edits in place, or returns a replacement dict, or
-    returns :data:`SKIP_WRITE` to abort without writing (e.g. the value is
-    already set).  Because of the retry loop it must be safe to call more
-    than once.
+    Reconciliation rules against the on-disk YAML:
 
-    Returns the dict that was written, or ``None`` when skipped.
+    * Keys present in both are updated in-place via assignment, which keeps
+      ruamel's CommentedMap anchors (and their attached comments) attached to
+      their original positions.
+    * Keys missing from ``new_state`` are deleted.
+    * Keys added in ``new_state`` are appended at the end of their parent map.
+    * Nested ``dict`` values recurse with the same rules.
+    * Non-dict values (lists, scalars) are overwritten wholesale — list
+      element comments are not individually preserved, matching ruamel's
+      semantics.
+
+    This is the comment-safe replacement for ``yaml.safe_dump(cfg, f)`` in
+    callers that mutate a deep-loaded config dict and want to persist the
+    whole thing.
+
+    Shares the fail-closed contract ``hermes_cli.config.atomic_config_write``
+    enforces for plain (non-comment-preserving) full-document writes: an
+    existing-but-unreadable ``config.yaml`` (permission error, broken mount,
+    transient I/O) raises rather than being silently replaced with only
+    ``new_state``. Imported lazily to avoid a module-level circular import —
+    ``hermes_cli.config`` itself imports from this module.
     """
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+
+    from hermes_cli.config import require_readable_config_before_write
+
     path = Path(path)
-    with config_file_lock(path):
-        for attempt in range(max_attempts):
-            snapshot = file_write_state(path)
-            data: dict = {}
-            if path.exists():
-                try:
-                    with path.open(encoding="utf-8") as f:
-                        data = yaml.safe_load(f) or {}
-                except Exception:
-                    data = {}
-                if not isinstance(data, dict):
-                    data = {}
-            result = mutate(data)
-            if result is SKIP_WRITE:
-                return None
-            if result is not None:
-                data = result
-            try:
-                atomic_yaml_write(
-                    path,
-                    data,
-                    sort_keys=sort_keys,
-                    default_flow_style=default_flow_style,
-                    extra_content=extra_content,
-                    expected_state=snapshot,
-                )
-                return data
-            except ConfigWriteConflictError:
-                if attempt == max_attempts - 1:
-                    raise
-    return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    require_readable_config_before_write(path)
+
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            existing = yaml_rt.load(f)
+        if not isinstance(existing, CommentedMap):
+            existing = CommentedMap(existing or {})
+    else:
+        existing = CommentedMap()
+
+    # ruamel's round-trip dumper resolves plain scalars against the YAML 1.2
+    # core schema, where only true/false/null are reserved words — so a plain
+    # python str like "off" or "yes" is emitted unquoted. Every other config
+    # reader in this codebase (atomic_config_write's PyYAML path, yaml.safe_load
+    # call sites, etc.) parses under YAML 1.1 rules, where on/off/yes/no are
+    # boolean synonyms. Without forcing quotes here, a freshly written
+    # `approvals.mode: off` silently round-trips back as `False` under
+    # yaml.safe_load. Force-quote any new string value that YAML 1.1 would
+    # otherwise misparse as bool/null.
+    _YAML11_AMBIGUOUS_WORDS = {
+        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~",
+    }
+
+    def _quote_if_yaml11_ambiguous(value):
+        if isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS_WORDS:
+            return DoubleQuotedScalarString(value)
+        return value
+
+    def _merge(dst: CommentedMap, src: dict) -> None:
+        # Update / recurse into keys present in src.
+        for key, value in src.items():
+            if isinstance(value, dict):
+                current = dst.get(key)
+                if not isinstance(current, CommentedMap):
+                    current = CommentedMap()
+                    dst[key] = current
+                _merge(current, value)
+            else:
+                dst[key] = _quote_if_yaml11_ambiguous(value)
+        # Delete keys missing from src — preserves "explicit absence" semantics
+        # of the old _save_cfg(cfg) pattern (e.g. cfg.pop("custom_prompt", None)
+        # then _save_cfg must actually remove the key from disk).
+        for key in [k for k in dst.keys() if k not in src]:
+            del dst[key]
+
+    _merge(existing, new_state)
+
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(existing, f)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────

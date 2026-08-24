@@ -36,6 +36,30 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +70,7 @@ def check_ha_requirements() -> bool:
 
 def validate_ha_config(config: PlatformConfig) -> bool:
     """Return True when Home Assistant has enough credential config to connect."""
-    token = (getattr(config, "token", None) or os.getenv("HASS_TOKEN", "")).strip()
+    token = (getattr(config, "token", None) or _get_scoped_secret("HASS_TOKEN", "")).strip()
     return bool(token)
 
 
@@ -76,7 +100,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         # Configuration from extra
         extra = config.extra or {}
-        token = config.token or os.getenv("HASS_TOKEN", "")
+        token = config.token or _get_scoped_secret("HASS_TOKEN", "")
         url = extra.get("url") or os.getenv("HASS_URL", "http://homeassistant.local:8123")
         self._hass_url: str = url.rstrip("/")
         self._hass_token: str = token
@@ -87,15 +111,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._ignore_entities: Set[str] = set(extra.get("ignore_entities", []))
         self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
-
-        # Significance filter
-        raw_significance_filter = extra.get("significance_filter", False)
-        if isinstance(raw_significance_filter, str):
-            self._significance_filter = raw_significance_filter.strip().lower() in {
-                "1", "true", "yes", "on"
-            }
-        else:
-            self._significance_filter = bool(raw_significance_filter)
 
         # Cooldown tracking: entity_id -> last_event_timestamp
         self._last_event_time: Dict[str, float] = {}
@@ -301,20 +316,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             return
         self._last_event_time[entity_id] = now
 
-        # Apply significance filter if enabled
-        if self._significance_filter:
-            old_state_val = event_data.get("old_state", {}).get("state", "unknown") if event_data.get("old_state") else "unknown"
-            new_state_val = event_data.get("new_state", {}).get("state", "unknown")
-            old_attrs = event_data.get("old_state", {}).get("attributes", {}) if event_data.get("old_state") else {}
-            new_attrs = event_data.get("new_state", {}).get("attributes", {}) if event_data.get("new_state") else {}
-            if not self._is_significant_event(
-                entity_id, old_state_val, new_state_val,
-                old_attrs, new_attrs,
-            ):
-                logger.debug("[%s] Dropped routine event: %s from %s to %s",
-                             self.name, entity_id, old_state_val, new_state_val)
-                return
-
         # Build human-readable message
         old_state = event_data.get("old_state", {})
         new_state = event_data.get("new_state", {})
@@ -341,126 +342,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
-
-    # ------------------------------------------------------------------
-    # Significance filter
-    # ------------------------------------------------------------------
-
-    SIGNIFICANT_BINARY_SENSOR_CLASSES = frozenset({
-        "smoke", "co", "gas", "moisture", "safety", "problem",
-        "tamper", "door", "window", "garage_door", "motion",
-        "presence", "occupancy", "battery", "connectivity", "plug",
-    })
-
-    SIGNIFICANT_SENSOR_KEYWORDS = frozenset({
-        # NB: "battery" is deliberately NOT here — battery percentage
-        # changes are handled by the dedicated threshold logic below
-        # that only flags drops crossing 20%/10%/5% boundaries.
-        "backup", "wan", "alert", "alarm", "security",
-        "presence", "critical", "outage", "firmware",
-        "smoke", "co2", "gas", "leak",
-        "power_consumption", "energy",
-    })
-
-    BATTERY_PCT_THRESHOLDS = [20, 10, 5]
-
-    def _is_significant_event(
-        self,
-        entity_id: str,
-        old_state: str = "unknown",
-        new_state: str = "unknown",
-        old_attrs: Optional[Dict[str, Any]] = None,
-        new_attrs: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Classify a state change as *significant* (route to agent) or
-        *routine* (drop silently).
-
-        Only called when ``self._significance_filter is True``.
-        The goal is to let through only high-signal events that warrant
-        an agent session — security, availability, alerts — and suppress
-        routine counter ticks, periodic sensor readings, and other
-        deterministic noise.
-
-        Always-significant categories:
-        - Unavailable / unknown transitions (any domain)
-        - Alarm control panel and lock state changes
-        - Critical binary_sensor device classes (smoke, CO, gas, door,
-          window, motion, presence, battery, connectivity, plug)
-        - Person zone changes
-        - Light / switch / fan / cover / climate user-action domains
-        - Update entities reporting an available update (state ``on``)
-        - Media player state transitions
-
-        Routinely dropped:
-        - Binary_sensor states that don't match a critical device_class
-        - Sensor entity updates that don't match significant keywords
-          or cross a battery-percentage threshold
-        - Media player same-state transitions (already filtered upstream
-          by ``_format_state_change``, but kept for parity)
-        - Update entities reporting *no* update (state ``off``)
-        """
-        domain = entity_id.split(".")[0] if "." in entity_id else ""
-
-        # --- 1. Unavailable / unknown transitions — always significant ---
-        if old_state in ("unavailable", "unknown") or new_state in ("unavailable", "unknown"):
-            return True
-
-        # --- 2. Security / safety domains ---
-        if domain in ("alarm_control_panel", "lock"):
-            return True
-
-        # --- 3. Binary sensor by device_class ---
-        if domain == "binary_sensor":
-            dc = (
-                (new_attrs or {}).get("device_class", "")
-                or (old_attrs or {}).get("device_class", "")
-            )
-            return dc in self.SIGNIFICANT_BINARY_SENSOR_CLASSES
-
-        # --- 4. Person zone changes ---
-        if domain == "person":
-            return True
-
-        # --- 5. Update availability ---
-        if domain == "update":
-            return new_state == "on"
-
-        # --- 6. User-action domains ---
-        if domain in ("light", "switch", "fan", "cover", "climate"):
-            return True
-
-        # --- 7. Media player state transitions ---
-        if domain == "media_player":
-            # Any non-identical transition is potentially interesting
-            return old_state != new_state
-
-        # --- 8. Sensor domain — keyword + battery threshold ---
-        if domain == "sensor":
-            entity_lower = entity_id.lower()
-
-            # Significant sensor keywords
-            if any(kw in entity_lower for kw in self.SIGNIFICANT_SENSOR_KEYWORDS):
-                return True
-
-            # Battery percentage — significant only when crossing a low threshold
-            if "battery" in entity_lower:
-                if new_state in ("low", "critical"):
-                    return True
-                try:
-                    old_val = float(old_state) if old_state else 100.0
-                    new_val = float(new_state) if new_state else 100.0
-                    for threshold in self.BATTERY_PCT_THRESHOLDS:
-                        if old_val > threshold > new_val:
-                            return True
-                except (ValueError, TypeError):
-                    pass
-                return False  # Routine battery tick
-
-            # All other sensor updates are routine noise
-            return False
-
-        # --- 9. Fallback — let unknown domains through ---
-        return True
 
     @staticmethod
     def _format_state_change(
@@ -631,7 +512,7 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", {}) or {}
     hass_url = (extra.get("url") or os.getenv("HASS_URL", "")).rstrip("/")
-    token = (getattr(pconfig, "token", None) or os.getenv("HASS_TOKEN", "")).strip()
+    token = (getattr(pconfig, "token", None) or _get_scoped_secret("HASS_TOKEN", "")).strip()
     if not hass_url or not token:
         return {
             "error": (

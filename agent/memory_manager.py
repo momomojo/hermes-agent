@@ -80,8 +80,17 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema
 
 
-def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
+def memory_provider_tools_enabled(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]] = None,
+    *,
+    memory_tool_present: bool = False,
+) -> bool:
     """Return whether external memory-provider tools should be exposed."""
+    if disabled_toolsets and "memory" in disabled_toolsets:
+        return False
+    if memory_tool_present:
+        return True
     if enabled_toolsets is None:
         return True
     if not enabled_toolsets:
@@ -110,9 +119,10 @@ def inject_memory_provider_tools(agent: Any) -> int:
         for tool in tools
         if isinstance(tool, dict)
     }
-    if (
-        "memory" not in existing_tool_names
-        and not memory_provider_tools_enabled(getattr(agent, "enabled_toolsets", None))
+    if not memory_provider_tools_enabled(
+        getattr(agent, "enabled_toolsets", None),
+        getattr(agent, "disabled_toolsets", None),
+        memory_tool_present="memory" in existing_tool_names,
     ):
         return 0
 
@@ -334,74 +344,6 @@ class StreamingContextScrubber:
             self._at_block_boundary = self._at_block_boundary and text.strip() == ""
 
 
-def _telemetry_profile(hermes_home: str) -> str:
-    """Resolve profile attribution without assuming HERMES_PROFILE is set."""
-    import json as _json
-    import os as _os
-    from pathlib import Path as _Path
-
-    for key in ("HERMES_PROFILE", "HERMES_AGENT_PROFILE", "AGENT_PROFILE"):
-        value = str(_os.environ.get(key) or "").strip()
-        if value:
-            return value
-    home = _Path(hermes_home)
-    if home.parent.name == "profiles":
-        return home.name
-    try:
-        bank = str(_json.loads((home / "hindsight" / "config.json").read_text(encoding="utf-8")).get("bank_id") or "")
-    except Exception:
-        bank = ""
-    return {
-        "hermes-owner": "default",
-        "hermes-coding": "codex-coding",
-        "hermes-home-assistant": "home-assistant",
-    }.get(bank, bank.removeprefix("hermes-") or "default")
-
-
-def _log_memory_injection(clean: str) -> None:
-    """Append one JSONL record per injected memory block.
-
-    Feeds the monthly Recall Utilization Rate review (memory gap analysis
-    2026-06-10): the injected block is ephemeral — never persisted with the
-    session — so injection time is the only place it can be observed. Best
-    effort: never let telemetry break the hot path.
-    """
-    try:
-        import hashlib as _hashlib
-        import json as _json
-        import os as _os
-        from datetime import datetime as _datetime, timezone as _timezone
-
-        hermes_home = _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes"))
-        log_dir = _os.path.join(hermes_home, "logs")
-        _os.makedirs(log_dir, mode=0o700, exist_ok=True)
-        try:
-            _os.chmod(log_dir, 0o700)
-        except OSError:
-            pass
-        record = {
-            "schema_version": 2,
-            "event": "memory_context_injected",
-            "ts": _datetime.now(_timezone.utc).isoformat(timespec="milliseconds"),
-            "profile": _telemetry_profile(hermes_home),
-            "chars": len(clean),
-            "items": clean.count("\n- ") + (1 if clean.lstrip().startswith("- ") else 0),
-            # No recalled content or excerpts are persisted. The digest lets
-            # operators correlate repeated injections without recovering it.
-            "content_sha256": _hashlib.sha256(clean.encode("utf-8")).hexdigest(),
-        }
-        path = _os.path.join(log_dir, "recall-utilization.jsonl")
-        fd = _os.open(path, _os.O_WRONLY | _os.O_APPEND | _os.O_CREAT, 0o600)
-        try:
-            _os.chmod(path, 0o600)
-            payload = (_json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-            _os.write(fd, payload)
-        finally:
-            _os.close(fd)
-    except Exception:
-        logger.debug("recall-utilization logging failed", exc_info=True)
-
-
 def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note."""
     if not raw_context or not raw_context.strip():
@@ -409,7 +351,6 @@ def build_memory_context_block(raw_context: str) -> str:
     clean = sanitize_context(raw_context)
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")
-    _log_memory_injection(clean)
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
@@ -618,8 +559,13 @@ class MemoryManager:
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
+        # Propagate the caller's contextvars (profile HERMES_HOME override)
+        # to the prefetch thread — see _submit_background.
+        import contextvars
+        from functools import partial
+
         thread = threading.Thread(
-            target=_run,
+            target=partial(contextvars.copy_context().run, _run),
             daemon=True,
             name=f"memory-prefetch-{provider.name}",
         )
@@ -652,6 +598,38 @@ class MemoryManager:
         if error_box:
             raise error_box["value"]
         return result_box.get("value", "")
+
+    def describe_recall(self) -> str:
+        """Build a deterministic, model-independent recall indicator line.
+
+        Call right after :meth:`prefetch_all` on the turn thread. Collects each
+        provider's :meth:`MemoryProvider.recall_status` and renders a single
+        status string (e.g. ``"🧠 Provider — recalled 3 memories"``) so the
+        user SEES memory was used regardless of whether the model mentions it.
+        Returns ``""`` when no provider injected memory this turn — callers can
+        emit the result unconditionally.
+        """
+        segments: List[str] = []
+        for provider in self._providers:
+            try:
+                status = provider.recall_status()
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' recall_status failed (non-fatal): %s",
+                    provider.name, e,
+                )
+                continue
+            if status is None:
+                continue
+            if status.count == 1:
+                detail = "recalled 1 memory"
+            elif status.count > 1:
+                detail = f"recalled {status.count} memories"
+            else:
+                # count <= 0 → content injected but no discrete count (reflect).
+                detail = "recalled relevant memory"
+            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
+        return "  ".join(segments)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
@@ -755,7 +733,20 @@ class MemoryManager:
     # -- Background dispatch -------------------------------------------------
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
-        """Queue ``fn`` on the serialized worker and track its durability class."""
+        """Queue ``fn`` on the serialized worker and track its durability class.
+
+        The submitted callable is wrapped with the CALLER's contextvars:
+        profile isolation in multi-profile processes (gateway multiplexer,
+        dashboard, cron) is a ContextVar-scoped HERMES_HOME override, and
+        executor worker threads start with empty contexts — without the
+        wrap, a provider resolving ambient state (config paths, secrets)
+        from the worker would silently land on the default profile.
+        """
+        import contextvars
+        from functools import partial
+
+        ctx = contextvars.copy_context()
+        fn = partial(ctx.run, fn)
         executor = self._get_sync_executor()
         if executor is None:
             if self._shutting_down:

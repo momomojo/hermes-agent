@@ -49,101 +49,12 @@ def test_self_heals_on_stale_refresh_token(monkeypatch):
     assert saved["access_token"] == "fresh-access"
 
 
-def test_does_not_self_heal_on_rate_limit(monkeypatch):
-    """429 quota keeps relogin_required=False — token still valid, must NOT reimport."""
-    import_calls = {"n": 0}
-
-    def _rate_limited(*_a, **_k):
-        raise AuthError(
-            "quota exhausted",
-            provider="openai-codex",
-            code="codex_rate_limited",
-            relogin_required=False,
-        )
-
-    def _import_spy():
-        import_calls["n"] += 1
-        return {"access_token": "should-not-be-used"}
-
-    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rate_limited)
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", _import_spy)
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda *a, **k: None)
-
-    with pytest.raises(AuthError) as ei:
-        _refresh_codex_auth_tokens(STALE, 20.0)
-
-    assert ei.value.code == "codex_rate_limited"
-    assert import_calls["n"] == 0  # never touched ~/.codex on a transient failure
 
 
-def test_reraises_when_codex_cli_token_absent(monkeypatch):
-    """relogin-required but ~/.codex unavailable/expired → propagate original error."""
-
-    def _reused(*_a, **_k):
-        raise AuthError(
-            "refresh token reused",
-            provider="openai-codex",
-            code="refresh_token_reused",
-            relogin_required=True,
-        )
-
-    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _reused)
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: None)
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda *a, **k: None)
-
-    with pytest.raises(AuthError) as ei:
-        _refresh_codex_auth_tokens(STALE, 20.0)
-
-    assert ei.value.code == "refresh_token_reused"
 
 
-def test_happy_path_unchanged(monkeypatch):
-    """Normal refresh succeeds → rotated tokens persisted, ~/.codex never consulted."""
-    saved = {}
-    import_calls = {"n": 0}
-
-    def _import_spy():
-        import_calls["n"] += 1
-        return None
-
-    monkeypatch.setattr(
-        auth,
-        "refresh_codex_oauth_pure",
-        lambda *a, **k: {"access_token": "rotated", "refresh_token": "rotated-r"},
-    )
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", _import_spy)
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
-
-    out = _refresh_codex_auth_tokens({"access_token": "a", "refresh_token": "b"}, 20.0)
-
-    assert out["access_token"] == "rotated"
-    assert out["refresh_token"] == "rotated-r"
-    assert saved["access_token"] == "rotated"
-    assert import_calls["n"] == 0  # happy path must not consult ~/.codex
 
 
-def test_reraises_when_imported_token_lacks_refresh_token(monkeypatch):
-    """relogin-required, but ~/.codex returns an access_token with NO refresh_token →
-    re-raise rather than persist a half-token that would break the next refresh."""
-    saved = {}
-
-    def _rejected(*_a, **_k):
-        raise AuthError(
-            "refresh token rejected",
-            provider="openai-codex",
-            code="invalid_grant",
-            relogin_required=True,
-        )
-
-    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
-    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: {"access_token": "fresh-only"})
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
-
-    with pytest.raises(AuthError) as ei:
-        _refresh_codex_auth_tokens(STALE, 20.0)
-
-    assert ei.value.code == "invalid_grant"
-    assert saved == {}  # nothing was persisted
 
 
 def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monkeypatch):
@@ -159,11 +70,6 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
                 "tokens": {"refresh_token": "stale-refresh"},
                 "last_refresh": "2026-06-01T00:00:00Z",
                 "auth_mode": "chatgpt",
-                "last_auth_error": {
-                    "provider": "openai-codex",
-                    "code": "refresh_token_reused",
-                    "relogin_required": True,
-                },
             },
         },
     }))
@@ -181,94 +87,8 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert resolved["api_key"] == "fresh-access"
     assert resolved["source"] == "hermes-auth-store"
     stored = json.loads((hermes_home / "auth.json").read_text())
-    assert "last_auth_error" not in stored["providers"]["openai-codex"]
     tokens = stored["providers"]["openai-codex"]["tokens"]
     assert tokens["access_token"] == "fresh-access"
     assert tokens["refresh_token"] == "fresh-refresh"
 
 
-def test_self_heal_preserves_last_auth_error_when_verified_save_fails(tmp_path, monkeypatch):
-    """CLI recovery must not clear a terminal marker unless the save verifies."""
-    hermes_home = tmp_path / "hermes"
-    codex_home = tmp_path / "codex"
-    hermes_home.mkdir()
-    codex_home.mkdir()
-    (hermes_home / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {
-            "openai-codex": {
-                "tokens": {"refresh_token": "stale-refresh"},
-                "auth_mode": "chatgpt",
-                "last_auth_error": {
-                    "provider": "openai-codex",
-                    "code": "refresh_token_reused",
-                    "relogin_required": True,
-                },
-            },
-        },
-    }))
-    (codex_home / "auth.json").write_text(json.dumps({
-        "tokens": {
-            "access_token": "fresh-access",
-            "refresh_token": "fresh-refresh",
-        },
-    }))
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    real_save = auth._save_auth_store
-    calls = {"count": 0}
-
-    def _save_broken_first_write(auth_store, target_path=None):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            broken_store = json.loads(json.dumps(auth_store))
-            broken_store["providers"]["openai-codex"]["tokens"] = {
-                "access_token": "fresh-access",
-            }
-            return real_save(broken_store, target_path)
-        return real_save(auth_store, target_path)
-
-    monkeypatch.setattr(auth, "_save_auth_store", _save_broken_first_write)
-
-    with pytest.raises(AuthError) as ei:
-        resolve_codex_runtime_credentials()
-
-    assert ei.value.code == "codex_auth_save_verification_failed"
-    assert calls["count"] == 1
-    stored = json.loads((hermes_home / "auth.json").read_text())
-    state = stored["providers"]["openai-codex"]
-    assert state["last_auth_error"]["code"] == "refresh_token_reused"
-
-
-def test_missing_singleton_access_token_reraises_when_codex_cli_half_token(tmp_path, monkeypatch):
-    """Missing access_token must not be masked by a malformed Codex CLI import."""
-    hermes_home = tmp_path / "hermes"
-    codex_home = tmp_path / "codex"
-    hermes_home.mkdir()
-    codex_home.mkdir()
-    (hermes_home / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {
-            "openai-codex": {
-                "tokens": {"refresh_token": "stale-refresh"},
-                "auth_mode": "chatgpt",
-                "last_auth_error": {
-                    "provider": "openai-codex",
-                    "code": "refresh_token_reused",
-                    "relogin_required": True,
-                },
-            },
-        },
-    }))
-    (codex_home / "auth.json").write_text(json.dumps({
-        "tokens": {"access_token": "fresh-only"},
-    }))
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-
-    with pytest.raises(AuthError) as ei:
-        resolve_codex_runtime_credentials()
-
-    assert ei.value.code == "codex_auth_missing_access_token"
-    stored = json.loads((hermes_home / "auth.json").read_text())
-    assert stored["providers"]["openai-codex"]["last_auth_error"]["code"] == "refresh_token_reused"

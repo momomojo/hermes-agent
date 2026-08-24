@@ -25,8 +25,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import psutil
-
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
@@ -114,14 +112,6 @@ class CodexAppServerClient:
                     ),
                 )
             )
-            # Worker network egress is opt-in per profile via
-            # HERMES_CODEX_WORKER_NETWORK (profile .env). Default stays
-            # false: a kanban worker's sandbox has no business on the
-            # network unless the profile's card lanes need to push
-            # branches / open PRs / install packages (codex-coding).
-            worker_network = spawn_env.get(
-                "HERMES_CODEX_WORKER_NETWORK", ""
-            ).strip().lower() in ("1", "true", "yes")
             app_server_args.extend(
                 [
                     "-c",
@@ -129,8 +119,7 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access="
-                    + ("true" if worker_network else "false"),
+                    "sandbox_workspace_write.network_access=false",
                 ]
             )
 
@@ -138,23 +127,19 @@ class CodexAppServerClient:
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
-        popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "bufsize": 0,
-            "env": spawn_env,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-            )
-        else:
-            # Keep the app-server outside Hermes' own process group. close()
-            # still uses psutil below so teardown is cross-platform.
-            popen_kwargs["start_new_session"] = True
+        # Hide the console the codex child would otherwise flash on Windows
+        # (#56747). Hide-only — stdio pipes stay intact for the app-server wire.
+        from hermes_cli._subprocess_compat import windows_hide_flags
 
-        self._proc = subprocess.Popen(cmd, **popen_kwargs)
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=spawn_env,
+            creationflags=windows_hide_flags(),
+        )
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
@@ -198,11 +183,7 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and kill the subprocess AND its children (sandbox processes).
-
-        The app-server can spawn sandbox processes. Terminate the whole process
-        tree with psutil so teardown works on Windows, macOS and Linux.
-        """
+        """Close stdin and wait for the subprocess to exit, escalating to kill."""
         if self._closed:
             return
         self._closed = True
@@ -211,42 +192,15 @@ class CodexAppServerClient:
                 self._proc.stdin.close()
         except Exception:
             pass
-        # Process already dead — nothing to kill.
-        if self._proc.poll() is not None:
-            return
         try:
-            root = psutil.Process(self._proc.pid)
-            targets = [root, *root.children(recursive=True)]
-        except psutil.NoSuchProcess:
-            return
-        except psutil.Error:
-            targets = []
-
-        if not targets:
+            self._proc.terminate()
+            self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=timeout)
+                self._proc.kill()
+                self._proc.wait(timeout=1.0)
             except Exception:
                 pass
-            return
-
-        for proc in targets:
-            try:
-                proc.terminate()
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.Error:
-                pass
-        _, alive = psutil.wait_procs(targets, timeout=timeout)
-        for proc in alive:
-            try:
-                proc.kill()
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.Error:
-                pass
-        if alive:
-            psutil.wait_procs(alive, timeout=1.0)
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
@@ -440,7 +394,7 @@ def check_codex_binary(
         proc = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
         )

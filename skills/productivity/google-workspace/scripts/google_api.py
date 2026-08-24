@@ -42,12 +42,15 @@ HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 
-# Least-privilege default for the shared helper: gmail.modify covers read,
-# label/archive, draft, and send workflows. Profiles that require additional
-# Workspace APIs should re-issue a profile-specific token instead of expanding
-# this bundled default for everyone.
 SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents",
 ]
 
 
@@ -67,7 +70,7 @@ def _ensure_authenticated():
 
 def _stored_token_scopes() -> list[str]:
     try:
-        data = json.loads(TOKEN_PATH.read_text())
+        data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
     except Exception:
         return list(SCOPES)
     scopes = data.get("scopes")
@@ -105,7 +108,7 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         env=_gws_env(),
     )
     if result.returncode != 0:
@@ -189,7 +192,7 @@ def get_credentials():
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,
-            )
+            ), encoding="utf-8"
         )
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)

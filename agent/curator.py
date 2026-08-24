@@ -138,8 +138,8 @@ def is_paused() -> bool:
 def _load_config() -> Dict[str, Any]:
     """Read curator.* config from ~/.hermes/config.yaml. Tolerates missing file."""
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
     except Exception as e:
         logger.debug("Failed to load config for curator: %s", e)
         return {}
@@ -192,13 +192,13 @@ def get_archive_after_days() -> int:
 def get_prune_builtins() -> bool:
     """Whether the curator may prune (archive) bundled built-in skills too.
 
-    OFF by default. When on, built-ins become curation candidates and are
+    ON by default. When on, built-ins become curation candidates and are
     archived after the same inactivity period as agent-created skills, with a
     suppression list keeping them archived across `hermes update` re-seeds.
     Hub-installed skills are never pruned regardless of this flag.
     """
     cfg = _load_config()
-    return bool(cfg.get("prune_builtins", False))
+    return bool(cfg.get("prune_builtins", True))
 
 
 def get_consolidate() -> bool:
@@ -321,42 +321,14 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
-    counts = {
-        "marked_stale": 0,
-        "archived": 0,
-        "reactivated": 0,
-        "checked": 0,
-        "seeded": 0,
-        "protected_skipped": 0,
-        "protection_scan_failed": 0,
-    }
-
-    # Auto-archive must fail closed. A missing protection snapshot means we
-    # cannot prove that a skill is not referenced by cron/Kanban/runtime state.
-    try:
-        from tools.skill_reference_guard import collect_protected_references
-
-        protected_snapshot = collect_protected_references()
-        protected_names = set(protected_snapshot.get("protected_names") or [])
-    except Exception as exc:
-        counts["protection_scan_failed"] = 1
-        logger.warning(
-            "Curator skipped automatic transitions because protected-reference "
-            "inventory failed: %s",
-            exc,
-            exc_info=True,
-        )
-        return counts
-
     cron_referenced = _cron_referenced_skills()
 
-    for row in _u.agent_created_report():
+    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+
+    for row in _u.curated_report():
         counts["checked"] += 1
         name = row["name"]
         if row.get("pinned"):
-            continue
-        if name in protected_names:
-            counts["protected_skipped"] += 1
             continue
 
         # A skill referenced by any cron job (incl. paused/disabled) is in
@@ -397,7 +369,22 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            ok, _msg = _u.archive_skill(name)
+            # Tag the ledger entry with the curator actor: this archive is an
+            # autonomous curator transition, not a foreground agent/user call.
+            try:
+                from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
+                _tok = set_ledger_actor("curator")
+            except Exception:
+                _tok = None
+                reset_ledger_actor = None  # type: ignore[assignment]
+            try:
+                ok, _msg = _u.archive_skill(name)
+            finally:
+                if _tok is not None and reset_ledger_actor is not None:
+                    try:
+                        reset_ledger_actor(_tok)
+                    except Exception:
+                        pass
             if ok:
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
@@ -450,7 +437,9 @@ CURATOR_REVIEW_PROMPT = (
     "INSTRUCTIONS AND EXPERIENTIAL KNOWLEDGE. A collection of hundreds of "
     "narrow skills where each one captures one session's specific bug is "
     "a FAILURE of the library — not a feature. An agent searching skills "
-    "matches on descriptions, not on exact names; one broad umbrella "
+    "matches on descriptions, not on exact names (note: long descriptions "
+    "are truncated to 57 chars in the system prompt skill index — keep the "
+    "trigger class in that window). One broad umbrella "
     "skill with labeled subsections beats five narrow siblings for "
     "discoverability, not the other way around.\n\n"
     "The right target shape is CLASS-LEVEL skills with rich SKILL.md "
@@ -928,7 +917,6 @@ def _reconcile_classification(
     Every removed skill is placed in exactly one bucket.
     """
     heur_cons = {e["name"]: e for e in heuristic.get("consolidated", [])}
-    heur_pruned = {e["name"] for e in heuristic.get("pruned", [])}
 
     model_cons = {e["from"]: e for e in model_block.get("consolidations", [])}
     model_pruned = {e["name"]: e for e in model_block.get("prunings", [])}
@@ -1215,62 +1203,6 @@ def _write_run_report(
     consolidated = classification["consolidated"]
     pruned = classification["pruned"]
 
-    protected_snapshot: Dict[str, Any] = {
-        "protected_names": [],
-        "references": [],
-        "by_name": {},
-        "count": 0,
-    }
-    try:
-        from tools.skill_reference_guard import collect_protected_references
-
-        protected_snapshot = collect_protected_references()
-    except Exception as e:
-        logger.debug("Curator protected-reference scan failed: %s", e, exc_info=True)
-        protected_snapshot = {
-            "protected_names": [],
-            "references": [],
-            "by_name": {},
-            "count": 0,
-            "error": str(e),
-        }
-
-    protected_names = set(protected_snapshot.get("protected_names") or [])
-    blocked_mutations: List[Dict[str, Any]] = []
-    for tc in llm_meta.get("tool_calls", []) or []:
-        if not isinstance(tc, dict) or tc.get("name") != "skill_manage":
-            continue
-        raw = tc.get("arguments") or ""
-        args: Dict[str, Any] = {}
-        if isinstance(raw, dict):
-            args = raw
-        elif isinstance(raw, str):
-            try:
-                args = json.loads(raw)
-            except Exception:
-                continue
-        if not isinstance(args, dict):
-            continue
-        if args.get("action") != "delete":
-            continue
-        name = str(args.get("name") or "").strip()
-        if name and name in protected_names:
-            name_references = (
-                protected_snapshot.get("by_name", {}).get(name, [])
-                if isinstance(protected_snapshot.get("by_name"), dict)
-                else []
-            )
-            blocked_mutations.append(
-                {
-                    "skill": name,
-                    "action": "delete",
-                    "reason": "protected_reference",
-                    "references": name_references[:3],
-                    "reference_count": len(name_references),
-                    "references_truncated": len(name_references) > 3,
-                }
-            )
-
     # Rewrite cron job skill references. When the curator consolidates
     # skill X into umbrella Y, any cron job that lists X fails to load
     # it at run time — the scheduler skips it and the job runs without
@@ -1278,17 +1210,17 @@ def _write_run_report(
     # references in-place keeps scheduled jobs working across
     # consolidation passes. Best-effort: never let a cron-module issue
     # break the curator.
-    consolidated_map = {
-        e["name"]: e["into"]
-        for e in consolidated
-        if isinstance(e, dict) and e.get("name") and e.get("into")
-    }
-    pruned_names = [
-        e["name"] for e in pruned
-        if isinstance(e, dict) and e.get("name")
-    ]
     cron_rewrites: Dict[str, Any] = {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
     try:
+        consolidated_map = {
+            e["name"]: e["into"]
+            for e in consolidated
+            if isinstance(e, dict) and e.get("name") and e.get("into")
+        }
+        pruned_names = [
+            e["name"] for e in pruned
+            if isinstance(e, dict) and e.get("name")
+        ]
         if consolidated_map or pruned_names:
             from cron.jobs import rewrite_skill_refs as _rewrite_cron_refs
             cron_rewrites = _rewrite_cron_refs(
@@ -1301,29 +1233,6 @@ def _write_run_report(
             "rewrites": [],
             "jobs_updated": 0,
             "jobs_scanned": 0,
-            "error": str(e),
-        }
-
-    try:
-        from tools.skill_reference_guard import (
-            collect_protected_references,
-            summarize_protected_references,
-        )
-        # Report current state after any cron/Kanban migrations, not the stale
-        # pre-mutation snapshot used to enforce the safety gate above.
-        protected_snapshot = collect_protected_references()
-        protected_names = set(protected_snapshot.get("protected_names") or [])
-        protected_report = summarize_protected_references(protected_snapshot)
-    except Exception as e:
-        protected_report = {
-            "protected_names": sorted(protected_names),
-            "references": [],
-            "by_name": {},
-            "count": len(protected_names),
-            "reference_count": 0,
-            "summary_by_name": {},
-            "bounded": True,
-            "references_truncated": False,
             "error": str(e),
         }
 
@@ -1343,8 +1252,6 @@ def _write_run_report(
             "pruned_this_run": len(pruned),
             "state_transitions": len(transitions),
             "cron_jobs_rewritten": int(cron_rewrites.get("jobs_updated", 0)),
-            "protected_references_checked": int(protected_snapshot.get("count", 0) or 0),
-            "blocked_mutations": len(blocked_mutations),
             "tool_calls_total": sum(tc_counts.values()),
         },
         "tool_call_counts": tc_counts,
@@ -1355,8 +1262,6 @@ def _write_run_report(
         "added": added,
         "state_transitions": transitions,
         "cron_rewrites": cron_rewrites,
-        "protected_references": protected_report,
-        "blocked_mutations": blocked_mutations,
         "llm_final": llm_meta.get("final", ""),
         "llm_summary": llm_meta.get("summary", ""),
         "llm_error": llm_meta.get("error"),
@@ -1419,35 +1324,9 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
     auto = p.get("auto_transitions") or {}
     lines.append("## Auto-transitions (pure, no LLM)\n")
     lines.append(f"- checked: {auto.get('checked', 0)}")
-    if "protected_skipped" in auto:
-        lines.append(f"- skipped protected references: {auto.get('protected_skipped', 0)}")
     lines.append(f"- marked stale: {auto.get('marked_stale', 0)}")
     lines.append(f"- archived (no LLM, pure time-based staleness): {auto.get('archived', 0)}")
     lines.append(f"- reactivated: {auto.get('reactivated', 0)}")
-    lines.append("")
-
-    protected = p.get("protected_references") or {}
-    protected_names = protected.get("protected_names") or []
-    protected_count = int(protected.get("count", len(protected_names)) or 0)
-    blocked_mutations = p.get("blocked_mutations") or []
-    lines.append("## Protected skill references\n")
-    lines.append(f"- protected names checked: **{protected_count}**")
-    if protected.get("error"):
-        lines.append(f"- scan error: `{protected.get('error')}`")
-    if blocked_mutations:
-        lines.append(f"- blocked curator mutations: **{len(blocked_mutations)}**")
-        for entry in blocked_mutations[:25]:
-            lines.append(
-                f"  - `{entry.get('skill')}` `{entry.get('action')}` blocked "
-                "because a live reference still points at it"
-            )
-    else:
-        lines.append("- blocked curator mutations: **0**")
-    if protected_names:
-        sample = ", ".join(f"`{name}`" for name in protected_names[:25])
-        if len(protected_names) > 25:
-            sample += f", … and {len(protected_names) - 25} more"
-        lines.append(f"- names: {sample}")
     lines.append("")
 
     # LLM pass numbers
@@ -1607,15 +1486,16 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _render_candidate_list() -> str:
-    """Human/agent-readable list of agent-created skills with usage stats."""
-    rows = skill_usage.agent_created_report()
+    """Human/agent-readable list of curator-managed skills with usage stats."""
+    rows = skill_usage.curated_report()
     if not rows:
-        return "No agent-created skills to review."
+        return "No curator-managed skills to review."
     cron_referenced = _cron_referenced_skills()
-    lines = [f"Agent-created skills ({len(rows)}):\n"]
+    lines = [f"Curator-managed skills ({len(rows)}):\n"]
     for r in rows:
         lines.append(
             f"- {r['name']}  "
+            f"provenance={r.get('provenance', 'agent')}  "
             f"state={r['state']}  "
             f"pinned={'yes' if r.get('pinned') else 'no'}  "
             f"cron={'yes' if r['name'] in cron_referenced else 'no'}  "
@@ -1668,7 +1548,7 @@ def run_curator_review(
     if dry_run:
         # Count candidates without mutating state.
         try:
-            report = skill_usage.agent_created_report()
+            report = skill_usage.curated_report()
             counts = {
                 "checked": len(report),
                 "marked_stale": 0,
@@ -1721,7 +1601,7 @@ def run_curator_review(
         nonlocal auto_summary
         # Snapshot skill state BEFORE the LLM pass so the report can diff.
         try:
-            before_report = skill_usage.agent_created_report()
+            before_report = skill_usage.curated_report()
         except Exception:
             before_report = []
         before_names = {r.get("name") for r in before_report if isinstance(r, dict)}
@@ -1747,7 +1627,7 @@ def run_curator_review(
             state2["last_run_duration_seconds"] = elapsed
             state2["last_run_summary"] = final_summary
             try:
-                after_report = skill_usage.agent_created_report()
+                after_report = skill_usage.curated_report()
             except Exception:
                 after_report = []
             try:
@@ -1776,10 +1656,7 @@ def run_curator_review(
         llm_meta: Dict[str, Any] = {}
         try:
             candidate_list = _render_candidate_list()
-            if (
-                "No agent-created skills" in candidate_list
-                or "No unprotected agent-created skills" in candidate_list
-            ):
+            if "No agent-created skills" in candidate_list:
                 final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
                 llm_meta = {
                     "final": "",
@@ -1837,7 +1714,7 @@ def run_curator_review(
         try:
             rename_lines = _build_rename_summary(
                 before_names=before_names,
-                after_report=skill_usage.agent_created_report(),
+                after_report=skill_usage.curated_report(),
                 tool_calls=llm_meta.get("tool_calls", []) or [],
                 model_final=llm_meta.get("final", "") or "",
             )
@@ -1855,7 +1732,7 @@ def run_curator_review(
         # reporting bug never breaks the curator itself. Report path is
         # recorded in state so `hermes curator status` can point at it.
         try:
-            after_report = skill_usage.agent_created_report()
+            after_report = skill_usage.curated_report()
         except Exception:
             after_report = []
         try:
@@ -2013,9 +1890,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _acp_args = None
     _model_name = ""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        _cfg = load_config()
+        _cfg = load_config_readonly()
         _binding = _resolve_review_runtime(_cfg)
         _provider, _model_name = _binding.provider, _binding.model
         _rp = resolve_runtime_provider(
@@ -2061,6 +1938,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
+            enabled_toolsets=["skills", "terminal"],
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

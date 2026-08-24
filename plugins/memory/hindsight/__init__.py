@@ -20,7 +20,7 @@ Config via environment variables:
   HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
-  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
+  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories (default: hermes)
   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
 
@@ -30,11 +30,8 @@ Or via $HERMES_HOME/hindsight/config.json (profile-scoped), falling back to
 
 from __future__ import annotations
 
-import re
-
 import asyncio
 import atexit
-import hashlib
 import importlib
 import json
 import logging
@@ -44,22 +41,47 @@ import sys
 import threading
 import time
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.secret_scope import get_secret
+
+from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class _RecallResult:
+    """Text + memory count from one recall.
+
+    Carrying the count alongside the text lets the deterministic recall
+    indicator report "recalled N memories" accurately without re-parsing the
+    formatted bullet list. ``count`` is 0 for a reflect synthesis (no discrete
+    memories) or on error.
+    """
+
+    text: str
+    count: int
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.8.4"
+_MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+# ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
+# AGENTS.md forbids shipping third-party attribution tags on-by-default until a
+# generic user-facing opt-in exists, so this stays unset unless the user sets it
+# via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
+_DEFAULT_RETAIN_SOURCE = ""
+# Hindsight brand mark — the logo is an eye ringed by graph nodes. Used for
+# the deterministic recall/retain indicators (overrides the generic core default).
+_HINDSIGHT_GLYPH = "👁️"
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -67,12 +89,10 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
-_REDACTED = "[REDACTED]"
-_VALID_RETAIN_OVERSIZE_POLICIES = {"recent_turns"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "groq": "openai/gpt-oss-120b",
     "openrouter": "qwen/qwen3.5-9b",
     "minimax": "MiniMax-M2.7",
@@ -80,48 +100,6 @@ _PROVIDER_DEFAULT_MODELS = {
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
-
-_AUTH_BEARER_RE = re.compile(
-    r"\b(?P<label>Authorization)(?P<sep>\s*[:=]\s*)Bearer\s+[^\s,;]+",
-    re.IGNORECASE,
-)
-_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"\b(?P<label>[\w.-]*?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"token|secret|password|passwd|pwd|client[_-]?secret|credential)[\w.-]*?)"
-    r"(?P<sep>\s*[:=]\s*)(?P<quote>[\"']?)(?P<value>[^\s\"',;{}\]\)]+)(?P=quote)",
-    re.IGNORECASE,
-)
-_COMMON_SECRET_RE = re.compile(
-    r"\b(?:"
-    r"sk-[A-Za-z0-9_-]{16,}|"
-    r"gh[pousr]_[A-Za-z0-9_]{20,}|"
-    r"github_pat_[A-Za-z0-9_]{20,}|"
-    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
-    r"AKIA[0-9A-Z]{16}|"
-    r"AIza[0-9A-Za-z_-]{20,}|"
-    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
-    r")\b"
-)
-_PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-    re.DOTALL,
-)
-_HOME_CODE_RE = re.compile(
-    r"\b(?P<label>(?:(?:door|alarm|lock|garage|gate|wifi|wi-fi|access)\s+)?"
-    r"(?:code|pin|password|passcode))(?P<sep>\s*[:=]\s*)"
-    r"(?P<quote>[\"']?)(?P<value>[^\s\"',;]+)(?P=quote)",
-    re.IGNORECASE,
-)
-_MEDICAL_LABELED_IDENTIFIER_RE = re.compile(
-    r"\b(?P<label>mrn|medical record(?: number)?|accession(?: number)?|dob|"
-    r"date of birth|patient(?: name)?|pt name)(?P<sep>\s*(?::|=|#|-)\s*)"
-    r"(?P<quote>[\"']?)(?P<value>[A-Za-z0-9][A-Za-z0-9 ._/-]{1,80})(?P=quote)",
-    re.IGNORECASE,
-)
-_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-_SSN_RE = re.compile(r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b")
-_PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
@@ -179,13 +157,47 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     error from NumPy before the daemon starts. Treat that as "unavailable"
     so Hermes can degrade gracefully instead of repeatedly trying to start
     a broken local memory backend.
+
+    The embedded daemon computes embeddings via ``sentence_transformers``
+    (transformers + huggingface-hub). Importing ``hindsight`` /
+    ``hindsight_embed`` alone succeeds even when that stack is broken, so
+    without importing it here the probe would falsely report the backend
+    healthy and ``hermes memory status`` would stay green while the daemon
+    aborts at startup on every retain/recall. Import it too so the probe (and
+    status) reports the real ImportError.
     """
     try:
         importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
+        importlib.import_module("sentence_transformers")
         return True, None
     except Exception as exc:
         return False, str(exc)
+
+
+def _local_runtime_hint(reason: str | None) -> str:
+    """Actionable install guidance when the local_embedded runtime is missing.
+
+    ``local_embedded`` imports ``from hindsight import HindsightEmbedded``, which
+    is provided only by the ``hindsight-all`` package (its wheel ships the
+    top-level ``hindsight`` module). ``plugin.yaml`` declares only
+    ``hindsight-client`` (enough for cloud / local_external), so a user who
+    selected local_embedded without going through ``hermes memory setup`` — a
+    hand-written config, the legacy ``"mode": "local"`` alias, or a restored
+    backup — hits ``ModuleNotFoundError: No module named 'hindsight'``.
+    NousResearch/hermes-agent#7718.
+    """
+    text = (reason or "").lower()
+    if "no module named" in text and ("hindsight'" in text or 'hindsight"' in text
+                                      or "hindsight_embed" in text):
+        return (
+            f" Install the embedded runtime with: uv pip install --python "
+            f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
+            "(local_embedded needs the 'hindsight-all' package, which provides the "
+            "top-level 'hindsight' module; 'hindsight-client' alone only covers "
+            "cloud / local_external.)"
+        )
+    return ""
 
 
 def _ensure_cloud_client_dependency() -> None:
@@ -362,76 +374,13 @@ RETAIN_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory. For current-state questions, prefer "
-        "types=['observation'] so consolidated state facts outrank raw session "
-        "metadata. Omit filters for open-ended history/provenance searches."
+        "Search long-term memory. Returns memories ranked by relevance using "
+        "semantic search, keyword matching, entity graph traversal, and reranking."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "types": {
-                "type": "array",
-                "items": {"type": "string", "enum": ["observation", "world", "experience"]},
-                "description": (
-                    "Optional fact-type filter. Use ['observation'] for state/current facts; "
-                    "omit for broad history searches. Defaults to configured recall_types."
-                ),
-            },
-            "tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional tag filter for domain-scoped recall.",
-            },
-            "tags_match": {
-                "type": "string",
-                "enum": ["any", "all", "any_strict", "all_strict", "exact"],
-                "description": "Tag matching mode when tags are provided.",
-            },
-            "prefer_observations": {
-                "type": "boolean",
-                "description": (
-                    "Optional Hindsight 0.8+ recall mode. When recalling observations together "
-                    "with raw world/experience facts, prefer consolidated observations and drop "
-                    "the raw source facts they supersede. Defaults to the provider config, which "
-                    "is false unless explicitly set."
-                ),
-            },
-            "min_scores": {
-                "type": "object",
-                "description": (
-                    "Optional Hindsight 0.8+ per-stage score floors. Keys: semantic, keyword, "
-                    "reranker, final. Any omitted key imposes no floor; floors are AND-ed."
-                ),
-                "properties": {
-                    "semantic": {"type": "number"},
-                    "keyword": {"type": "number"},
-                    "reranker": {"type": "number"},
-                    "final": {"type": "number"},
-                },
-                "additionalProperties": False,
-            },
-            "trace": {
-                "type": "boolean",
-                "description": "Optional Hindsight recall trace/debug output. Defaults to false.",
-            },
-            "include_scores": {
-                "type": "boolean",
-                "description": "If true, include per-result recall scores in the tool response when returned by the server.",
-            },
-            "query_timestamp": {
-                "type": "string",
-                "description": "Optional ISO timestamp anchor for recency-sensitive recall.",
-            },
-            "budget": {
-                "type": "string",
-                "enum": ["low", "mid", "high"],
-                "description": "Optional per-call recall budget override.",
-            },
-            "max_tokens": {
-                "type": "integer",
-                "description": "Optional per-call maximum token budget for returned recall text.",
-            },
         },
         "required": ["query"],
     },
@@ -485,12 +434,12 @@ def _load_config() -> dict:
 
     return {
         "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
-        "apiKey": os.environ.get("HINDSIGHT_API_KEY", ""),
+        "apiKey": get_secret("HINDSIGHT_API_KEY", ""),
         "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
         "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""),
-        "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", ""),
+        "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE),
         "retain_user_prefix": os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
         "retain_assistant_prefix": os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
         "banks": {
@@ -538,272 +487,6 @@ def _normalize_retain_tags(value: Any) -> List[str]:
         seen.add(tag)
         normalized.append(tag)
     return normalized
-
-
-def _normalize_string_list(value: Any) -> List[str]:
-    """Normalize a config string/list into non-empty strings."""
-    return _normalize_retain_tags(value)
-
-
-def _load_create_bank_request():
-    """Load the optional client's request model through transient import races.
-
-    Hindsight can initialize its embedded/client stack on background threads.
-    CPython may then surface a transient ``ImportError`` or private
-    ``_DeadlockError`` when this control-path import overlaps that work.  The
-    package is optional, so permanently missing imports still fall back to the
-    legacy mission APIs; only short-lived concurrent-import failures are
-    retried here.
-    """
-    last_error: Exception | None = None
-    # A cold import of the generated client can hold its package import lock
-    # for several hundred milliseconds while Pydantic models are built.  Four
-    # 10ms-scale retries proved too short under parallel startup and produced
-    # an intermittent false "client unavailable" fallback.  Keep the retry
-    # bounded below one second, but long enough for that legitimate cold path.
-    attempts = 7
-    for attempt in range(attempts):
-        try:
-            from hindsight_client_api.models.create_bank_request import (
-                CreateBankRequest,
-            )
-
-            return CreateBankRequest
-        except Exception as exc:
-            if not isinstance(exc, ImportError) and exc.__class__.__name__ != "_DeadlockError":
-                raise
-            last_error = exc
-            if attempt < attempts - 1:
-                threading.Event().wait(min(0.02 * (2 ** attempt), 0.25))
-    raise ImportError("Hindsight request model is unavailable") from last_error
-
-
-_RECALL_SCORE_KEYS = ("semantic", "keyword", "reranker", "final")
-
-
-def _normalize_min_scores(value: Any) -> dict[str, float] | None:
-    """Normalize Hindsight recall min_scores config/tool input.
-
-    Hindsight 0.8 accepts a partial object with ``semantic``, ``keyword``,
-    ``reranker``, and/or ``final`` numeric floors. Ignore unknown keys and
-    invalid values so a bad optional diagnostic knob never breaks default
-    recall.
-    """
-    if value is None or value == "":
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            value = json.loads(text)
-        except Exception:
-            logger.warning("Invalid Hindsight recall_min_scores JSON %r; ignoring.", value)
-            return None
-    if not isinstance(value, dict):
-        return None
-
-    normalized: dict[str, float] = {}
-    for key in _RECALL_SCORE_KEYS:
-        raw = value.get(key)
-        if raw is None or raw == "":
-            continue
-        try:
-            normalized[key] = float(raw)
-        except (TypeError, ValueError):
-            logger.warning("Invalid Hindsight min_scores.%s=%r; ignoring that floor.", key, raw)
-    return normalized or None
-
-
-def _model_to_dict(value: Any) -> dict[str, Any] | None:
-    """Best-effort conversion for pydantic/openapi/simple namespace objects."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return dict(value)
-    for method_name in ("to_dict", "model_dump", "dict"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                data = method()
-            except TypeError:
-                data = method(exclude_none=True)
-            except Exception:
-                continue
-            if isinstance(data, dict):
-                return data
-    data = {
-        key: getattr(value, key)
-        for key in _RECALL_SCORE_KEYS
-        if hasattr(value, key) and getattr(value, key) is not None
-    }
-    return data or None
-
-
-def _extract_recall_scores(result: Any) -> dict[str, Any] | None:
-    """Return a serializable per-result scores object if Hindsight returned one."""
-    return _model_to_dict(getattr(result, "scores", None))
-
-
-def _private_jsonl_append(path: Any, record: dict[str, Any]) -> None:
-    """Append one content-free telemetry record with private permissions."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.parent.chmod(0o700)
-    except OSError:
-        pass
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.chmod(path, 0o600)
-        os.write(fd, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
-
-
-def _format_recall_result_line(index: int, result: Any, *, include_scores: bool = False) -> str:
-    """Format a recall result line, optionally appending compact scores."""
-    text = getattr(result, "text", "")
-    line = f"{index}. {text}"
-    if not include_scores:
-        return line
-    scores = _extract_recall_scores(result)
-    if not scores:
-        return line
-    parts = []
-    for key in _RECALL_SCORE_KEYS:
-        score = scores.get(key)
-        if isinstance(score, (int, float)):
-            parts.append(f"{key}={score:.4g}")
-    return f"{line} [scores: {', '.join(parts)}]" if parts else line
-
-
-def _redact_labeled_value(match: re.Match[str]) -> str:
-    quote = match.groupdict().get("quote") or ""
-    return f"{match.group('label')}{match.group('sep')}{quote}{_REDACTED}{quote}"
-
-
-def _redact_secrets(text: str) -> str:
-    redacted = _PRIVATE_KEY_BLOCK_RE.sub(_REDACTED, text)
-    redacted = _AUTH_BEARER_RE.sub(
-        lambda m: f"{m.group('label')}{m.group('sep')}Bearer {_REDACTED}",
-        redacted,
-    )
-    redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_labeled_value, redacted)
-    redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", redacted)
-    return _COMMON_SECRET_RE.sub(_REDACTED, redacted)
-
-
-def _redact_home_codes(text: str) -> str:
-    return _HOME_CODE_RE.sub(_redact_labeled_value, text)
-
-
-def _redact_medical_phi(text: str) -> str:
-    redacted = _MEDICAL_LABELED_IDENTIFIER_RE.sub(_redact_labeled_value, text)
-    redacted = _EMAIL_RE.sub(_REDACTED, redacted)
-    redacted = _SSN_RE.sub(_REDACTED, redacted)
-    return _PHONE_RE.sub(_REDACTED, redacted)
-
-
-def _regex_search(pattern: str, text: str) -> bool:
-    try:
-        return re.search(pattern, text, re.IGNORECASE) is not None
-    except re.error as exc:
-        logger.warning("Invalid retain_noise_patterns entry %r: %s", pattern, exc)
-        return False
-
-
-def _payload_for_turns(turns: List[str]) -> str:
-    return "[" + ",".join(turns) + "]"
-
-
-def _truncate_text_with_marker(text: str, keep_chars: int) -> str:
-    if keep_chars <= 0:
-        return ""
-    if len(text) <= keep_chars:
-        return text
-    marker = "...[truncated] "
-    if keep_chars <= len(marker):
-        return text[-keep_chars:]
-    return marker + text[-(keep_chars - len(marker)):]
-
-
-def _turn_with_content_budget(messages: List[Dict[str, Any]], keep_chars: int) -> str:
-    remaining = max(0, keep_chars)
-    copied: List[Dict[str, Any]] = [
-        dict(msg) if isinstance(msg, dict) else {"content": str(msg)}
-        for msg in messages
-    ]
-    content_indexes = [
-        index for index, msg in enumerate(copied)
-        if isinstance(msg.get("content"), str)
-    ]
-    allocations = {index: 0 for index in content_indexes}
-    for index in reversed(content_indexes):
-        original = copied[index].get("content", "")
-        take = min(len(original), remaining)
-        allocations[index] = take
-        remaining -= take
-
-    for index in content_indexes:
-        copied[index]["content"] = _truncate_text_with_marker(
-            copied[index].get("content", ""),
-            allocations[index],
-        )
-    return json.dumps(copied, ensure_ascii=False)
-
-
-def _truncate_turn_to_payload(turn: str, max_payload_chars: int) -> str | None:
-    try:
-        messages = json.loads(turn)
-    except Exception:
-        return None
-    if not isinstance(messages, list):
-        return None
-
-    def payload_with_budget(keep_chars: int) -> str:
-        return _payload_for_turns([_turn_with_content_budget(messages, keep_chars)])
-
-    if len(payload_with_budget(0)) > max_payload_chars:
-        return None
-
-    total_content_chars = sum(
-        len(msg.get("content", ""))
-        for msg in messages
-        if isinstance(msg, dict) and isinstance(msg.get("content"), str)
-    )
-    low = 0
-    high = total_content_chars
-    best = _turn_with_content_budget(messages, 0)
-    while low <= high:
-        mid = (low + high) // 2
-        candidate = _turn_with_content_budget(messages, mid)
-        if len(_payload_for_turns([candidate])) <= max_payload_chars:
-            best = candidate
-            low = mid + 1
-        else:
-            high = mid - 1
-    return best
-
-
-def _cap_turn_payload(turns: List[str], max_payload_chars: int, oversize_policy: str) -> List[str]:
-    if max_payload_chars <= 0 or len(_payload_for_turns(turns)) <= max_payload_chars:
-        return list(turns)
-    if oversize_policy != "recent_turns":
-        oversize_policy = "recent_turns"
-
-    capped: List[str] = []
-    for turn in reversed(turns):
-        candidate = [turn] + capped
-        if len(_payload_for_turns(candidate)) <= max_payload_chars:
-            capped = candidate
-            continue
-        if capped:
-            break
-        truncated = _truncate_turn_to_payload(turn, max_payload_chars)
-        if truncated is not None:
-            capped = [truncated]
-        break
-    return capped
 
 
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
@@ -873,7 +556,9 @@ def _load_simple_env(path) -> dict[str, str]:
         return {}
 
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, not plain utf-8: this is also used on the Hermes .env during
+    # post_setup, and a Notepad BOM would otherwise stick to the first key.
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -888,7 +573,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         current_key = (
             config.get("llmApiKey")
             or config.get("llm_api_key")
-            or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+            or get_secret("HINDSIGHT_LLM_API_KEY", "")
         )
 
     current_provider = config.get("llm_provider", "")
@@ -925,15 +610,61 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
+def _secure_write_profile_env(profile_env, content: str) -> None:
+    """Create/overwrite *profile_env* with owner-only (0600) permissions.
+
+    The file carries the embedded daemon's plaintext LLM API key
+    (``HINDSIGHT_API_LLM_API_KEY``), so it must never be created with the
+    default umask-derived mode. A pre-existing file is tightened *before*
+    the new secret bytes are written.
+    """
+    if profile_env.exists():
+        try:
+            os.chmod(profile_env, 0o600)
+        except OSError:
+            pass
+    fd = os.open(str(profile_env), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def _validate_profile_env_permissions(profile_env) -> None:
+    """Post-write validation: the secret file must be owner-only on POSIX."""
+    if os.name != "posix":
+        # POSIX mode bits do not model Windows ACLs.
+        return
+    import stat
+
+    mode = stat.S_IMODE(profile_env.stat().st_mode)
+    if mode != 0o600:
+        try:
+            os.chmod(profile_env, 0o600)
+        except OSError:
+            pass
+        mode = stat.S_IMODE(profile_env.stat().st_mode)
+        if mode != 0o600:
+            raise PermissionError(
+                f"Embedded Hindsight profile environment is not owner-only: {profile_env}"
+            )
+
+
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
     """Write the profile-scoped env file that standalone hindsight-embed uses."""
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
-    profile_env.write_text(
-        "".join(f"{key}={value}\n" for key, value in env_values.items()),
-        encoding="utf-8",
-    )
+    content = "".join(f"{key}={value}\n" for key, value in env_values.items())
+    try:
+        _secure_write_profile_env(profile_env, content)
+        _validate_profile_env_permissions(profile_env)
+    except BaseException:
+        # Never leave a plaintext API key behind in a file whose permissions
+        # could not be verified.
+        try:
+            profile_env.unlink()
+        except OSError:
+            pass
+        raise
     return profile_env
 
 def _sanitize_bank_segment(value: str) -> str:
@@ -991,39 +722,6 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
     return rendered or fallback
 
 
-def _read_field(obj: Any, key: str) -> Any:
-    """Read *key* from dict-like, pydantic, or simple attribute objects."""
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        return obj.get(key)
-    value = getattr(obj, key, None)
-    if value is not None:
-        return value
-    for method in ("to_dict", "model_dump"):
-        converter = getattr(obj, method, None)
-        if callable(converter):
-            try:
-                data = converter()
-            except Exception:
-                continue
-            if isinstance(data, dict):
-                return data.get(key)
-    return None
-
-
-def _first_nonempty_field(obj: Any, keys: tuple[str, ...]) -> str:
-    """Return the first non-empty string field from *obj*."""
-    for key in keys:
-        value = _read_field(obj, key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return ""
-
-
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -1052,7 +750,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
         self._prefetch_method = "recall"  # "recall" or "reflect"
         self._retain_tags: List[str] = []
-        self._retain_source = ""
+        self._retain_source = _DEFAULT_RETAIN_SOURCE
         self._retain_user_prefix = "User"
         self._retain_assistant_prefix = "Assistant"
         self._platform = ""
@@ -1069,11 +767,23 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        # Number of memories in the pending prefetch block, captured alongside
+        # _prefetch_result so the deterministic recall indicator can report an
+        # accurate count without re-parsing the formatted text.
+        self._prefetch_count = 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
-        self._prefetch_query = ""
-        self._prefetch_turn_message = ""
-        self._prefetch_generation = 0
+        # State for the model-independent recall indicator (see recall_status()).
+        # _last_recall_returned tracks whether the most recent prefetch() handed
+        # any memory to the agent this turn; _last_recall_count is how many.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+        self._recall_indicator = True
+        # Deterministic retain indicator: emitted from sync_turn the moment a
+        # retain is dispatched to the writer (see _emit_saving_indicator). Uses
+        # the agent's status channel, injected via initialize(status_callback=).
+        self._retain_indicator = True
+        self._status_callback: Optional[Callable[[str], None]] = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1082,6 +792,21 @@ class HindsightMemoryProvider(MemoryProvider):
         self._writer_thread: threading.Thread | None = None
         self._shutting_down = threading.Event()
         self._atexit_registered = False
+        # Server-side async retain operations still in flight. With
+        # retain_async=True, aretain_batch returns as soon as the write is
+        # *accepted*, not when it's durable/recall-visible, so the returned
+        # operation_id(s) stay "pending" until the server finishes. The
+        # background prefetch gates on these via get_operation_status so recall
+        # observes the just-completed turn (draining the local queue alone is
+        # not a read-after-write signal for async retains).
+        self._pending_retain_ops: set[str] = set()
+        self._pending_retain_ops_lock = threading.Lock()
+        self._retain_ops_bank_id = ""
+        # Seconds between get_operation_status polls while waiting for server-
+        # side retain completion. Each poll is a server round trip, so this is
+        # deliberately coarser than the 0.05s local queue-drain poll: ~20 calls
+        # max over the default 10s budget instead of ~200.
+        self._RETAIN_OP_POLL_INTERVAL_S = 0.5
         # Legacy alias — older tests/callers reference _sync_thread directly.
         # Points at _writer_thread once the writer is running.
         self._sync_thread = None
@@ -1098,12 +823,18 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_retain = True
         self._retain_every_n_turns = 1
         self._retain_async = True
+        # Async retain never blocks the reply (writes drain on the single
+        # writer thread). But the next turn's warm prefetch runs on its own
+        # thread and could read BEFORE the just-completed retain is
+        # recall-visible on the server, dropping the latest turn from recall.
+        # When True, the background prefetch first waits (bounded) for the
+        # local writer queue to drain AND for the server-side async retain
+        # operation(s) to report completion, an explicit read-after-write
+        # signal — closing that race without putting any write on the reply
+        # path.
+        self._prefetch_waits_for_retain = True
+        self._prefetch_retain_drain_timeout = 10.0
         self._retain_context = "conversation between Hermes Agent and the User"
-        self._retain_redaction_policy: list[str] = []
-        self._retain_max_payload_chars = 0
-        self._retain_oversize_policy = "recent_turns"
-        self._retain_noise_patterns: list[str] = []
-        self._retain_durable_terms: list[str] = []
         self._turn_counter = 0
         self._session_turns: list[str] = []  # accumulates ALL turns for the session
         # How many turns the last append-mode retain already shipped. Used to
@@ -1113,6 +844,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
+        self._recall_sync = False
         self._recall_max_tokens = 4096
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
@@ -1123,10 +855,6 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
-        self._recall_prefer_observations = False
-        self._recall_min_scores: dict[str, float] | None = None
-        self._recall_trace = False
-        self._recall_include_scores = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -1134,7 +862,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
-        self._profile_summary = ""
 
     @property
     def name(self) -> str:
@@ -1152,12 +879,32 @@ class HindsightMemoryProvider(MemoryProvider):
             has_key = bool(
                 cfg.get("apiKey")
                 or cfg.get("api_key")
-                or os.environ.get("HINDSIGHT_API_KEY", "")
+                or get_secret("HINDSIGHT_API_KEY", "")
             )
             has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
             return has_key or has_url
         except Exception:
             return False
+
+    def unavailable_reason(self) -> str:
+        """Explain an unavailable local_embedded provider (missing runtime).
+
+        ``is_available()`` returns False for local modes when the embedded
+        runtime can't be imported, so ``initialize()`` — and the hint it would
+        log — is never reached (#7718). Surface the install guidance here, where
+        agent_init warns about an unavailable provider.
+        """
+        try:
+            cfg = _load_config()
+            mode = cfg.get("mode", "cloud")
+        except Exception:
+            return ""
+        if mode not in {"local", "local_embedded"}:
+            return ""
+        available, reason = _check_local_runtime()
+        if available:
+            return ""
+        return _local_runtime_hint(reason).strip()
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/hindsight/config.json."""
@@ -1169,7 +916,7 @@ class HindsightMemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text())
+                existing = json.loads(config_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
         existing.update(values)
@@ -1245,26 +992,23 @@ class HindsightMemoryProvider(MemoryProvider):
             provider_config["llm_provider"] = llm_provider
 
         print("\n  Checking dependencies...")
-        uv_path = shutil.which("uv")
-        if not uv_path:
-            print("  ⚠ uv not found — install it: curl -LsSf https://astral.sh/uv/install.sh | sh")
-            print(f"  Then run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
+        # Environment-aware install: sealed hosted venvs redirect to the durable
+        # data-volume target instead of writing to /opt/hermes (NS-605).
+        from tools.lazy_deps import install_specs
+
+        outcome = install_specs(deps_to_install, timeout=120)
+        if outcome.ok:
+            print("  ✓ Dependencies up to date")
+        elif outcome.blocked:
+            print(f"  ⚠ Cannot install dependencies: {outcome.reason}")
         else:
-            try:
-                subprocess.run(
-                    [uv_path, "pip", "install", "--python", sys.executable, "--quiet", "--upgrade"] + deps_to_install,
-                    check=True, timeout=120, capture_output=True,
-                    stdin=subprocess.DEVNULL,
-                )
-                print("  ✓ Dependencies up to date")
-            except Exception as e:
-                print(f"  ⚠ Install failed: {e}")
-                print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
+            print(f"  ⚠ Install failed:\n{(outcome.stderr or '').strip()}")
+            print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
 
         # Step 3: Mode-specific config
         if mode == "cloud":
             print("\n  Get your API key at https://ui.hindsight.vectorize.io\n")
-            existing_key = os.environ.get("HINDSIGHT_API_KEY", "")
+            existing_key = get_secret("HINDSIGHT_API_KEY", "") or ""
             if existing_key:
                 masked = f"...{existing_key[-4:]}" if len(existing_key) > 4 else "set"
                 sys.stdout.write(f"  API key (current: {masked}, blank to keep): ")
@@ -1318,7 +1062,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 env_path = Path(hermes_home) / ".env"
                 existing_llm_key = ""
                 if env_path.exists():
-                    for line in env_path.read_text().splitlines():
+                    # utf-8-sig: a Notepad BOM must not hide the first key.
+                    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
                         if line.startswith("HINDSIGHT_LLM_API_KEY="):
                             existing_llm_key = line.split("=", 1)[1]
                             break
@@ -1348,7 +1093,10 @@ class HindsightMemoryProvider(MemoryProvider):
             env_path.parent.mkdir(parents=True, exist_ok=True)
             existing_lines = []
             if env_path.exists():
-                existing_lines = env_path.read_text().splitlines()
+                # utf-8-sig: a Notepad BOM would glue U+FEFF onto the first
+                # key, defeating the in-place update below and appending a
+                # duplicate line instead.
+                existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
             updated_keys = set()
             new_lines = []
             for line in existing_lines:
@@ -1361,7 +1109,13 @@ class HindsightMemoryProvider(MemoryProvider):
             for k, v in env_writes.items():
                 if k not in updated_keys:
                     new_lines.append(f"{k}={v}")
-            env_path.write_text("\n".join(new_lines) + "\n")
+            env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+        # Step 5: Optional starter template. Only for cloud / local_external —
+        # the API is reachable now; local_embedded's daemon isn't up during setup.
+        from . import templates as _hs_templates
+        if _hs_templates.supported_for_mode(mode):
+            self._offer_starter_template(mode, provider_config, env_writes)
 
         if mode == "local_embedded":
             materialized_config = dict(provider_config)
@@ -1390,6 +1144,24 @@ class HindsightMemoryProvider(MemoryProvider):
             print("  API keys saved to .env")
         print("\n  Start a new session to activate.\n")
 
+    def _offer_starter_template(self, mode: str, provider_config: dict, env_writes: dict) -> None:
+        """Offer to seed the bank with a Hermes starter template (best-effort)."""
+        from hermes_cli.memory_setup import _CANCELLED, _curses_select
+
+        from . import templates as _hs_templates
+
+        default_url = _DEFAULT_LOCAL_URL if mode == "local_external" else _DEFAULT_API_URL
+        api_url = provider_config.get("api_url") or default_url
+        bank_id = provider_config.get("bank_id", "hermes")
+        api_key = env_writes.get("HINDSIGHT_API_KEY") or os.environ.get("HINDSIGHT_API_KEY", "") or None
+        _hs_templates.run_template_step(
+            api_url=api_url,
+            bank_id=bank_id,
+            api_key=api_key,
+            select=_curses_select,
+            cancelled=_CANCELLED,
+        )
+
     def get_config_schema(self):
         return [
             {"key": "mode", "description": "Connection mode", "default": "cloud", "choices": ["cloud", "local_embedded", "local_external"]},
@@ -1413,22 +1185,22 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
-            {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
+            {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
+            {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
+            {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
+            {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
-            {"key": "retain_redaction_policy", "description": "Client-side redaction policies before retain (for example: secrets, medical_no_phi, home_codes)", "default": []},
-            {"key": "retain_max_payload_chars", "description": "Maximum retained payload size in characters; 0 disables client-side capping", "default": 0},
-            {"key": "retain_oversize_policy", "description": "How to cap oversized retain payloads", "default": "recent_turns", "choices": ["recent_turns"]},
-            {"key": "retain_noise_patterns", "description": "Regex patterns for turns that should be dropped before retain", "default": []},
-            {"key": "retain_durable_terms", "description": "Terms that override retain_noise_patterns when present in the same turn", "default": []},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
@@ -1464,7 +1236,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 kwargs = dict(
                     profile=self._config.get("profile", "hermes"),
                     llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
+                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or get_secret("HINDSIGHT_LLM_API_KEY", ""),
                     llm_model=self._config.get("llm_model", ""),
                 )
                 if self._llm_base_url:
@@ -1531,6 +1303,169 @@ class HindsightMemoryProvider(MemoryProvider):
         # external code that joins _sync_thread keeps working.
         self._sync_thread = thread
         thread.start()
+
+    def _track_retain_ops(self, retain_response, bank_id: str) -> None:
+        """Record server-side async operation id(s) from an aretain_batch reply.
+
+        Async retains return ``operation_id`` / ``operation_ids`` that stay
+        ``pending`` on the server until the write is durable and recall-visible.
+        The bank_id is captured alongside so completion can be polled with the
+        same bank the write targeted.
+        """
+        ids: list[str] = []
+        single = getattr(retain_response, "operation_id", None)
+        if single:
+            ids.append(str(single))
+        multiple = getattr(retain_response, "operation_ids", None)
+        if multiple:
+            ids.extend(str(op) for op in multiple if op)
+        if not ids:
+            # Server didn't hand back an op id (older API, or it completed
+            # synchronously). Nothing to poll — local queue drain is the only
+            # available signal in that case.
+            return
+        self._retain_ops_bank_id = bank_id
+        with self._pending_retain_ops_lock:
+            self._pending_retain_ops.update(ids)
+
+    def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
+        """Return True when a server-side async retain op is done (or gone).
+
+        ``get_operation_status`` returns ``completed``/``failed`` for a known
+        op; completed ops are evicted server-side, so a NotFound (404) also
+        means "no longer pending" and is treated as done. Transient errors
+        return False so the caller keeps waiting until its deadline.
+        """
+        from hindsight_client_api.exceptions import NotFoundException
+
+        try:
+            resp = self._run_hindsight_operation(
+                lambda client: client.operations.get_operation_status(
+                    bank_id=bank_id, operation_id=op_id
+                )
+            )
+        except NotFoundException:
+            return True
+        except Exception as exc:
+            logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
+            return False
+        status = str(getattr(resp, "status", "") or "").lower()
+        return status in {"completed", "failed"}
+
+    def _wait_for_retains_drained(self, timeout: float) -> bool:
+        """Block up to *timeout* seconds for the just-completed turn's retain to
+        become recall-visible on the server.
+
+        Used by the background prefetch so the next turn's recall observes the
+        just-completed turn's write instead of racing ahead of it. Runs only on
+        the background prefetch thread — never on the reply path.
+
+        Two ordered barriers, both bounded by the shared *timeout* budget:
+
+        1. Local writer queue drains (the retain call has been *dispatched* to
+           the server). Polls ``unfinished_tasks`` rather than ``queue.join()``
+           so a wedged write can't hang the prefetch.
+        2. Server-side async operations complete. With ``retain_async=True`` the
+           dispatched call returns on *acceptance*, not durability, so draining
+           the local queue alone is NOT a read-after-write signal. We poll
+           ``get_operation_status`` for the tracked op id(s) until the server
+           reports completion (an explicit read-after-write condition).
+
+        Returns True if both barriers cleared within the budget, False on
+        timeout/shutdown.
+        """
+        deadline = None if timeout <= 0 else time.monotonic() + timeout
+
+        def _expired() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
+
+        # Barrier 1: local queue drain (retain dispatched to the server).
+        while self._retain_queue.unfinished_tasks > 0:
+            if self._shutting_down.is_set():
+                return False
+            if _expired():
+                logger.debug(
+                    "Prefetch: retain drain timed out after %.1fs (%d pending)",
+                    timeout, self._retain_queue.unfinished_tasks,
+                )
+                return False
+            time.sleep(0.05)
+
+        # Barrier 2: server-side async retain completion (read-after-write).
+        return self._wait_for_server_retain_ops(deadline, timeout)
+
+    def _wait_for_server_retain_ops(self, deadline: float | None, timeout: float) -> bool:
+        """Poll tracked async retain ops until complete or the deadline passes.
+
+        *deadline* is a ``time.monotonic()`` value (None = no bound). Completed
+        ops are removed from the pending set as they finish so a later prefetch
+        doesn't re-poll them.
+
+        Ops still pending when the deadline expires are DROPPED, not retained:
+        keeping them would make a permanently failing status endpoint (auth
+        error, endless 500s, server that loses ops without a 404) grow the
+        pending set forever and burn the full timeout on EVERY subsequent
+        prefetch — turning "bounded wait per prefetch" into unbounded
+        session-wide degradation (and, via prefetch()'s bounded join on the
+        reply path, a per-turn reply-latency penalty). Dropping trades a
+        possibly-stale recall NOW (identical to prefetch_waits_for_retain=False
+        behavior) for guaranteed liveness; the drop is logged at WARNING once
+        per prefetch so persistent server trouble is visible.
+
+        Status polls are spaced by _RETAIN_OP_POLL_INTERVAL_S (0.5s) — server
+        round trips per op are bounded (~20 over a 10s budget), unlike the
+        cheap 0.05s local queue-drain poll in _wait_for_retains_drained.
+        """
+        while True:
+            with self._pending_retain_ops_lock:
+                bank_id = getattr(self, "_retain_ops_bank_id", "") or self._bank_id
+                pending = list(self._pending_retain_ops)
+            if not pending:
+                return True
+            if self._shutting_down.is_set():
+                return False
+
+            done: set[str] = set()
+            expired = False
+            for op_id in pending:
+                if self._shutting_down.is_set():
+                    return False
+                if deadline is not None and time.monotonic() >= deadline:
+                    expired = True
+                    break
+                if self._is_retain_op_complete(bank_id, op_id):
+                    done.add(op_id)
+
+            if expired:
+                with self._pending_retain_ops_lock:
+                    self._pending_retain_ops.difference_update(done)
+                    dropped = len(self._pending_retain_ops)
+                    self._pending_retain_ops.clear()
+                logger.warning(
+                    "Prefetch: server retain visibility timed out after %.1fs; "
+                    "dropping %d unresolved op(s) so later prefetches stay "
+                    "bounded (recall may miss the just-completed turn)",
+                    timeout, dropped,
+                )
+                return False
+
+            with self._pending_retain_ops_lock:
+                self._pending_retain_ops.difference_update(done)
+                still_pending = bool(self._pending_retain_ops)
+            if not still_pending:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                with self._pending_retain_ops_lock:
+                    dropped = len(self._pending_retain_ops)
+                    self._pending_retain_ops.clear()
+                logger.warning(
+                    "Prefetch: server retain visibility timed out after %.1fs; "
+                    "dropping %d unresolved op(s) so later prefetches stay "
+                    "bounded (recall may miss the just-completed turn)",
+                    timeout, dropped,
+                )
+                return False
+            time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
 
     def _writer_loop(self) -> None:
         """Drain the retain queue serially. Exits on sentinel.
@@ -1630,6 +1565,11 @@ class HindsightMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
+        # Agent status channel for the deterministic retain indicator (recall
+        # emits via the pull-based recall_status()/describe_recall() path).
+        _status_cb = kwargs.get("status_callback")
+        if callable(_status_cb):
+            self._status_callback = _status_cb
 
         # Each process lifecycle gets its own document_id. Reusing session_id
         # alone caused overwrites on /resume — the reloaded session starts
@@ -1647,24 +1587,18 @@ class HindsightMemoryProvider(MemoryProvider):
             if Version(installed) < Version(_MIN_CLIENT_VERSION):
                 logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
                                installed, _MIN_CLIENT_VERSION)
-                import shutil
-                import subprocess
-                import sys
-                uv_path = shutil.which("uv")
-                if uv_path:
-                    try:
-                        subprocess.run(
-                            [uv_path, "pip", "install", "--python", sys.executable,
-                             "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
-                            stdin=subprocess.DEVNULL,
-                        )
-                        logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                    except Exception as e:
-                        logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                       e, _MIN_CLIENT_VERSION)
+                # Environment-aware install: sealed hosted venvs redirect to the
+                # durable data-volume target instead of /opt/hermes (NS-605).
+                from tools.lazy_deps import install_specs
+                outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
+                if outcome.ok:
+                    logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
+                elif outcome.blocked:
+                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
+                                   outcome.reason, _MIN_CLIENT_VERSION)
                 else:
-                    logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
+                                   (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
@@ -1678,10 +1612,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._thread_id = str(kwargs.get("thread_id") or "").strip()
         self._agent_identity = str(kwargs.get("agent_identity") or "").strip()
         self._agent_workspace = str(kwargs.get("agent_workspace") or "").strip()
-        self._profile_summary = (
-            str(kwargs.get("profile_description") or "").strip()
-            or self._load_profile_summary(kwargs.get("hermes_home"))
-        )
         self._turn_index = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
@@ -1705,12 +1635,13 @@ class HindsightMemoryProvider(MemoryProvider):
             available, reason = _check_local_runtime()
             if not available:
                 logger.warning(
-                    "Hindsight local mode disabled because its runtime could not be imported: %s",
+                    "Hindsight local mode disabled because its runtime could not be imported: %s.%s",
                     reason,
+                    _local_runtime_hint(reason),
                 )
                 self._mode = "disabled"
                 return
-        self._api_key = self._config.get("apiKey") or self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
+        self._api_key = self._config.get("apiKey") or self._config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
         self._llm_base_url = self._config.get("llm_base_url", "")
@@ -1753,7 +1684,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
-            self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
+            self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE)
         ).strip()
         self._retain_user_prefix = str(
             self._config.get("retain_user_prefix") or os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User")
@@ -1766,32 +1697,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_retain = self._config.get("auto_retain", True)
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
-        self._retain_redaction_policy = [
-            policy.strip().lower()
-            for policy in _normalize_string_list(self._config.get("retain_redaction_policy"))
-            if policy.strip()
-        ]
-        self._retain_max_payload_chars = max(
-            0,
-            _parse_int_setting(self._config.get("retain_max_payload_chars"), 0),
-        )
-        oversize_policy = str(
-            self._config.get("retain_oversize_policy") or "recent_turns"
-        ).strip().lower()
-        self._retain_oversize_policy = (
-            oversize_policy
-            if oversize_policy in _VALID_RETAIN_OVERSIZE_POLICIES
-            else "recent_turns"
-        )
-        self._retain_noise_patterns = _normalize_string_list(
-            self._config.get("retain_noise_patterns")
-        )
-        self._retain_durable_terms = _normalize_string_list(
-            self._config.get("retain_durable_terms")
-        )
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
+        self._recall_sync = bool(self._config.get("recall_sync", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
@@ -1804,13 +1713,21 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list(configured_types) or ["observation"]
-        self._recall_prefer_observations = bool(self._config.get("recall_prefer_observations", False))
-        self._recall_min_scores = _normalize_min_scores(self._config.get("recall_min_scores"))
-        self._recall_trace = bool(self._config.get("recall_trace", False))
-        self._recall_include_scores = bool(self._config.get("recall_include_scores", False))
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
+        # On-by-default deterministic indicator: when auto-recall injects memory,
+        # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
+        # user SEES memory working, independent of whether the model mentions it.
+        # Off switch for customer-facing agents that shouldn't surface internals.
+        self._recall_indicator = bool(self._config.get("recall_indicator", True))
+        # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
+        # when a turn is dispatched to the writer. Same off switch rationale.
+        self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
+        self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
+        self._prefetch_retain_drain_timeout = float(
+            self._config.get("prefetch_retain_drain_timeout", 10.0)
+        )
 
         _client_version = "unknown"
         try:
@@ -1900,113 +1817,6 @@ class HindsightMemoryProvider(MemoryProvider):
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
 
-        self._queue_bank_mission_sync()
-
-    def _load_profile_summary(self, hermes_home: Any = None) -> str:
-        """Return the active profile's short description, if one exists."""
-        try:
-            from pathlib import Path
-            from hermes_cli.profiles import read_profile_meta
-            profile_home = Path(hermes_home) if hermes_home else get_hermes_home()
-            meta = read_profile_meta(profile_home)
-            return str(meta.get("description") or "").strip()
-        except Exception:
-            return ""
-
-    def _queue_bank_mission_sync(self) -> None:
-        """Best-effort bank mission propagation without blocking agent init."""
-        if not str(self._bank_mission or "").strip():
-            return
-
-        def _run() -> None:
-            try:
-                self._sync_bank_mission_if_empty()
-            except Exception as exc:
-                logger.debug("Hindsight bank mission sync failed: %s", exc, exc_info=True)
-
-        threading.Thread(target=_run, daemon=True, name="hindsight-bank-mission-sync").start()
-
-    def _control_request_timeout(self) -> float:
-        """Short timeout for init-time control-plane calls."""
-        try:
-            return min(float(self._timeout or _DEFAULT_TIMEOUT), 5.0)
-        except (TypeError, ValueError):
-            return 5.0
-
-    def _server_bank_mission(self, client) -> str:
-        """Fetch the server's current bank mission, returning empty on unknown."""
-        banks = getattr(client, "banks", None)
-        if banks is not None and hasattr(banks, "get_bank_profile"):
-            try:
-                profile = self._run_sync(
-                    banks.get_bank_profile(
-                        self._bank_id,
-                        _request_timeout=self._control_request_timeout(),
-                    )
-                )
-                mission = _first_nonempty_field(profile, ("mission",))
-                if mission:
-                    return mission
-            except Exception as exc:
-                logger.debug("Hindsight bank profile read failed: %s", exc)
-
-        if hasattr(client, "_aget_bank_config"):
-            try:
-                payload = self._run_sync(client._aget_bank_config(self._bank_id))
-                config = _read_field(payload, "config")
-                overrides = _read_field(payload, "overrides")
-                return (
-                    _first_nonempty_field(overrides, ("mission", "reflect_mission"))
-                    or _first_nonempty_field(config, ("mission", "reflect_mission"))
-                    or _first_nonempty_field(payload, ("mission", "reflect_mission"))
-                )
-            except Exception as exc:
-                logger.debug("Hindsight bank config read failed: %s", exc)
-
-        return ""
-
-    def _patch_bank_mission(self, client, mission: str) -> None:
-        """Patch the server bank mission using the newest available client API."""
-        banks = getattr(client, "banks", None)
-        if banks is not None and hasattr(banks, "update_bank"):
-            try:
-                CreateBankRequest = _load_create_bank_request()
-                request = CreateBankRequest(mission=mission)
-                self._run_sync(
-                    banks.update_bank(
-                        self._bank_id,
-                        request,
-                        _request_timeout=self._control_request_timeout(),
-                    )
-                )
-                return
-            except ImportError:
-                pass
-
-        if hasattr(client, "aset_mission"):
-            self._run_sync(client.aset_mission(self._bank_id, mission))
-            return
-        if hasattr(client, "set_mission"):
-            client.set_mission(self._bank_id, mission)
-            return
-        if hasattr(client, "update_bank_config"):
-            client.update_bank_config(self._bank_id, reflect_mission=mission)
-            return
-        raise RuntimeError("Hindsight client has no bank mission update method")
-
-    def _sync_bank_mission_if_empty(self) -> None:
-        """Push configured bank_mission only when the server mission is blank."""
-        mission = str(self._bank_mission or "").strip()
-        if not mission or self._mode == "disabled":
-            return
-        client = self._get_client()
-        current = self._server_bank_mission(client)
-        if current:
-            logger.debug("Hindsight bank mission already set for bank=%s", self._bank_id)
-            return
-        self._patch_bank_mission(client, mission)
-        logger.info("Hindsight bank mission initialized for bank=%s", self._bank_id)
-
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
             return (
@@ -2029,7 +1839,62 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
-    def _format_prefetch_result(self, result: str) -> str:
+    def _recall_disabled(self) -> bool:
+        """Guards shared by the async and synchronous recall paths."""
+        if self._memory_mode == "tools":
+            logger.debug("Prefetch: skipped (tools-only mode)")
+            return True
+        if not self._auto_recall:
+            logger.debug("Prefetch: skipped (auto_recall disabled)")
+            return True
+        if self._shutting_down.is_set():
+            logger.debug("Prefetch: skipped (shutting down)")
+            return True
+        return False
+
+    def _do_recall(self, query: str) -> _RecallResult:
+        """Run one recall/reflect for *query*.
+
+        Returns the formatted memory text plus the number of discrete memories
+        recalled (0 for a reflect synthesis or on error), so the deterministic
+        recall indicator can report an accurate count without re-parsing the
+        text. Shared by the background prefetch worker (``queue_prefetch``) and
+        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
+        """
+        # Truncate query to max chars
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        try:
+            if self._prefetch_method == "reflect":
+                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                # Reflect synthesizes across many memories -> no discrete count.
+                return _RecallResult(resp.text or "", 0)
+            recall_kwargs: dict = {
+                "bank_id": self._bank_id, "query": query,
+                "budget": self._budget, "max_tokens": self._recall_max_tokens,
+            }
+            if self._recall_tags:
+                recall_kwargs["tags"] = self._recall_tags
+                recall_kwargs["tags_match"] = self._recall_tags_match
+            if self._recall_types:
+                recall_kwargs["types"] = self._recall_types
+            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
+                         self._bank_id, len(query), self._budget)
+            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+            num_results = len(resp.results) if resp.results else 0
+            logger.debug("Recall: returned %d results", num_results)
+            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            return _RecallResult(text, num_results)
+        except Exception as e:
+            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+            return _RecallResult("", 0)
+
+    def _format_recall(self, result: str) -> str:
+        if not result:
+            logger.debug("Prefetch: no results available")
+            return ""
+        logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
@@ -2037,198 +1902,74 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def _recall_profile(self) -> str:
-        if self._agent_identity:
-            return self._agent_identity
-        return {
-            "hermes-owner": "default",
-            "hermes-coding": "codex-coding",
-            "hermes-home-assistant": "home-assistant",
-        }.get(self._bank_id, self._bank_id.removeprefix("hermes-") or "default")
+    def _record_recall_indicator(self, *, returned: bool, count: int) -> None:
+        """Track what the last prefetch injected, for recall_status().
 
-    def _log_recall_telemetry(
-        self,
-        *,
-        method: str,
-        query: str,
-        started: float,
-        response: Any | None = None,
-        error: BaseException | None = None,
-        source: str = "prefetch",
-    ) -> None:
-        """Persist measurable recall metadata without recalled/query content."""
-        try:
-            results = list(getattr(response, "results", None) or [])
-            refs = []
-            for result in results:
-                ref: dict[str, Any] = {
-                    "id": str(getattr(result, "id", "") or ""),
-                    "type": str(getattr(result, "type", "") or ""),
-                }
-                scores = _extract_recall_scores(result)
-                if scores:
-                    ref["scores"] = {
-                        key: value
-                        for key, value in scores.items()
-                        if key in _RECALL_SCORE_KEYS and isinstance(value, (int, float))
-                    }
-                source_ids = getattr(result, "source_fact_ids", None)
-                if source_ids:
-                    ref["source_fact_ids"] = [str(value) for value in source_ids]
-                refs.append(ref)
-            session_ref = (
-                hashlib.sha256(self._session_id.encode("utf-8")).hexdigest()[:24]
-                if self._session_id
-                else ""
-            )
-            record: dict[str, Any] = {
-                "schema_version": 2,
-                "event": "hindsight_recall",
-                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "source": source,
-                "status": "error" if error is not None else "ok",
-                "method": method,
-                "profile": self._recall_profile(),
-                "bank_id": self._bank_id,
-                "session_ref": session_ref,
-                "turn_index": self._turn_index,
-                "query_chars": len(query),
-                "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
-                "latency_ms": round((time.monotonic() - started) * 1000, 2),
-                "result_count": len(results),
-                "results": refs,
-            }
-            if error is not None:
-                record["error_type"] = type(error).__name__
-            _private_jsonl_append(get_hermes_home() / "logs" / "recall-utilization.jsonl", record)
-        except Exception:
-            logger.debug("Hindsight recall telemetry logging failed", exc_info=True)
-
-    def _normalize_prefetch_query(self, query: str) -> str:
-        query = str(query or "")
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
-        return query.strip()
-
-    def _build_turn_prefetch_query(self, turn_number: int, message: str) -> str:
-        message = str(message or "").strip()
-        if turn_number != 1:
-            return message
-
-        parts: list[str] = []
-        if self._profile_summary:
-            parts.append(f"Profile summary: {self._profile_summary}")
-        if self._bank_mission:
-            parts.append(f"Bank mission: {self._bank_mission}")
-        if message:
-            parts.append(f"Current user message: {message}")
-        return "\n".join(parts) if parts else message
-
-    def _prefetch_text(self, query: str) -> str:
-        started = time.monotonic()
-        if self._prefetch_method == "reflect":
-            logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-            try:
-                resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id,
-                        query=query,
-                        budget=self._budget,
-                    )
-                )
-            except Exception as exc:
-                self._log_recall_telemetry(method="reflect", query=query, started=started, error=exc)
-                raise
-            self._log_recall_telemetry(method="reflect", query=query, started=started, response=resp)
-            return resp.text or ""
-
-        recall_kwargs: dict = {
-            "bank_id": self._bank_id, "query": query,
-            "budget": self._budget, "max_tokens": self._recall_max_tokens,
-        }
-        if self._recall_tags:
-            recall_kwargs["tags"] = self._recall_tags
-            recall_kwargs["tags_match"] = self._recall_tags_match
-        if self._recall_types:
-            recall_kwargs["types"] = self._recall_types
-        if self._recall_prefer_observations:
-            recall_kwargs["prefer_observations"] = True
-        if self._recall_min_scores:
-            recall_kwargs["min_scores"] = self._recall_min_scores
-        if self._recall_trace:
-            recall_kwargs["trace"] = True
-        logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                     self._bank_id, len(query), self._budget)
-        try:
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-        except Exception as exc:
-            self._log_recall_telemetry(method="recall", query=query, started=started, error=exc)
-            raise
-        num_results = len(resp.results) if resp.results else 0
-        logger.debug("Prefetch: recall returned %d results", num_results)
-        self._log_recall_telemetry(method="recall", query=query, started=started, response=resp)
-        return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-
-    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        query = self._build_turn_prefetch_query(turn_number, message)
-        self._queue_prefetch(query, session_id=kwargs.get("session_id", ""), turn_message=message)
+        Cleared to "nothing" on empty turns so the indicator never reports a
+        stale prior count.
+        """
+        self._last_recall_returned = returned
+        self._last_recall_count = count if returned else 0
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Opt-in: recall synchronously against the *current* message so the
+        # injected memories match this turn's query rather than the previous
+        # turn's queued recall. See NousResearch/hermes-agent#5820.
+        if self._recall_sync:
+            if self._recall_disabled():
+                self._record_recall_indicator(returned=False, count=0)
+                return ""
+            recalled = self._do_recall(query)
+            self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
+            return self._format_recall(recalled.text)
+
+        # Default: return the result the background worker prefetched for the
+        # previous turn (cheap buffer read, capped join).
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
+            count = self._prefetch_count
             self._prefetch_result = ""
-            self._prefetch_query = ""
-            self._prefetch_turn_message = ""
-        if not result:
-            logger.debug("Prefetch: no results available")
-            return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
-        return self._format_prefetch_result(result)
+            self._prefetch_count = 0
+        self._record_recall_indicator(returned=bool(result), count=count)
+        return self._format_recall(result)
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Report the count injected by the last prefetch (for the UI indicator).
+
+        Returns ``None`` when nothing was injected this turn or the indicator
+        is turned off (``recall_indicator=false``), so customer-facing agents
+        can suppress the "recalled N memories" status line.
+        """
+        if not self._recall_indicator or not self._last_recall_returned:
+            return None
+        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        self._queue_prefetch(query, session_id=session_id, turn_message=query)
-
-    def _queue_prefetch(self, query: str, *, session_id: str = "", turn_message: str = "") -> None:
-        if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
+        # In synchronous mode prefetch() does a live recall each turn, so
+        # there's nothing to prime in the background.
+        if self._recall_sync:
             return
-        if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
+        if self._recall_disabled():
             return
-        if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
-            return
-        query = self._normalize_prefetch_query(query)
-        if not query:
-            logger.debug("Prefetch: skipped (empty query)")
-            return
-        turn_message = self._normalize_prefetch_query(turn_message or query)
-
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            generation = self._prefetch_generation
-            self._prefetch_query = query
-            self._prefetch_turn_message = turn_message
-            self._prefetch_result = ""
 
         def _run():
-            try:
-                text = self._prefetch_text(query)
-                if text:
-                    with self._prefetch_lock:
-                        if generation == self._prefetch_generation:
-                            self._prefetch_result = text
-            except Exception as e:
-                # WARNING, not debug: a silently dying recall path makes every
-                # downstream turn run memory-blind with no operator signal.
-                self._prefetch_failures = getattr(self, "_prefetch_failures", 0) + 1
-                logger.warning(
-                    "Hindsight prefetch failed (%d total this session): %s",
-                    self._prefetch_failures, e, exc_info=True,
-                )
+            # Ensure the just-completed turn's retain is recall-visible on the
+            # server before we recall, so the warmed context for the next turn
+            # includes it. This waits for the local writer queue to drain AND
+            # for the server-side async retain op(s) to complete (an explicit
+            # read-after-write signal), because async retain returns on
+            # acceptance rather than durability. Runs on the background prefetch
+            # thread, never the reply path, so it adds no response latency.
+            if self._prefetch_waits_for_retain:
+                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+            recalled = self._do_recall(query)
+            if recalled.text:
+                with self._prefetch_lock:
+                    self._prefetch_result = recalled.text
+                    self._prefetch_count = recalled.count
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2247,42 +1988,6 @@ class HindsightMemoryProvider(MemoryProvider):
                 "timestamp": now,
             },
         ]
-
-    def _turn_matches_retain_noise(self, user_content: str, assistant_content: str) -> bool:
-        if not self._retain_noise_patterns:
-            return False
-        combined = f"{user_content}\n{assistant_content}"
-        if not any(_regex_search(pattern, combined) for pattern in self._retain_noise_patterns):
-            return False
-        folded = combined.casefold()
-        if any(term.casefold() in folded for term in self._retain_durable_terms):
-            return False
-        return True
-
-    def _redact_for_retain(self, text: str) -> str:
-        redacted = text
-        policies = set(self._retain_redaction_policy)
-        if "secrets" in policies:
-            redacted = _redact_secrets(redacted)
-        if "home_codes" in policies:
-            redacted = _redact_home_codes(redacted)
-        if "medical_no_phi" in policies:
-            redacted = _redact_medical_phi(redacted)
-        return redacted
-
-    def _cap_retain_turns(self, turns: List[str]) -> List[str]:
-        capped = _cap_turn_payload(
-            turns,
-            self._retain_max_payload_chars,
-            self._retain_oversize_policy,
-        )
-        if len(capped) < len(turns):
-            logger.info(
-                "sync_turn: capped retain payload from %d to %d turns (max=%d chars, policy=%s)",
-                len(turns), len(capped), self._retain_max_payload_chars,
-                self._retain_oversize_policy,
-            )
-        return capped
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -2361,12 +2066,6 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        if self._turn_matches_retain_noise(user_content, assistant_content):
-            logger.debug("sync_turn: skipped turn matching retain_noise_patterns")
-            return
-
-        user_content = self._redact_for_retain(str(user_content))
-        assistant_content = self._redact_for_retain(str(assistant_content))
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
@@ -2390,14 +2089,6 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
         else:
             turns_to_retain = list(self._session_turns)
-
-        turns_to_retain = self._cap_retain_turns(turns_to_retain)
-        if not turns_to_retain:
-            logger.warning(
-                "sync_turn: skipped retain because retain_max_payload_chars=%d is too small for a valid payload",
-                self._retain_max_payload_chars,
-            )
-            return
 
         logger.debug("sync_turn: retaining %d/%d turns, payload %d chars",
                      len(turns_to_retain), len(self._session_turns),
@@ -2434,7 +2125,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 item["update_mode"] = update_mode
             logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                          bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-            self._run_hindsight_operation(
+            resp = self._run_hindsight_operation(
                 lambda client: client.aretain_batch(
                     bank_id=bank_id,
                     items=[item],
@@ -2442,15 +2133,39 @@ class HindsightMemoryProvider(MemoryProvider):
                     retain_async=retain_async_flag,
                 )
             )
+            # For async retains the write is only *accepted* here; track the
+            # returned operation id(s) so the next-turn prefetch can wait for
+            # true server-side completion (read-after-write) before recalling.
+            if retain_async_flag:
+                self._track_retain_ops(resp, bank_id)
             logger.debug("Hindsight retain succeeded")
 
         self._ensure_writer()
         self._register_atexit()
+        # Deterministic "saving to memory" indicator — emitted the moment a
+        # real retain is dispatched (past every skip/buffer gate above), so it
+        # only fires on turns that actually persist.
+        self._emit_saving_indicator()
         self._retain_queue.put(_do_retain)
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
+
+    def _emit_saving_indicator(self) -> None:
+        """Surface a model-independent "saving to memory" status line.
+
+        Runs on the background sync worker (sync_turn's caller). No-ops when the
+        indicator is turned off (``retain_indicator=false``) or no status
+        channel was injected. Never raises — a status-line failure must not
+        derail the retain.
+        """
+        if not self._retain_indicator or self._status_callback is None:
+            return
+        try:
+            self._status_callback(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
+        except Exception:
+            logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
@@ -2487,82 +2202,26 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            started = time.monotonic()
             try:
                 recall_kwargs: dict = {
-                    "bank_id": self._bank_id,
-                    "query": query,
-                    "budget": str(args.get("budget") or self._budget),
-                    "max_tokens": int(args.get("max_tokens") or self._recall_max_tokens),
+                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                    "max_tokens": self._recall_max_tokens,
                 }
-
-                call_tags = _normalize_string_list(args.get("tags")) if "tags" in args else self._recall_tags
-                if call_tags:
-                    recall_kwargs["tags"] = call_tags
-                    recall_kwargs["tags_match"] = str(args.get("tags_match") or self._recall_tags_match)
-                elif args.get("tags_match"):
-                    recall_kwargs["tags_match"] = str(args["tags_match"])
-
-                if "types" in args:
-                    call_types = _normalize_string_list(args.get("types"))
-                    if call_types:
-                        recall_kwargs["types"] = call_types
-                elif self._recall_types:
+                if self._recall_tags:
+                    recall_kwargs["tags"] = self._recall_tags
+                    recall_kwargs["tags_match"] = self._recall_tags_match
+                if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
-
-                if args.get("prefer_observations") is not None:
-                    recall_kwargs["prefer_observations"] = bool(args.get("prefer_observations"))
-                elif self._recall_prefer_observations:
-                    recall_kwargs["prefer_observations"] = True
-
-                min_scores = (
-                    _normalize_min_scores(args.get("min_scores"))
-                    if "min_scores" in args
-                    else self._recall_min_scores
-                )
-                if min_scores:
-                    recall_kwargs["min_scores"] = min_scores
-
-                if args.get("trace") is not None:
-                    recall_kwargs["trace"] = bool(args.get("trace"))
-                elif self._recall_trace:
-                    recall_kwargs["trace"] = True
-
-                query_timestamp = args.get("query_timestamp")
-                if query_timestamp:
-                    recall_kwargs["query_timestamp"] = str(query_timestamp)
-
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s, types=%s",
-                             self._bank_id, len(query), recall_kwargs["budget"], recall_kwargs.get("types"))
+                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
+                             self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                 num_results = len(resp.results) if resp.results else 0
                 logger.debug("Tool hindsight_recall: %d results", num_results)
-                self._log_recall_telemetry(
-                    method="recall", query=query, started=started, response=resp, source="tool"
-                )
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                include_scores = (
-                    bool(args.get("include_scores"))
-                    if "include_scores" in args
-                    else self._recall_include_scores
-                )
-                lines = [
-                    _format_recall_result_line(i, r, include_scores=include_scores)
-                    for i, r in enumerate(resp.results, 1)
-                ]
-                result_payload: dict[str, Any] = {"result": "\n".join(lines)}
-                if include_scores:
-                    scores = [_extract_recall_scores(r) for r in resp.results]
-                    if any(score is not None for score in scores):
-                        result_payload["scores"] = scores
-                if recall_kwargs.get("trace") and getattr(resp, "trace", None) is not None:
-                    result_payload["trace"] = resp.trace
-                return json.dumps(result_payload)
+                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
-                self._log_recall_telemetry(
-                    method="recall", query=query, started=started, error=e, source="tool"
-                )
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
 
@@ -2570,7 +2229,6 @@ class HindsightMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
-            started = time.monotonic()
             try:
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
@@ -2579,15 +2237,9 @@ class HindsightMemoryProvider(MemoryProvider):
                         bank_id=self._bank_id, query=query, budget=self._budget
                     )
                 )
-                self._log_recall_telemetry(
-                    method="reflect", query=query, started=started, response=resp, source="tool"
-                )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
-                self._log_recall_telemetry(
-                    method="reflect", query=query, started=started, error=e, source="tool"
-                )
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
 
@@ -2640,7 +2292,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # everything before mutating self._* so metadata + tags + doc_id
         # all reference the old session consistently.
         if self._session_turns:
-            old_turns = self._cap_retain_turns(list(self._session_turns))
+            old_turns = list(self._session_turns)
             old_session_id = self._session_id
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
@@ -2695,7 +2347,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # two threads on aretain_batch against the same document, and
             # keeps shutdown's drain semantics intact. Skip enqueue if
             # shutdown has already fired — the writer is draining/gone.
-            if old_turns and not self._shutting_down.is_set():
+            if not self._shutting_down.is_set():
                 self._ensure_writer()
                 self._register_atexit()
                 self._retain_queue.put(_flush)
@@ -2706,9 +2358,6 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
-            self._prefetch_query = ""
-            self._prefetch_turn_message = ""
-            self._prefetch_generation = getattr(self, "_prefetch_generation", 0) + 1
 
         # 3. Now rotate to the new session.
         if parent_session_id:

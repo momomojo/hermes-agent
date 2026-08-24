@@ -52,6 +52,13 @@ def busy_input_hint_gateway(mode: str) -> str:
             "Send `/busy interrupt` or `/busy queue` to change this, or "
             "`/busy status` to check. This notice won't appear again."
         )
+    if mode == "redirect":
+        return (
+            "💡 First-time tip — I redirected the current run using your message. "
+            "Completed work stays in context, and `/stop` still cancels the task. "
+            "Send `/busy queue` to wait for a separate turn, or `/busy status` "
+            "to check. This notice won't appear again."
+        )
     return (
         "💡 First-time tip — I just interrupted my current task to answer you. "
         "Send `/busy queue` to queue follow-ups for after the current task instead, "
@@ -73,6 +80,12 @@ def busy_input_hint_cli(mode: str) -> str:
             "(tip) Your message was steered into the current run; it arrives "
             "after the next tool call. Use /busy interrupt or /busy queue to "
             "change this. This tip only shows once."
+        )
+    if mode == "redirect":
+        return (
+            "(tip) Your correction redirected the current run without discarding "
+            "completed work. Use /stop to cancel or /busy queue to wait for a "
+            "separate turn. This tip only shows once."
         )
     return (
         "(tip) Your message interrupted the current run. "
@@ -203,18 +216,22 @@ def is_seen(config: Mapping[str, Any], flag: str) -> bool:
 def mark_seen(config_path: Path, flag: str) -> bool:
     """Persist ``onboarding.seen.<flag> = True`` to ``config_path``.
 
-    Runs the full read-modify-write cycle under the cross-process config
-    lock (``utils.locked_yaml_mutate``) so this write can't revert a
-    concurrent config edit.  Returns True on success, False on any error
+    Uses the atomic YAML writer so a concurrent process can't observe a
+    partially-written file.  Returns True on success, False on any error
     (including the config file being absent — onboarding is best-effort).
     """
     try:
-        from utils import SKIP_WRITE, locked_yaml_mutate
+        import yaml
+        from hermes_cli.config import atomic_config_write
     except Exception as e:  # pragma: no cover — dependency issue
-        logger.debug("onboarding: failed to import utils: %s", e)
+        logger.debug("onboarding: failed to import yaml/utils: %s", e)
         return False
 
-    def _mark(cfg: dict):
+    try:
+        cfg: dict = {}
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
         if not isinstance(cfg.get("onboarding"), dict):
             cfg["onboarding"] = {}
         seen = cfg["onboarding"].get("seen")
@@ -222,12 +239,9 @@ def mark_seen(config_path: Path, flag: str) -> bool:
             seen = {}
             cfg["onboarding"]["seen"] = seen
         if seen.get(flag) is True:
-            return SKIP_WRITE  # already marked — nothing to do
+            return True  # already marked — nothing to do
         seen[flag] = True
-        return None
-
-    try:
-        locked_yaml_mutate(config_path, _mark)
+        atomic_config_write(config_path, cfg)
         return True
     except Exception as e:
         logger.debug("onboarding: failed to mark flag %s: %s", flag, e)
