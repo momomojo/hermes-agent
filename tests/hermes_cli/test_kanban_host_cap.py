@@ -151,6 +151,7 @@ def test_max_in_progress_counts_other_boards(
     # Host budget (2) already consumed by the second board → nothing spawns.
     assert not spawns
     assert not res.spawned
+    assert res.deferred_capacity is True
 
 
 def test_max_in_progress_partial_budget_across_boards(

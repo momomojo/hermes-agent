@@ -98,3 +98,26 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert res2.spawned[0][0] != spawned_id  # different task this time
 
 
+def test_all_rows_per_profile_capped_is_expected_capacity_deferral(
+    isolated_kanban_home_with_profiles,
+):
+    """A busy profile with queued work is healthy queueing, not stuck."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running = kb.create_task(conn, title="running", assignee="alpha")
+        kb.create_task(conn, title="waiting", assignee="alpha")
+        assert kb.claim_task(conn, running) is not None
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress_per_profile=1,
+        )
+
+    assert not res.spawned
+    assert len(res.skipped_per_profile_capped) == 1
+    assert res.deferred_capacity is True
+

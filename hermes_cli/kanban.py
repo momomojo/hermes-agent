@@ -2798,7 +2798,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        expected_deferral = (
+            bool(getattr(res, "deferred_capacity", False))
+            or bool(getattr(res, "skipped_locked", False))
+            or getattr(res, "memory_pressure", None) == "critical"
+        )
+        if ready_pending and not spawned_any and not expected_deferral:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0

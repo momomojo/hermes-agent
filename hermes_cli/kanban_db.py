@@ -342,6 +342,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.deferred_capacity,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -8049,6 +8050,11 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    deferred_capacity: bool = False
+    """True when this tick intentionally spawned nothing because the global,
+    per-board, or per-profile concurrency budget was already consumed.
+    Capacity deferral is healthy queueing, not a dispatcher failure; health
+    telemetry must not count it toward the ``dispatcher stuck`` window."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9988,6 +9994,7 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.deferred_capacity = True
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10004,6 +10011,7 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.deferred_capacity = True
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10415,6 +10423,25 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    # If every queued row that did not spawn was explicitly accounted for as
+    # capped/nonspawnable/unassigned/guarded, then zero spawns is expected
+    # capacity deferral. Do not set this after an unreported spawn failure:
+    # such a row is absent from the accounted buckets and must remain visible
+    # to the dispatcher health warning and circuit breaker.
+    queued_rows = len(ready_rows) + len(review_rows)
+    accounted_rows = (
+        len(result.skipped_per_profile_capped)
+        + len(result.skipped_unassigned)
+        + len(result.skipped_nonspawnable)
+        + len(result.respawn_guarded)
+    )
+    if (
+        not result.spawned
+        and result.skipped_per_profile_capped
+        and queued_rows > 0
+        and accounted_rows >= queued_rows
+    ):
+        result.deferred_capacity = True
     return result
 
 
