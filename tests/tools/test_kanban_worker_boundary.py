@@ -684,6 +684,32 @@ def _run_linux_sandbox(command, worker):
     platform.system() != "Linux" or shutil.which("bwrap") is None,
     reason="Linux bubblewrap integration",
 )
+def test_linux_sandbox_executes_exact_active_python_runtime(worker):
+    """The exact worker venv and its resolved runtime closure stay executable."""
+    executable = shlex.quote(sys.executable)
+    script = (
+        "set -eu; "
+        f"exe={executable}; "
+        'printf "exe=%s\\n" "$exe"; '
+        'ls -ld "$(dirname "$exe")"; '
+        'ls -l "$exe"; '
+        'real="$(readlink -f "$exe")"; '
+        'printf "real=%s\\n" "$real"; '
+        'ls -l "$real"; '
+        '"$exe" -c "import sys; assert sys.executable"'
+    )
+
+    completed = _run_linux_sandbox(["/bin/sh", "-c", script], worker)
+
+    assert completed.returncode == 0, (
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap integration",
+)
 def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
     """The inherited seccomp filter must deny IP and abstract AF_UNIX sockets."""
 
