@@ -639,11 +639,63 @@ def test_linux_bubblewrap_pins_exact_resolved_python_executable_after_runtime_ro
     """A uv venv symlink target cannot disappear behind the empty-root view."""
     from tools.kanban_worker_boundary import local_sandbox_argv
 
-    runtime = tmp_path / "uv-python-dir" / "cpython-3.11" / "bin"
+    canonical_runtime = tmp_path / "canonical-python" / "cpython-3.11" / "bin"
+    canonical_runtime.mkdir(parents=True)
+    real_python = canonical_runtime / "python3.11"
+    real_python.write_text("runtime", encoding="utf-8")
+    lexical_parent = tmp_path / "uv-python-dir"
+    lexical_parent.symlink_to(canonical_runtime.parent.parent)
+    lexical_runtime = lexical_parent / "cpython-3.11" / "bin"
+    lexical_python = lexical_runtime / "python3.11"
+    venv_bin = tmp_path / "repo" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(lexical_python)
+
+    with (
+        patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
+        patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
+        patch("tools.kanban_worker_boundary.sys.executable", str(venv_python)),
+        patch("tools.kanban_worker_boundary.sys.prefix", str(venv_bin.parent)),
+        patch(
+            "tools.kanban_worker_boundary.sys.base_prefix",
+            str(canonical_runtime.parent),
+        ),
+    ):
+        argv = local_sandbox_argv(
+            [str(venv_python), "-c", "pass"], worker, seccomp_fd=71
+        )
+
+    alias_mount = ["--ro-bind", str(real_python), str(lexical_python)]
+    exact_index = next(
+        index
+        for index in range(len(argv) - 2)
+        if argv[index : index + 3] == alias_mount
+    )
+    runtime_root_mount = [
+        "--ro-bind",
+        str(canonical_runtime.parent),
+        str(lexical_runtime.parent),
+    ]
+    runtime_index = next(
+        index
+        for index in range(len(argv) - 2)
+        if argv[index : index + 3] == runtime_root_mount
+    )
+    assert exact_index > runtime_index
+
+
+def test_linux_bubblewrap_rejects_worker_controlled_python_runtime_alias(worker):
+    from tools.kanban_worker_boundary import (
+        WorkerSandboxUnavailable,
+        local_sandbox_argv,
+    )
+
+    runtime = worker / "runtime" / "bin"
     runtime.mkdir(parents=True)
     real_python = runtime / "python3.11"
-    real_python.write_text("runtime", encoding="utf-8")
-    venv_bin = tmp_path / "repo" / ".venv" / "bin"
+    real_python.write_text("worker-controlled", encoding="utf-8")
+    venv_bin = worker / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     venv_python = venv_bin / "python"
     venv_python.symlink_to(real_python)
@@ -652,30 +704,11 @@ def test_linux_bubblewrap_pins_exact_resolved_python_executable_after_runtime_ro
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
         patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
         patch("tools.kanban_worker_boundary.sys.executable", str(venv_python)),
-        patch("tools.kanban_worker_boundary.sys.prefix", str(venv_bin.parent)),
-        patch("tools.kanban_worker_boundary.sys.base_prefix", str(runtime.parent)),
+        pytest.raises(WorkerSandboxUnavailable, match="Python runtime alias"),
     ):
-        argv = local_sandbox_argv(
+        local_sandbox_argv(
             [str(venv_python), "-c", "pass"], worker, seccomp_fd=71
         )
-
-    exact_mount = ["--ro-bind", str(real_python), str(real_python)]
-    exact_index = next(
-        index
-        for index in range(len(argv) - 2)
-        if argv[index : index + 3] == exact_mount
-    )
-    runtime_root_mount = [
-        "--ro-bind",
-        str(runtime.parent),
-        str(runtime.parent),
-    ]
-    runtime_index = next(
-        index
-        for index in range(len(argv) - 2)
-        if argv[index : index + 3] == runtime_root_mount
-    )
-    assert exact_index > runtime_index
 
 
 def test_linux_sandbox_fails_closed_without_seccomp_fd(worker):

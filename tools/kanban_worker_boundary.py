@@ -582,6 +582,38 @@ def _bubblewrap_system_roots() -> tuple[tuple[Path, Path], ...]:
     return tuple(roots)
 
 
+def _bubblewrap_python_runtime_aliases() -> tuple[tuple[Path, Path], ...]:
+    """Map the trusted interpreter closure to its literal venv symlink target.
+
+    ``Path.resolve()`` canonicalizes every parent symlink.  uv's hosted-runner
+    venv can instead point at a lexical ``.../work/_temp/...`` alias whose
+    parent resolves elsewhere.  The empty Bubblewrap root must contain the
+    literal target named by the venv, not only the canonical source path.
+    """
+    entry = Path(sys.executable)
+    if not entry.is_absolute():
+        return ()
+    try:
+        raw_target = Path(os.readlink(entry))
+        canonical_python = entry.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ()
+    lexical_python = raw_target if raw_target.is_absolute() else entry.parent / raw_target
+    lexical_python = Path(os.path.normpath(str(lexical_python)))
+    canonical_root = canonical_python.parent.parent
+    lexical_root = lexical_python.parent.parent
+    if (
+        not canonical_python.is_file()
+        or canonical_root == Path("/")
+        or lexical_root == Path("/")
+    ):
+        return ()
+    return (
+        (canonical_root, lexical_root),
+        (canonical_python, lexical_python),
+    )
+
+
 def local_sandbox_argv(
     argv: Sequence[str],
     workspace: Path,
@@ -654,6 +686,19 @@ def local_sandbox_argv(
             args.extend(("--tmpfs", str(private_root)))
         for system_source, system_target in _bubblewrap_system_roots():
             args.extend(("--ro-bind", str(system_source), str(system_target)))
+        for alias_source, alias_target in _bubblewrap_python_runtime_aliases():
+            overlaps_workspace = any(
+                left == right or left.is_relative_to(right)
+                for left, right in (
+                    (exact_workspace, alias_target),
+                    (alias_target, exact_workspace),
+                )
+            )
+            if overlaps_workspace:
+                raise WorkerSandboxUnavailable(
+                    "assigned workspace overlaps the host Python runtime alias"
+                )
+            args.extend(("--ro-bind", str(alias_source), str(alias_target)))
         # Pin the exact resolved interpreter *after* its runtime roots.  uv's
         # GitHub Actions venv uses an absolute symlink into a temporary Python
         # installation; an empty-root mount can otherwise expose the venv
