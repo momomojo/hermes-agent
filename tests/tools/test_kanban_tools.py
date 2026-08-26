@@ -461,6 +461,58 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("workspace_kind", "workspace_path"),
+    [
+        ("dir", None),
+        ("dir", "/Users/agent/Library/LaunchAgents"),
+        ("scratch", "/Users/agent/.local/bin"),
+        ("worktree", "/Users/agent/Documents/protected-repo"),
+    ],
+)
+def test_create_rejects_model_minted_host_workspace_grants(
+    worker_env,
+    workspace_kind,
+    workspace_path,
+):
+    """Only trusted CLI/dashboard code may persist an explicit host path."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "confused deputy child",
+                "assignee": "peer",
+                "workspace_kind": workspace_kind,
+                "workspace_path": workspace_path,
+            }
+        )
+    )
+
+    assert result.get("ok") is not True
+    assert "trusted CLI or dashboard" in result.get("error", "")
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+    finally:
+        conn.close()
+
+
+def test_create_schema_does_not_offer_shared_or_explicit_host_paths():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    properties = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    assert "workspace_path" not in properties
+    assert "dir" not in properties["workspace_kind"]["enum"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

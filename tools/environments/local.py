@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -1816,12 +1817,12 @@ class LocalEnvironment(BaseEnvironment):
         # avoids contaminating a reused LocalEnvironment or an in-process cron
         # execution with stale worker authority.
         from tools.kanban_worker_boundary import (
+            LocalSandboxLaunch,
             current_local_sandbox_workspace,
-            local_sandbox_argv,
+            local_sandbox_launch,
         )
 
-        if (worker_workspace := current_local_sandbox_workspace()) is not None:
-            args = local_sandbox_argv(args, worker_workspace)
+        worker_workspace = current_local_sandbox_workspace()
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
@@ -1851,24 +1852,31 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_creationflags = windows_hide_flags() if _IS_WINDOWS else 0
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=_popen_cwd,
-            **_popen_kwargs,
+        sandbox_context = (
+            local_sandbox_launch(args, worker_workspace)
+            if worker_workspace is not None
+            else nullcontext(LocalSandboxLaunch(args))
         )
+        with sandbox_context as launch:
+            proc = subprocess.Popen(
+                launch.argv,
+                text=True,
+                env=run_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=_popen_cwd,
+                creationflags=_popen_creationflags,
+                pass_fds=launch.pass_fds,
+            )
         if not _IS_WINDOWS:
             try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
+                setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
             except ProcessLookupError:
                 pass
 

@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -29,6 +30,106 @@ _LOCAL_SANDBOX_WORKSPACE: ContextVar[Path | None] = ContextVar(
 
 class WorkerSandboxUnavailable(RuntimeError):
     """Raised when the host cannot provide a real filesystem boundary."""
+
+
+@dataclass(frozen=True)
+class LocalSandboxLaunch:
+    """Exact argv plus host-owned descriptors inherited by one sandbox spawn."""
+
+    argv: list[str]
+    pass_fds: tuple[int, ...] = ()
+
+
+# Native 64-bit socket syscalls plus io_uring, whose socket/connect operations
+# would otherwise bypass a syscall-name blacklist. A compat-ABI process is
+# killed by the architecture guard, and x32 syscalls are rejected separately.
+_LINUX_NETWORK_SYSCALLS: dict[str, tuple[int, ...]] = {
+    "x86_64": (*range(41, 56), 288, 299, 307, 425, 426, 427),
+    "aarch64": (*range(198, 213), 242, 243, 269, 425, 426, 427),
+}
+_LINUX_AUDIT_ARCH = {
+    "x86_64": 0xC000003E,
+    "aarch64": 0xC00000B7,
+}
+
+
+def _normalized_linux_machine(machine: str) -> str:
+    normalized = machine.strip().lower()
+    aliases = {
+        "amd64": "x86_64",
+        "arm64": "aarch64",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in _LINUX_NETWORK_SYSCALLS:
+        raise WorkerSandboxUnavailable(
+            f"Linux worker seccomp policy does not support architecture {machine!r}"
+        )
+    return normalized
+
+
+def _network_seccomp_instructions(machine: str) -> tuple[tuple[int, int, int, int], ...]:
+    """Return a fail-closed classic-BPF filter for worker network syscalls."""
+    normalized = _normalized_linux_machine(machine)
+    # struct seccomp_data offsets: nr=0, arch=4. Each tuple is the kernel's
+    # eight-byte ``struct sock_filter``: code, jt, jf, k.
+    load_word_abs = 0x20
+    jump_equal = 0x15
+    jump_ge = 0x35
+    return_k = 0x06
+    errno_action = 0x00050000 | 1  # SECCOMP_RET_ERRNO | EPERM
+    instructions: list[tuple[int, int, int, int]] = [
+        (load_word_abs, 0, 0, 4),
+        (jump_equal, 1, 0, _LINUX_AUDIT_ARCH[normalized]),
+        (return_k, 0, 0, 0x80000000),  # SECCOMP_RET_KILL_PROCESS
+        (load_word_abs, 0, 0, 0),
+    ]
+    if normalized == "x86_64":
+        # AUDIT_ARCH_X86_64 also covers x32. Reject that ABI wholesale so its
+        # syscall-number bit cannot bypass the native-number denylist.
+        instructions.extend(
+            [
+                (jump_ge, 0, 1, 0x40000000),
+                (return_k, 0, 0, errno_action),
+            ]
+        )
+    for syscall_number in _LINUX_NETWORK_SYSCALLS[normalized]:
+        instructions.extend(
+            [
+                (jump_equal, 0, 1, syscall_number),
+                (return_k, 0, 0, errno_action),
+            ]
+        )
+    instructions.append((return_k, 0, 0, 0x7FFF0000))  # SECCOMP_RET_ALLOW
+    return tuple(instructions)
+
+
+def _network_seccomp_program(machine: str) -> bytes:
+    return b"".join(
+        struct.pack("=HBBI", *instruction)
+        for instruction in _network_seccomp_instructions(machine)
+    )
+
+
+def _network_seccomp_fd() -> int:
+    """Create a host-owned in-memory BPF program for one Bubblewrap launch."""
+    memfd_create = getattr(os, "memfd_create", None)
+    if memfd_create is None:
+        raise WorkerSandboxUnavailable(
+            "Linux memfd_create is required for the worker seccomp boundary"
+        )
+    try:
+        fd = memfd_create(
+            "hermes-worker-network-seccomp",
+            getattr(os, "MFD_CLOEXEC", 0),
+        )
+        program = _network_seccomp_program(platform.machine())
+        os.write(fd, program)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except Exception:
+        if "fd" in locals():
+            os.close(fd)
+        raise
 
 
 def _boundary_expected() -> bool:
@@ -441,7 +542,12 @@ def _bubblewrap_system_roots() -> tuple[tuple[Path, Path], ...]:
     return tuple(roots)
 
 
-def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
+def local_sandbox_argv(
+    argv: Sequence[str],
+    workspace: Path,
+    *,
+    seccomp_fd: int | None = None,
+) -> list[str]:
     """Wrap argv in a real local filesystem+network sandbox.
 
     macOS uses Seatbelt. Linux uses bubblewrap with a minimal immutable system
@@ -470,29 +576,24 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             raise WorkerSandboxUnavailable(
                 "Linux bubblewrap (bwrap) is required for Kanban workers"
             )
-        unshare = shutil.which("unshare")
-        if not unshare:
+        if seccomp_fd is None:
             raise WorkerSandboxUnavailable(
-                "Linux util-linux unshare is required for Kanban workers"
+                "Linux worker sandbox requires a host-owned seccomp filter fd"
             )
         args = [
-            unshare,
-            "--user",
-            "--map-root-user",
-            "--net",
-            "--",
             bubblewrap,
             "--die-with-parent",
             "--new-session",
             "--unshare-pid",
             "--cap-drop",
             "ALL",
+            "--seccomp",
+            str(seccomp_fd),
         ]
-        # Do not bind host /. Pathname AF_UNIX sockets are selected through
-        # the filesystem even inside a new network namespace, so a read-only
-        # full-root view would still expose control sockets anywhere on the
-        # host. Bind only immutable executable/runtime trees; /run, /tmp,
-        # /var/tmp, and the user's home are private empty mounts.
+        # Do not bind host /. Seccomp denies socket syscalls, while pathname
+        # AF_UNIX endpoints are selected through the filesystem and therefore
+        # still require a mount boundary. Bind only immutable executable/runtime
+        # trees; /run, /tmp, /var/tmp, and the user's home are private mounts.
         private_roots = (Path("/run"), Path("/tmp"), Path("/var/tmp"), Path.home())
         seen_private: set[Path] = set()
         for private_root in private_roots:
@@ -533,12 +634,31 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             "--setenv",
             "TMPDIR",
             str(temp_root),
+            "--",
             *argv,
         ])
         return args
     raise WorkerSandboxUnavailable(
         f"{system or 'unknown'} has no supported Kanban worker filesystem sandbox"
     )
+
+
+@contextmanager
+def local_sandbox_launch(
+    argv: Sequence[str], workspace: Path
+) -> Iterator[LocalSandboxLaunch]:
+    """Prepare one sandbox spawn while retaining any trusted filter fd."""
+    if platform.system() != "Linux":
+        yield LocalSandboxLaunch(local_sandbox_argv(argv, workspace))
+        return
+    seccomp_fd = _network_seccomp_fd()
+    try:
+        yield LocalSandboxLaunch(
+            local_sandbox_argv(argv, workspace, seccomp_fd=seccomp_fd),
+            (seccomp_fd,),
+        )
+    finally:
+        os.close(seccomp_fd)
 
 
 def terminal_backend_violation(env_type: str, *, background: bool) -> str | None:
@@ -566,7 +686,8 @@ def terminal_backend_violation(env_type: str, *, background: bool) -> str | None
         )
     try:
         # Preflight the exact platform boundary without executing anything.
-        local_sandbox_argv(["/usr/bin/true"], workspace)
+        with local_sandbox_launch(["/usr/bin/true"], workspace):
+            pass
     except (OSError, RuntimeError) as exc:
         return f"Blocked: verified local filesystem sandbox unavailable: {exc}"
     return None

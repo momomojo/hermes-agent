@@ -586,31 +586,20 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
         "GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8"
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    sandbox_tools = {
-        "bwrap": "/usr/bin/bwrap",
-        "unshare": "/usr/bin/unshare",
-    }
     with (
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
-        patch(
-            "tools.kanban_worker_boundary.shutil.which",
-            side_effect=sandbox_tools.get,
-        ),
+        patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
     ):
-        argv = local_sandbox_argv(["/bin/sh", "-c", "true"], worker)
+        argv = local_sandbox_argv(
+            ["/bin/sh", "-c", "true"], worker, seccomp_fd=71
+        )
 
     joined = "\0".join(argv)
-    assert argv[:5] == [
-        "/usr/bin/unshare",
-        "--user",
-        "--map-root-user",
-        "--net",
-        "--",
-    ]
-    assert argv[5] == "/usr/bin/bwrap"
+    assert argv[0] == "/usr/bin/bwrap"
     assert "--unshare-net" not in argv
     assert "--unshare-pid" in argv
     assert "--cap-drop\0ALL" in joined
+    assert f"--seccomp\0{71}" in joined
     assert f"--ro-bind\0/\0/" not in joined
     assert "--tmpfs\0/run" in joined
     assert "--tmpfs\0/tmp" in joined
@@ -630,7 +619,7 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
     assert hermes_home.resolve() not in masked_targets
 
 
-def test_linux_sandbox_fails_closed_without_unshare(worker):
+def test_linux_sandbox_fails_closed_without_seccomp_fd(worker):
     from tools.kanban_worker_boundary import (
         WorkerSandboxUnavailable,
         local_sandbox_argv,
@@ -638,13 +627,44 @@ def test_linux_sandbox_fails_closed_without_unshare(worker):
 
     with (
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
-        patch(
-            "tools.kanban_worker_boundary.shutil.which",
-            side_effect=lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
-        ),
-        pytest.raises(WorkerSandboxUnavailable, match="util-linux unshare"),
+        patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
+        pytest.raises(WorkerSandboxUnavailable, match="seccomp"),
     ):
         local_sandbox_argv(["/bin/true"], worker)
+
+
+@pytest.mark.parametrize("machine", ["x86_64", "aarch64"])
+def test_linux_network_seccomp_program_denies_socket_and_io_uring(machine):
+    from tools.kanban_worker_boundary import (
+        _LINUX_NETWORK_SYSCALLS,
+        _network_seccomp_instructions,
+        _network_seccomp_program,
+    )
+
+    instructions = _network_seccomp_instructions(machine)
+    errno_action = 0x00050000 | 1
+    denied = {
+        instruction[3]
+        for index, instruction in enumerate(instructions[:-1])
+        if instruction[:3] == (0x15, 0, 1)
+        and instructions[index + 1] == (0x06, 0, 0, errno_action)
+    }
+    assert denied == set(_LINUX_NETWORK_SYSCALLS[machine])
+    assert instructions[-1] == (0x06, 0, 0, 0x7FFF0000)
+    assert len(_network_seccomp_program(machine)) == len(instructions) * 8
+
+
+def _run_linux_sandbox(command, worker):
+    from tools.kanban_worker_boundary import local_sandbox_launch
+
+    with local_sandbox_launch(command, worker) as launch:
+        return subprocess.run(
+            launch.argv,
+            pass_fds=launch.pass_fds,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
 
 @pytest.mark.skipif(
@@ -652,8 +672,7 @@ def test_linux_sandbox_fails_closed_without_unshare(worker):
     reason="Linux bubblewrap integration",
 )
 def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
-    """The outer network namespace must hide IP and abstract AF_UNIX sockets."""
-    from tools.kanban_worker_boundary import local_sandbox_argv
+    """The inherited seccomp filter must deny IP and abstract AF_UNIX sockets."""
 
     tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     abstract_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -675,8 +694,7 @@ def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
             " s.close()\n"
             "sys.exit(1 if escaped else 0)"
         )
-        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
     finally:
         abstract_listener.close()
@@ -694,7 +712,6 @@ def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
 )
 def test_linux_sandbox_cannot_connect_to_host_runtime_socket(worker, socket_dir):
     """Host control sockets outside /run must disappear from the worker."""
-    from tools.kanban_worker_boundary import local_sandbox_argv
 
     if not socket_dir.is_dir() or not os.access(socket_dir, os.W_OK):
         pytest.skip(f"socket fixture directory is not writable: {socket_dir}")
@@ -709,13 +726,7 @@ def test_linux_sandbox_cannot_connect_to_host_runtime_socket(worker, socket_dir)
             "except OSError: sys.exit(0)\n"
             "else: sys.exit(1)"
         )
-        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-        if completed.returncode not in (0, 1) and (
-            "Operation not permitted" in completed.stderr
-            or "No permissions" in completed.stderr
-        ):
-            pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+        completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
     finally:
         listener.close()
@@ -727,8 +738,7 @@ def test_linux_sandbox_cannot_connect_to_host_runtime_socket(worker, socket_dir)
     reason="Linux bubblewrap integration",
 )
 def test_linux_sandbox_cannot_connect_to_host_run_socket(worker):
-    """Network namespaces do not isolate AF_UNIX; the /run view must."""
-    from tools.kanban_worker_boundary import local_sandbox_argv
+    """Pathname AF_UNIX sockets require the private /run mount."""
 
     run_user = Path("/run/user") / str(os.getuid())
     if not run_user.is_dir() or not os.access(run_user, os.W_OK):
@@ -745,13 +755,7 @@ def test_linux_sandbox_cannot_connect_to_host_run_socket(worker):
             "except OSError: sys.exit(0)\n"
             "else: sys.exit(1)"
         )
-        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-        if completed.returncode not in (0, 1) and (
-            "Operation not permitted" in completed.stderr
-            or "No permissions" in completed.stderr
-        ):
-            pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+        completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
     finally:
         listener.close()
@@ -764,7 +768,6 @@ def test_linux_sandbox_cannot_connect_to_host_run_socket(worker):
 )
 def test_linux_sandbox_cannot_connect_to_accessible_container_daemon(worker):
     """Exercise the exact Docker/Podman confused-deputy primitive when present."""
-    from tools.kanban_worker_boundary import local_sandbox_argv
 
     candidates = (
         Path("/run/docker.sock"),
@@ -791,13 +794,7 @@ def test_linux_sandbox_cannot_connect_to_accessible_container_daemon(worker):
         "except OSError: sys.exit(0)\n"
         "else: sys.exit(1)"
     )
-    argv = local_sandbox_argv([sys.executable, "-c", code], worker)
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-    if completed.returncode not in (0, 1) and (
-        "Operation not permitted" in completed.stderr
-        or "No permissions" in completed.stderr
-    ):
-        pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+    completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
     assert completed.returncode == 0, completed.stderr
 
 

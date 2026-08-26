@@ -1428,6 +1428,18 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    # This is a model-facing tool. An explicit host path (or ``dir`` which
+    # resolves to the board's shared host directory) would let a worker mint a
+    # new durable authority row and trick a later dispatcher turn into granting
+    # write access to arbitrary same-UID state such as ~/.local/bin or
+    # LaunchAgents. Human-created durable dir/legacy tasks remain supported via
+    # the trusted CLI/dashboard paths, which bypass this module entirely.
+    if workspace_kind == "dir" or workspace_path is not None:
+        return tool_error(
+            "kanban_create refused: model-facing tools cannot mint a host "
+            "workspace grant. Use a scratch or project-linked task; create "
+            "durable dir/explicit-path tasks through the trusted CLI or dashboard."
+        )
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -2232,18 +2244,12 @@ KANBAN_CREATE_SCHEMA = {
             },
             "workspace_kind": {
                 "type": "string",
-                "enum": ["scratch", "dir", "worktree"],
+                "enum": ["scratch", "worktree"],
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
-                ),
-            },
-            "workspace_path": {
-                "type": "string",
-                "description": (
-                    "Absolute path for 'dir' or 'worktree' workspace. "
-                    "Relative paths are rejected at dispatch."
+                    "default) or 'worktree' (fresh task-local git worktree "
+                    "anchored by the board/project). Model-facing calls cannot "
+                    "create shared-directory or explicit-path grants."
                 ),
             },
             "project": {
