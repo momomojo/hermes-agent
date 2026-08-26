@@ -586,16 +586,31 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
         "GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8"
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    sandbox_tools = {
+        "bwrap": "/usr/bin/bwrap",
+        "unshare": "/usr/bin/unshare",
+    }
     with (
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
-        patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
+        patch(
+            "tools.kanban_worker_boundary.shutil.which",
+            side_effect=sandbox_tools.get,
+        ),
     ):
         argv = local_sandbox_argv(["/bin/sh", "-c", "true"], worker)
 
     joined = "\0".join(argv)
-    assert argv[0] == "/usr/bin/bwrap"
-    assert "--unshare-net" in argv
+    assert argv[:5] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--net",
+        "--",
+    ]
+    assert argv[5] == "/usr/bin/bwrap"
+    assert "--unshare-net" not in argv
     assert "--unshare-pid" in argv
+    assert "--cap-drop\0ALL" in joined
     assert f"--ro-bind\0/\0/" not in joined
     assert "--tmpfs\0/run" in joined
     assert "--tmpfs\0/tmp" in joined
@@ -613,6 +628,59 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
         if value == "--ro-bind"
     }
     assert hermes_home.resolve() not in masked_targets
+
+
+def test_linux_sandbox_fails_closed_without_unshare(worker):
+    from tools.kanban_worker_boundary import (
+        WorkerSandboxUnavailable,
+        local_sandbox_argv,
+    )
+
+    with (
+        patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
+        patch(
+            "tools.kanban_worker_boundary.shutil.which",
+            side_effect=lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+        ),
+        pytest.raises(WorkerSandboxUnavailable, match="util-linux unshare"),
+    ):
+        local_sandbox_argv(["/bin/true"], worker)
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap integration",
+)
+def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
+    """The outer network namespace must hide IP and abstract AF_UNIX sockets."""
+    from tools.kanban_worker_boundary import local_sandbox_argv
+
+    tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    abstract_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    abstract_address = f"\0hermes-kanban-{os.getpid()}"
+    try:
+        tcp_listener.bind(("127.0.0.1", 0))
+        tcp_listener.listen(1)
+        tcp_port = tcp_listener.getsockname()[1]
+        abstract_listener.bind(abstract_address)
+        abstract_listener.listen(1)
+        code = (
+            "import socket,sys; escaped=False\n"
+            f"for family,address in ((socket.AF_INET, ('127.0.0.1', {tcp_port})), "
+            f"(socket.AF_UNIX, {abstract_address!r})):\n"
+            " s=socket.socket(family, socket.SOCK_STREAM); s.settimeout(1)\n"
+            " try: s.connect(address)\n"
+            " except OSError: pass\n"
+            " else: escaped=True\n"
+            " s.close()\n"
+            "sys.exit(1 if escaped else 0)"
+        )
+        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        assert completed.returncode == 0, completed.stderr
+    finally:
+        abstract_listener.close()
+        tcp_listener.close()
 
 
 @pytest.mark.skipif(

@@ -470,16 +470,28 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             raise WorkerSandboxUnavailable(
                 "Linux bubblewrap (bwrap) is required for Kanban workers"
             )
+        unshare = shutil.which("unshare")
+        if not unshare:
+            raise WorkerSandboxUnavailable(
+                "Linux util-linux unshare is required for Kanban workers"
+            )
         args = [
+            unshare,
+            "--user",
+            "--map-root-user",
+            "--net",
+            "--",
             bubblewrap,
             "--die-with-parent",
             "--new-session",
-            "--unshare-net",
             "--unshare-pid",
+            "--cap-drop",
+            "ALL",
         ]
-        # Do not bind host /. AF_UNIX ignores network namespaces, so a
-        # read-only full-root view still exposes control sockets anywhere on
-        # the host. Bind only immutable executable/runtime trees; /run, /tmp,
+        # Do not bind host /. Pathname AF_UNIX sockets are selected through
+        # the filesystem even inside a new network namespace, so a read-only
+        # full-root view would still expose control sockets anywhere on the
+        # host. Bind only immutable executable/runtime trees; /run, /tmp,
         # /var/tmp, and the user's home are private empty mounts.
         private_roots = (Path("/run"), Path("/tmp"), Path("/var/tmp"), Path.home())
         seen_private: set[Path] = set()
