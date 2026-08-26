@@ -2967,6 +2967,31 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        # Dispatcher worktree workers are model-facing even when their profile
+        # uses the ordinary Hermes local runtime rather than Codex app-server.
+        # Enforce the same Git/control-plane boundary before the user-bypassable
+        # approval layer; force=True can never grant commit/ref/config/publish.
+        if env_type == "local":
+            from tools.kanban_worker_boundary import terminal_violation
+
+            guard_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+            )
+            kanban_boundary_error = terminal_violation(command, guard_cwd)
+            if kanban_boundary_error:
+                logger.warning(
+                    "Blocked Kanban worker boundary crossing (command: %s)",
+                    _safe_command_preview(command),
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": kanban_boundary_error,
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
         # Windows-only: NTFS locks loaded module files, so rewriting the local
         # checkout backing this interpreter can corrupt the running process.
         # POSIX keeps old inodes alive for open handles, so the guard is off

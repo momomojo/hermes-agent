@@ -279,6 +279,25 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     assert referenced - declared == set(), "job(s) gate on an output detect never declares"
 
 
+def test_docs_workflow_installs_declared_npm_before_dependency_install():
+    """Node 22 bundles npm 10, but the website manifest is engine-strict >=11.17."""
+    workflow = _yaml(".github/workflows/docs-site-checks.yml")
+    steps = workflow["jobs"]["docs-site-checks"]["steps"]
+    commands = [
+        str((step.get("with") or {}).get("command") or "")
+        for step in steps
+    ]
+    npm_toolchain = next(
+        index
+        for index, command in enumerate(commands)
+        if "npm install --global npm@11.17.0" in command
+    )
+    npm_ci = next(
+        index for index, command in enumerate(commands) if command == "npm ci"
+    )
+    assert npm_toolchain < npm_ci
+
+
 def _iter_if_expressions(job: object):
     """Yield every ``if:`` string in a job, including inside its steps."""
     if not isinstance(job, dict):

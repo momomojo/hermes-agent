@@ -2230,6 +2230,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    from tools.kanban_worker_boundary import write_path_violation
+
+    kanban_boundary_err = write_path_violation(_resolve_path_for_task(path, task_id))
+    if kanban_boundary_err:
+        return tool_error(kanban_boundary_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2374,6 +2379,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        from tools.kanban_worker_boundary import write_path_violation
+
+        kanban_boundary_err = write_path_violation(
+            _resolve_path_for_task(_p, task_id)
+        )
+        if kanban_boundary_err:
+            return tool_error(kanban_boundary_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

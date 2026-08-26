@@ -339,3 +339,55 @@ def test_broker_recovers_exact_commit_after_board_transaction_crash(
         if event.kind == "trusted_local_commit"
     ]
     assert len(publish_events) == 1
+
+
+def test_broker_recovers_exact_commit_after_run_was_reclaimed(
+    broker_task, monkeypatch
+):
+    """A successor claim must not strand a commit made for the crashed run."""
+    conn, tid, repo, workspace, branch, base_sha, first = broker_task
+    (workspace / "feature.txt").write_text("worker output\n", encoding="utf-8")
+    _stage(conn, tid, first.current_run_id)
+
+    from hermes_cli import kanban_git_broker as broker
+
+    real_write_txn = kb.write_txn
+
+    @contextmanager
+    def crash_before_board_commit(_conn):
+        raise RuntimeError("simulated host crash after git commit")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(kb, "write_txn", crash_before_board_commit)
+    with pytest.raises(RuntimeError, match="simulated host crash"):
+        broker.finalize_current_worker_git_handoff()
+    committed_sha = _git("rev-parse", branch, cwd=repo)
+    assert committed_sha != base_sha
+
+    monkeypatch.setattr(kb, "write_txn", real_write_txn)
+    assert kb.reclaim_task(conn, tid, reason="worker crashed", signal_fn=lambda *_: None)
+    second = kb.claim_task(conn, tid)
+    assert second is not None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(second.claim_lock))
+    _stage(conn, tid, second.current_run_id)
+
+    result = broker.finalize_current_worker_git_handoff()
+
+    assert result == {
+        "outcome": "awaiting_trusted_publisher",
+        "task_id": tid,
+        "head_sha": committed_sha,
+        "branch": branch,
+    }
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "blocked"
+    publish = [
+        event.payload
+        for event in kb.list_events(conn, tid)
+        if event.kind == "trusted_local_commit"
+    ]
+    assert len(publish) == 1
+    assert publish[0]["recovered_from_run_id"] == first.current_run_id
+    assert publish[0]["base_sha"] == base_sha
+    assert publish[0]["head_sha"] == committed_sha

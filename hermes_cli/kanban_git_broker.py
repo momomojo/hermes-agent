@@ -257,6 +257,72 @@ def _recover_exact_broker_commit(
     return base_sha, head_sha
 
 
+def _recover_reclaimed_broker_commit(
+    conn,
+    *,
+    git_dir: Path,
+    workspace: Path,
+    task_id: str,
+    current_run_id: int,
+) -> tuple[str, str, int] | None:
+    """Recover a journaled broker commit whose original run was reclaimed.
+
+    The staged completion event is the durable pre-commit journal. The commit
+    must be the exact broker-authored single child of its recorded base, its
+    trailer run must be an earlier reclaimed run for this task, and that run
+    must have a matching request with no publisher event. A successor claim can
+    therefore finish the SQLite handoff without trusting successor prose or
+    accepting an arbitrary pre-existing commit.
+    """
+    head_sha = _git(
+        ["rev-parse", "HEAD"], git_dir=git_dir, work_tree=workspace
+    ).stdout.strip()
+    message = _git(
+        ["show", "-s", "--format=%ae%n%B", head_sha],
+        git_dir=git_dir,
+        work_tree=workspace,
+    ).stdout.splitlines()
+    if not message or message[0].strip() != _BROKER_AUTHOR_EMAIL:
+        return None
+    trailers: dict[str, str] = {}
+    for line in message[1:]:
+        key, separator, value = line.partition(":")
+        if separator and key in {
+            "Hermes-Kanban-Task",
+            "Hermes-Kanban-Run",
+            "Hermes-Kanban-Base",
+        }:
+            trailers[key] = value.strip()
+    if trailers.get("Hermes-Kanban-Task") != task_id:
+        return None
+    try:
+        prior_run_id = int(trailers.get("Hermes-Kanban-Run", ""))
+    except ValueError:
+        return None
+    if prior_run_id >= current_run_id:
+        return None
+    base_sha = trailers.get("Hermes-Kanban-Base", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        return None
+    actual_parent = _git(
+        ["rev-parse", f"{head_sha}^"], git_dir=git_dir, work_tree=workspace
+    ).stdout.strip()
+    if actual_parent != base_sha:
+        return None
+    run = conn.execute(
+        "SELECT status, outcome FROM task_runs WHERE id = ? AND task_id = ?",
+        (prior_run_id, task_id),
+    ).fetchone()
+    if run is None or run["status"] != "reclaimed" or run["outcome"] != "reclaimed":
+        return None
+    if _pending_request(conn, task_id, prior_run_id) is None:
+        return None
+    for event in kb.list_events(conn, task_id):
+        if event.kind == "trusted_local_commit" and event.run_id == prior_run_id:
+            return None
+    return base_sha, head_sha, prior_run_id
+
+
 def finalize_current_worker_git_handoff() -> dict[str, Any]:
     """Commit one staged worktree handoff and park it for trusted publishing.
 
@@ -374,6 +440,7 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
                 git_dir=git_dir,
                 work_tree=workspace,
             ).stdout
+            recovered_from_run_id = None
             if status.strip():
                 base_sha = _git(
                     ["rev-parse", "HEAD"], git_dir=git_dir, work_tree=workspace
@@ -411,8 +478,18 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
                     run_id=run_id,
                 )
                 if recovered is None:
-                    raise BrokerRejected("worker produced no file changes to commit")
-                base_sha, head_sha = recovered
+                    reclaimed = _recover_reclaimed_broker_commit(
+                        conn,
+                        git_dir=git_dir,
+                        workspace=workspace,
+                        task_id=task_id,
+                        current_run_id=run_id,
+                    )
+                    if reclaimed is None:
+                        raise BrokerRejected("worker produced no file changes to commit")
+                    base_sha, head_sha, recovered_from_run_id = reclaimed
+                else:
+                    base_sha, head_sha = recovered
             changed_raw = _git(
                 ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", head_sha],
                 git_dir=git_dir,
@@ -420,7 +497,7 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
             ).stdout
             changed_paths = sorted(path for path in changed_raw.split("\0") if path)
 
-            contract = {
+            contract: dict[str, Any] = {
                 "contract": PUBLISH_CONTRACT,
                 "task_id": task_id,
                 "project_id": task.project_id,
@@ -432,6 +509,8 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
                 "changed_paths": changed_paths,
                 "publisher_state": "awaiting",
             }
+            if recovered_from_run_id is not None:
+                contract["recovered_from_run_id"] = recovered_from_run_id
             blocked = kb.park_trusted_git_commit(
                 conn,
                 task_id,

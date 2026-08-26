@@ -123,6 +123,30 @@ _WRAPPER_OPTIONS_WITH_ARG = {
 }
 _SIMPLE_WRAPPERS = frozenset({"builtin", "exec", "nohup", "setsid", "time"})
 _MAX_RECURSION = 4
+_KANBAN_READ_ONLY_GIT = frozenset({
+    "blame",
+    "cat-file",
+    "describe",
+    "diff",
+    "grep",
+    "help",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "range-diff",
+    "rev-list",
+    "rev-parse",
+    "shortlog",
+    "show",
+    "show-ref",
+    "status",
+})
+_GIT_METADATA_REFERENCE_RE = re.compile(
+    r"(?:^|[\\/\s>$'\"])(?:\.git)(?:[\\/\s<|&;'\"]|$)|"
+    r"HERMES_KANBAN_(?:GIT_COMMON_DIR|TRUSTED_REPO_ROOT)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -693,6 +717,113 @@ def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str |
                     return operation
 
     return None
+
+
+def _worker_read_only_git(subcommand: str, args: list[str]) -> bool:
+    """Whether one Git invocation is metadata- and network-read-only."""
+    if subcommand in _KANBAN_READ_ONLY_GIT:
+        return True
+    if subcommand == "branch":
+        # `git branch` without an explicit listing/query flag creates/deletes
+        # refs. Keep the small read-only forms workers use for orientation.
+        return any(
+            arg in {
+                "--list", "-l", "--show-current", "--contains",
+                "--merged", "--no-merged",
+            }
+            or arg.startswith(
+                ("--list=", "--contains=", "--merged=", "--no-merged=")
+            )
+            for arg in args
+        )
+    if subcommand == "stash":
+        action = next((arg for arg in args if not arg.startswith("-")), "list")
+        return action in {"list", "show"}
+    if subcommand == "worktree":
+        action = next((arg for arg in args if not arg.startswith("-")), "list")
+        return action == "list"
+    return False
+
+
+def _find_kanban_git_violation(
+    command: str,
+    cwd: Path,
+    depth: int = 0,
+) -> str | None:
+    """Find Git/GitHub mutation in a model-facing dispatcher command.
+
+    Unlike the Windows self-checkout guard, this policy is intentionally
+    repository-agnostic: a worker may inspect its task checkout, but every Git
+    metadata mutation and every publisher/network command belongs to the
+    trusted host broker. This also prevents `-C`/`--git-dir` confused-deputy
+    targeting of a sibling or protected checkout.
+    """
+    if depth > _MAX_RECURSION:
+        return "nested shell command"
+    masked_command, heredoc_scripts = _mask_heredocs(command)
+    for script in heredoc_scripts:
+        operation = _find_kanban_git_violation(script, cwd, depth + 1)
+        if operation:
+            return operation
+
+    starts = sorted(set(_iter_shell_command_starts(masked_command)))
+    scopes = _scope_keys(masked_command, starts)
+    cwd_by_scope: dict[tuple[int, ...], Path] = {(): cwd}
+    pending_cd: dict[tuple[int, ...], Path] = {}
+    for start in starts:
+        scope = scopes[start]
+        if scope not in cwd_by_scope:
+            cwd_by_scope[scope] = cwd_by_scope.get(scope[:-1], cwd)
+        operator = _operator_before(masked_command, start)
+        pending = pending_cd.pop(scope, None)
+        if pending is not None and operator in {"&&", ";", "\n"}:
+            cwd_by_scope[scope] = pending
+        words = _shell_words_at(masked_command, start)
+        env, executable, args = _command_parts(words)
+        if executable is None:
+            continue
+        current_dir = cwd_by_scope[scope]
+        cd_target = _cd_target(executable, args, current_dir)
+        if cd_target is not None:
+            pending_cd[scope] = cd_target
+            continue
+        name = _executable_name(executable)
+        if name == "git":
+            _target, subcommand, sub_args, _aliases = _git_target_and_subcommand(
+                args, current_dir, env
+            )
+            if subcommand is None or not _worker_read_only_git(subcommand, sub_args):
+                return f"git {subcommand or '<unknown>'}"
+        elif name in {"gh", "hub"}:
+            return name
+        elif name in _SHELL_EXECUTABLES:
+            script = _shell_script_arg(args)
+            if script:
+                operation = _find_kanban_git_violation(script, current_dir, depth + 1)
+                if operation:
+                    return operation
+    if _GIT_METADATA_REFERENCE_RE.search(masked_command):
+        return "direct Git metadata access"
+    return None
+
+
+def detect_kanban_worker_git_violation(
+    command: str,
+    cwd: str | None,
+) -> tuple[bool, str | None]:
+    """Return whether a dispatcher worker command crosses the Git boundary."""
+    if not command:
+        return False, None
+    base = _resolve(cwd, Path("/")) if cwd else Path("/")
+    operation = _find_kanban_git_violation(command, base)
+    if operation is None:
+        return False, None
+    return True, (
+        f"Blocked: `{operation}` is unavailable to model-facing Kanban workers. "
+        "Edit and test task files only; the trusted Kanban Git broker performs "
+        "the exact local commit, and the separate trusted publisher handles "
+        "network/GitHub operations."
+    )
 
 
 def guard_active() -> bool:

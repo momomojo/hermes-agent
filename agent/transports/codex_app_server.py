@@ -17,7 +17,6 @@ runtime is not selected.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import subprocess
 import threading
@@ -30,53 +29,6 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
-
-
-def _kanban_writable_roots(env: dict[str, str]) -> list[str]:
-    """Return the narrow host paths a dispatcher-owned worker must mutate.
-
-    The task workspace itself is already Codex's cwd and therefore writable in
-    ``workspace-write`` mode. Board lifecycle state lives outside that cwd, so
-    the dispatcher pins the board paths. Git metadata is deliberately excluded:
-    a model must never receive shared refs, hooks, config, sibling worktree
-    metadata, or protected-branch write authority.
-    """
-    kanban_db = (env.get("HERMES_KANBAN_DB") or "").strip()
-    legacy_root = (env.get("HERMES_KANBAN_ROOT") or "").strip()
-    if kanban_db:
-        board_root = os.path.dirname(kanban_db)
-    elif legacy_root:
-        board_root = legacy_root
-    else:
-        board_root = os.path.join(
-            env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-            "kanban",
-        )
-
-    candidates = (
-        board_root,
-        env.get("HERMES_KANBAN_WORKSPACES_ROOT", ""),
-        legacy_root,
-    )
-    roots: list[str] = []
-    seen: set[str] = set()
-    for raw in candidates:
-        raw = str(raw or "").strip()
-        if not raw:
-            continue
-        expanded = os.path.expanduser(raw)
-        if not os.path.isabs(expanded):
-            continue
-        normalized = os.path.realpath(os.path.normpath(expanded))
-        # ``dirname('/') == '/'`` (and likewise for a Windows drive root).
-        if os.path.dirname(normalized) == normalized:
-            continue
-        key = os.path.normcase(normalized)
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(normalized)
-    return roots
 
 
 @dataclass
@@ -163,17 +115,16 @@ class CodexAppServerClient:
         # Workers edit and test inside the task cwd, but never mutate Git
         # metadata. A trusted post-turn broker commits the exact validated
         # worktree after the model stages a machine-readable completion handoff.
-        # Board roots remain available for lifecycle MCP calls; network stays
+        # Board lifecycle calls execute in trusted Hermes host tools; the model
+        # receives no board/database/attachments writable root. Network stays
         # disabled. GitHub publishing is a separate host-side control plane.
         if dispatcher_worker:
-            writable_roots = _kanban_writable_roots(spawn_env)
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    "sandbox_workspace_write.writable_roots="
-                    + json.dumps(writable_roots),
+                    "sandbox_workspace_write.writable_roots=[]",
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]

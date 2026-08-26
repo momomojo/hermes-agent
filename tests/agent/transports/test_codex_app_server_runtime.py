@@ -264,12 +264,8 @@ class TestSpawnEnvIsolation:
         cmd = captured["cmd"]
         assert cmd[:2] == ["codex", "app-server"]
         assert 'sandbox_mode="workspace-write"' in cmd
-        assert (
-            "sandbox_workspace_write.writable_roots="
-            '["/users/alice/.hermes/kanban/boards/smoke", '
-            '"/users/alice/.hermes/kanban/boards/smoke/workspaces"]'
-            in cmd
-        )
+        assert "sandbox_workspace_write.writable_roots=[]" in cmd
+        assert all("kanban/boards/smoke" not in part for part in cmd)
         assert all("radulator/.git" not in part for part in cmd)
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
@@ -325,7 +321,7 @@ class TestSpawnEnvIsolation:
         assert "HERMES_KANBAN_TRUSTED_REPO_ROOT" not in captured["env"]
         assert "HERMES_KANBAN_PROJECT_ID" not in captured["env"]
 
-    def test_kanban_writable_roots_are_deduplicated_and_never_include_fs_root(
+    def test_kanban_worker_never_grants_board_or_legacy_roots(
         self, monkeypatch
     ):
         """A malformed path pin must not silently grant filesystem-wide writes."""
@@ -370,7 +366,8 @@ class TestSpawnEnvIsolation:
             part for part in captured["cmd"]
             if part.startswith("sandbox_workspace_write.writable_roots=")
         )
-        assert writable == 'sandbox_workspace_write.writable_roots=["/board"]'
+        assert writable == "sandbox_workspace_write.writable_roots=[]"
+        assert "/board" not in writable
         assert '"/"' not in writable
         assert "relative" not in writable
 
