@@ -48,7 +48,11 @@ jobs:
   test:
     name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
     needs: generate
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 AppArmor blocks Bubblewrap's unprivileged user namespace.
+    # Keep the real worker-boundary canaries mandatory on the supported 22.04
+    # image while unrelated slices continue to track ubuntu-latest.  We do not
+    # disable AppArmor, invoke bwrap through sudo, or weaken the sandbox.
+    runs-on: ${{ contains(matrix.slice.files, 'tests/tools/test_kanban_worker_boundary.py') && 'ubuntu-22.04' || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

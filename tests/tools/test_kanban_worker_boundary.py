@@ -217,7 +217,7 @@ def _run_terminal(
         stack.enter_context(
             patch(
                 "tools.kanban_worker_boundary.local_sandbox_argv",
-                side_effect=lambda argv, _workspace: list(argv),
+                side_effect=lambda argv, _workspace, **_trusted_options: list(argv),
             )
         )
         stack.enter_context(
