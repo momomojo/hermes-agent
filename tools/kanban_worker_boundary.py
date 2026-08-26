@@ -593,8 +593,11 @@ def local_sandbox_argv(
         # Do not bind host /. Seccomp denies socket syscalls, while pathname
         # AF_UNIX endpoints are selected through the filesystem and therefore
         # still require a mount boundary. Bind only immutable executable/runtime
-        # trees; /run, /tmp, /var/tmp, and the user's home are private mounts.
-        private_roots = (Path("/run"), Path("/tmp"), Path("/var/tmp"), Path.home())
+        # trees; /run, /tmp, and /var/tmp are private mounts. Host / is absent,
+        # so the user's home is absent by default too. Do not mount a broad
+        # empty home over it: uv-managed ``sys.prefix`` / ``sys.base_prefix``
+        # roots may live below that path and are re-mounted exactly read-only.
+        private_roots = (Path("/run"), Path("/tmp"), Path("/var/tmp"))
         seen_private: set[Path] = set()
         for private_root in private_roots:
             if private_root == Path("/") or private_root in seen_private:

@@ -604,7 +604,20 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
     assert "--tmpfs\0/run" in joined
     assert "--tmpfs\0/tmp" in joined
     assert "--tmpfs\0/var/tmp" in joined
-    assert f"--tmpfs\0{Path.home().resolve()}" in joined
+    # Host / is never bound, so mounting a broad empty $HOME is unnecessary
+    # and hides uv-managed interpreter roots that must be re-mounted exactly.
+    # Leave the host home absent and expose only the explicit read-only runtime
+    # subtrees below it; HOME itself still points at task-private temp.
+    tmpfs_targets = {
+        Path(argv[index + 1]).resolve(strict=False)
+        for index, value in enumerate(argv[:-1])
+        if value == "--tmpfs"
+    }
+    assert Path.home().resolve() not in tmpfs_targets
+    assert (
+        f"--ro-bind\0{Path.home().resolve()}\0{Path.home().resolve()}"
+        not in joined
+    )
     assert f"--bind\0{worker.resolve()}\0{worker.resolve()}" in joined
     assert (
         f"--ro-bind\0{(worker / '.git').resolve()}\0{(worker / '.git').resolve()}"
