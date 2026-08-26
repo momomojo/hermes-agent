@@ -78,6 +78,17 @@ def _run_terminal(
             )
         )
         stack.enter_context(patch("tools.terminal_tool._start_cleanup_thread"))
+        # Unit tests below use a mock LocalEnvironment to assert that the
+        # boundary ContextVar surrounds env.execute(). Do not require the CI
+        # host itself to have bwrap for that mock-only layer; the dedicated
+        # Linux argv test verifies the exact bubblewrap policy, and the macOS
+        # integration tests execute the real Seatbelt boundary end to end.
+        stack.enter_context(
+            patch(
+                "tools.kanban_worker_boundary.local_sandbox_argv",
+                side_effect=lambda argv, _workspace: list(argv),
+            )
+        )
         stack.enter_context(
             patch("tools.terminal_tool._active_environments", {"default": mock_env})
         )
