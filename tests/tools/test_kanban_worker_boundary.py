@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import shlex
 import shutil
@@ -32,20 +33,45 @@ def _env_config(cwd: Path, *, env_type: str = "local") -> dict:
 
 @pytest.fixture
 def worker(tmp_path, monkeypatch):
-    workspace = tmp_path / "repo" / ".worktrees" / "t_safe"
+    from hermes_cli import kanban_db as kb
+
+    db_path = tmp_path / "board" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title="safe worker",
+        initial_status="blocked",
+        workspace_kind="worktree",
+        workspace_path=str(tmp_path / "pending"),
+        branch_name="wt/pending",
+    )
+    workspace = tmp_path / "repo" / ".worktrees" / task_id
     workspace.mkdir(parents=True)
     (workspace / ".git").write_text(
-        "gitdir: ../../.git/worktrees/t_safe\n", encoding="utf-8"
+        f"gitdir: ../../.git/worktrees/{task_id}\n", encoding="utf-8"
     )
+    branch = f"radulator/{task_id}-change"
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, branch_name = ?, status = 'ready' "
+            "WHERE id = ?",
+            (str(workspace), branch, task_id),
+        )
+    claimed = kb.claim_task(conn, task_id, claimer="host:worker:claim")
+    assert claimed is not None
+    conn.close()
+
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safe")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "17")
-    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:worker:claim")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
-    monkeypatch.setenv("HERMES_KANBAN_BRANCH", "radulator/t_safe-change")
+    monkeypatch.setenv("HERMES_KANBAN_BRANCH", branch)
+    monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "")
     monkeypatch.setenv("TERMINAL_CWD", str(workspace))
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board" / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", str(tmp_path / "repo"))
     return workspace
 
@@ -151,6 +177,36 @@ def test_stale_or_worker_supplied_repo_seal_fails_closed(worker, monkeypatch, tm
     env.execute.assert_not_called()
 
 
+def test_reclaimed_live_claim_revokes_stale_worker_seal(worker):
+    from hermes_cli import kanban_db as kb
+
+    task_id = os.environ["HERMES_KANBAN_TASK"]
+    old_run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+    db_path = Path(os.environ["HERMES_KANBAN_DB"])
+    conn = kb.connect(db_path=db_path)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+            "ended_at = 1 WHERE id = ?",
+            (old_run_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, current_run_id = NULL WHERE id = ?",
+            (task_id,),
+        )
+    successor = kb.claim_task(conn, task_id, claimer="host:successor:claim")
+    assert successor is not None
+    assert successor.current_run_id != old_run_id
+    conn.close()
+
+    result, env, _boundaries = _run_terminal("python -m pytest -q", worker)
+
+    assert result["status"] == "blocked"
+    assert "stale/confused-deputy" in result["error"]
+    env.execute.assert_not_called()
+
+
 def test_referenced_shell_script_cannot_hide_git_mutation(worker):
     script = worker / "mutate.sh"
     script.write_text("#!/bin/sh\ngit commit -m hidden\n", encoding="utf-8")
@@ -164,9 +220,10 @@ def test_model_file_tools_cannot_write_board_or_sibling_paths(worker, tmp_path):
     from tools.file_tools import write_file_tool
 
     target = tmp_path / "board" / "kanban.db"
+    before = target.read_bytes()
     result = json.loads(write_file_tool(str(target), "attacker"))
     assert "outside the assigned Kanban workspace" in result["error"]
-    assert not target.exists()
+    assert target.read_bytes() == before
 
 
 def test_model_file_tools_can_write_normal_task_file(worker):
@@ -325,6 +382,8 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
 
     hermes_home = tmp_path / "profiles" / "radulator"
     hermes_home.mkdir(parents=True)
+    secret = hermes_home / ".env"
+    secret.write_text("GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     with (
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
@@ -343,7 +402,34 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
         in joined
     )
     assert f"--ro-bind\0" in joined
-    assert f"\0{hermes_home.resolve()}" in joined
+    assert f"\0{secret.resolve()}" in joined
+    masked_targets = {
+        Path(argv[index + 2]).resolve(strict=False)
+        for index, value in enumerate(argv[:-2])
+        if value == "--ro-bind"
+    }
+    assert hermes_home.resolve() not in masked_targets
+
+
+def test_managed_checkout_under_hermes_root_is_not_masked(
+    tmp_path,
+    monkeypatch,
+):
+    from tools.kanban_worker_boundary import _credential_read_paths
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hermes_root = tmp_path / ".hermes"
+    managed_workspace = hermes_root / "hermes-agent" / ".worktrees" / "t_safe"
+    managed_workspace.mkdir(parents=True)
+    secret = hermes_root / ".env"
+    secret.write_text("GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+
+    masked = _credential_read_paths(managed_workspace)
+
+    assert secret.resolve() in masked
+    assert hermes_root.resolve() not in masked
+    assert all(path != managed_workspace.resolve() for path in masked)
 
 
 @pytest.mark.skipif(
@@ -474,6 +560,55 @@ def test_macos_worker_terminal_cannot_read_profile_credentials(
         environment.cleanup()
 
     assert completed["returncode"] != 0
+    assert "must-not-enter-model" not in completed["output"]
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or shutil.which("sandbox-exec") is None,
+    reason="macOS Seatbelt integration",
+)
+def test_macos_managed_checkout_under_hermes_root_remains_usable(
+    tmp_path,
+    monkeypatch,
+):
+    from tools.environments.local import LocalEnvironment, hermes_subprocess_env
+    from tools.kanban_worker_boundary import local_worker_sandbox
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    hermes_root = tmp_path / ".hermes"
+    worker = hermes_root / "hermes-agent" / ".worktrees" / "t_safe"
+    worker.mkdir(parents=True)
+    (worker / ".git").write_text(
+        "gitdir: ../../.git/worktrees/t_safe\n", encoding="utf-8"
+    )
+    secret = hermes_root / ".env"
+    secret.write_text("GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8")
+    source = worker / "source.txt"
+    source.write_text("visible\n", encoding="utf-8")
+    output = worker / "result.txt"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+    code = (
+        "from pathlib import Path; "
+        f"data=Path({str(source)!r}).read_text(); "
+        f"Path({str(output)!r}).write_text(data); "
+        f"Path({str(secret)!r}).read_text()"
+    )
+    environment = LocalEnvironment(
+        cwd=str(worker),
+        timeout=30,
+        env=hermes_subprocess_env(inherit_credentials=True),
+    )
+    try:
+        with local_worker_sandbox(worker):
+            completed = environment.execute(
+                f"python3 -c {shlex.quote(code)}",
+                cwd=str(worker),
+            )
+    finally:
+        environment.cleanup()
+
+    assert completed["returncode"] != 0
+    assert output.read_text(encoding="utf-8") == "visible\n"
     assert "must-not-enter-model" not in completed["output"]
 
 

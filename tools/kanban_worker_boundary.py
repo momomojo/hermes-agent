@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -36,6 +37,73 @@ def _boundary_expected() -> bool:
     )
 
 
+def dispatcher_worker_boundary_expected() -> bool:
+    """Return whether this execution must stay inside the worker boundary."""
+    return _boundary_expected()
+
+
+def _live_claim_matches(
+    *,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    workspace: Path,
+    branch: str,
+) -> bool:
+    """Read back the durable claim so a reclaimed process loses authority."""
+    raw_db = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    board = str(os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+    if not raw_db or not board or "HERMES_KANBAN_PROJECT_ID" not in os.environ:
+        return False
+    db_path = Path(raw_db).expanduser()
+    if not db_path.is_absolute():
+        return False
+    try:
+        db_path = db_path.resolve(strict=True)
+        conn = sqlite3.connect(
+            f"{db_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=1.0,
+        )
+        try:
+            row = conn.execute(
+                "SELECT status, current_run_id, claim_lock, workspace_kind, "
+                "workspace_path, branch_name, project_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, RuntimeError, sqlite3.Error):
+        return False
+    if row is None:
+        return False
+    (
+        status,
+        current_run_id,
+        durable_claim,
+        workspace_kind,
+        durable_workspace,
+        durable_branch,
+        durable_project,
+    ) = row
+    try:
+        stored_workspace = Path(str(durable_workspace)).expanduser().resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    expected_project = str(os.environ.get("HERMES_KANBAN_PROJECT_ID") or "")
+    return (
+        status == "running"
+        and current_run_id == run_id
+        and durable_claim == claim_lock
+        and workspace_kind == "worktree"
+        and stored_workspace == workspace
+        and durable_branch == branch
+        and str(durable_project or "") == expected_project
+    )
+
+
 def assigned_workspace() -> Path | None:
     """Return the exact dispatcher workspace only for the owning execution."""
     if not _boundary_expected():
@@ -50,7 +118,7 @@ def assigned_workspace() -> Path | None:
     if not all((task_id, run_id, claim_lock, branch, sealed_repo)):
         return None
     try:
-        int(run_id)
+        exact_run_id = int(run_id)
     except ValueError:
         return None
     raw = str(os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
@@ -69,6 +137,14 @@ def assigned_workspace() -> Path | None:
         return None
     leaf = branch.rsplit("/", 1)[-1]
     if not (branch == f"wt/{task_id}" or leaf == task_id or leaf.startswith(f"{task_id}-")):
+        return None
+    if not _live_claim_matches(
+        task_id=task_id,
+        run_id=exact_run_id,
+        claim_lock=claim_lock,
+        workspace=workspace,
+        branch=branch,
+    ):
         return None
     return workspace
 
@@ -118,16 +194,47 @@ def _worker_temp_root(workspace: Path) -> Path:
     return root.resolve(strict=True)
 
 
-def _credential_read_paths() -> tuple[Path, ...]:
+def _credential_read_paths(workspace: Path | None = None) -> tuple[Path, ...]:
     """Return host credential locations that model subprocesses must not read."""
     candidates: list[Path] = []
-    raw_hermes_home = str(os.environ.get("HERMES_HOME") or "").strip()
-    if raw_hermes_home:
-        candidates.append(Path(raw_hermes_home).expanduser())
+    try:
+        from agent.file_safety import _hermes_home_path, _hermes_root_path
+
+        active_home = _hermes_home_path()
+        hermes_root = _hermes_root_path()
+    except Exception:
+        active_home = Path(
+            str(os.environ.get("HERMES_HOME") or "~/.hermes")
+        ).expanduser()
+        hermes_root = Path.home() / ".hermes"
+
+    hermes_bases = [active_home, hermes_root]
+    profiles_dir = hermes_root / "profiles"
+    try:
+        hermes_bases.extend(path for path in profiles_dir.iterdir() if path.is_dir())
+    except OSError:
+        pass
+    credential_files = (
+        "auth.json",
+        "auth.lock",
+        ".anthropic_oauth.json",
+        ".env",
+        "webhook_subscriptions.json",
+        "auth/google_oauth.json",
+        "cache/bws_cache.json",
+        "cache/bws_cache.enc.json",
+    )
+    for base in hermes_bases:
+        candidates.extend(base / relative for relative in credential_files)
+        candidates.extend((base / "mcp-tokens", base / "skills" / ".hub"))
+    candidates.append(hermes_root / "shared" / "nous_auth.json")
+    shared_auth_dir = str(os.environ.get("HERMES_SHARED_AUTH_DIR") or "").strip()
+    if shared_auth_dir:
+        candidates.append(Path(shared_auth_dir).expanduser() / "nous_auth.json")
+
     home = Path.home()
     candidates.extend(
         (
-            home / ".hermes",
             home / ".ssh",
             home / ".gnupg",
             home / ".aws",
@@ -141,6 +248,7 @@ def _credential_read_paths() -> tuple[Path, ...]:
     )
     unique: list[Path] = []
     seen: set[Path] = set()
+    exact_workspace = workspace.resolve(strict=True) if workspace is not None else None
     for candidate in candidates:
         try:
             resolved = candidate.resolve(strict=False)
@@ -148,6 +256,15 @@ def _credential_read_paths() -> tuple[Path, ...]:
             continue
         if not resolved.is_absolute() or resolved in seen:
             continue
+        if exact_workspace is not None:
+            try:
+                exact_workspace.relative_to(resolved)
+            except ValueError:
+                pass
+            else:
+                raise WorkerSandboxUnavailable(
+                    "assigned workspace overlaps a host credential location"
+                )
         seen.add(resolved)
         unique.append(resolved)
     return tuple(unique)
@@ -173,7 +290,7 @@ def _seatbelt_profile(workspace: Path, temp_root: Path) -> str:
         f"(subpath {quoted_gitfile}))",
         "(deny network*)",
     ]
-    for sensitive in _credential_read_paths():
+    for sensitive in _credential_read_paths(workspace):
         quoted = json.dumps(str(sensitive))
         rules.append(
             f"(deny file-read* (literal {quoted}) (subpath {quoted}))"
@@ -181,14 +298,14 @@ def _seatbelt_profile(workspace: Path, temp_root: Path) -> str:
     return " ".join(rules)
 
 
-def _bubblewrap_read_masks(temp_root: Path) -> list[str]:
+def _bubblewrap_read_masks(temp_root: Path, workspace: Path) -> list[str]:
     """Mask existing host credential paths inside a read-only root bind."""
     empty_dir = temp_root / ".masked-credential-dir"
     empty_file = temp_root / ".masked-credential-file"
     empty_dir.mkdir(mode=0o700, exist_ok=True)
     empty_file.touch(mode=0o600, exist_ok=True)
     args: list[str] = []
-    for sensitive in _credential_read_paths():
+    for sensitive in _credential_read_paths(workspace):
         try:
             if sensitive.is_dir():
                 source = empty_dir
@@ -246,7 +363,7 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             "--ro-bind",
             str(exact_workspace / ".git"),
             str(exact_workspace / ".git"),
-            *_bubblewrap_read_masks(temp_root),
+            *_bubblewrap_read_masks(temp_root, exact_workspace),
             "--bind",
             str(temp_root),
             str(temp_root),

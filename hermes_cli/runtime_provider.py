@@ -456,6 +456,14 @@ def _maybe_apply_codex_app_server_runtime(
     rerouted through codex.
 
     Returns the (possibly-rewritten) api_mode."""
+    # Codex app-server owns its own model-driven shell and its native
+    # workspace-write sandbox still permits broad host reads. Dispatcher-owned
+    # Kanban workers must therefore stay on Hermes' normal runtime, where every
+    # file and terminal action passes through the exact task/claim sandbox.
+    from tools.kanban_worker_boundary import dispatcher_worker_boundary_expected
+
+    if dispatcher_worker_boundary_expected():
+        return api_mode
     if not model_cfg:
         return api_mode
     if provider not in {"openai", "openai-codex"}:

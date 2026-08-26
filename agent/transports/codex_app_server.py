@@ -74,6 +74,16 @@ class CodexAppServerClient:
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
     ) -> None:
+        from tools.kanban_worker_boundary import (
+            dispatcher_worker_boundary_expected,
+        )
+
+        if dispatcher_worker_boundary_expected():
+            raise RuntimeError(
+                "codex app-server is disabled for dispatcher-owned Kanban "
+                "workers; use the Hermes runtime whose tools enforce the "
+                "trusted worker sandbox"
+            )
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
