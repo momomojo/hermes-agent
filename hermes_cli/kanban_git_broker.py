@@ -41,6 +41,18 @@ class BrokerRejected(RuntimeError):
     """Raised when durable worker identity does not match the trusted checkout."""
 
 
+def _trusted_publisher_enabled() -> bool:
+    """Return the explicit deployment-specific publisher opt-in."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    kanban = config.get("kanban") if isinstance(config, dict) else None
+    return (
+        isinstance(kanban, dict)
+        and kanban.get("trusted_publisher_enabled") is True
+    )
+
+
 def _base_git_env() -> dict[str, str]:
     # Git is strictly local here. Build a small allowlist instead of copying
     # the long-lived Hermes process env: stale worker GIT_* overrides,
@@ -324,7 +336,7 @@ def _recover_reclaimed_broker_commit(
 
 
 def finalize_current_worker_git_handoff() -> dict[str, Any]:
-    """Commit one staged worktree handoff and park it for trusted publishing.
+    """Commit one staged worktree handoff and finish or park it safely.
 
     Safe to call more than once. When no exact staged request exists it is a
     no-op. Rejections from an actual dispatcher-owned worker block the task with
@@ -511,6 +523,34 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
             }
             if recovered_from_run_id is not None:
                 contract["recovered_from_run_id"] = recovered_from_run_id
+            if not _trusted_publisher_enabled():
+                completion_metadata = dict(request.get("metadata") or {})
+                completion_metadata["trusted_local_commit"] = {
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "branch": env_branch,
+                    "changed_paths": changed_paths,
+                }
+                completed = kb.complete_task(
+                    conn,
+                    task_id,
+                    result=request.get("result"),
+                    summary=request.get("summary"),
+                    metadata=completion_metadata,
+                    created_cards=request.get("created_cards") or None,
+                    expected_run_id=run_id,
+                    expected_claim_lock=claim_lock,
+                )
+                if not completed:
+                    raise BrokerRejected(
+                        "task changed state before trusted local completion"
+                    )
+                return {
+                    "outcome": "committed_locally",
+                    "task_id": task_id,
+                    "head_sha": head_sha,
+                    "branch": env_branch,
+                }
             blocked = kb.park_trusted_git_commit(
                 conn,
                 task_id,

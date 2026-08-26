@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -42,22 +43,27 @@ def dispatcher_worker_boundary_expected() -> bool:
     return _boundary_expected()
 
 
-def _live_claim_matches(
+@dataclass(frozen=True)
+class _LiveAssignment:
+    workspace: Path
+    workspace_kind: str
+
+
+def _live_assignment(
     *,
     task_id: str,
     run_id: int,
     claim_lock: str,
-    workspace: Path,
-    branch: str,
-) -> bool:
+    env_workspace: Path,
+) -> _LiveAssignment | None:
     """Read back the durable claim so a reclaimed process loses authority."""
     raw_db = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
     board = str(os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
-    if not raw_db or not board or "HERMES_KANBAN_PROJECT_ID" not in os.environ:
-        return False
+    if not raw_db or not board:
+        return None
     db_path = Path(raw_db).expanduser()
     if not db_path.is_absolute():
-        return False
+        return None
     try:
         db_path = db_path.resolve(strict=True)
         conn = sqlite3.connect(
@@ -74,9 +80,9 @@ def _live_claim_matches(
         finally:
             conn.close()
     except (OSError, RuntimeError, sqlite3.Error):
-        return False
+        return None
     if row is None:
-        return False
+        return None
     (
         status,
         current_run_id,
@@ -91,31 +97,74 @@ def _live_claim_matches(
             strict=True
         )
     except (OSError, RuntimeError, TypeError, ValueError):
-        return False
-    expected_project = str(os.environ.get("HERMES_KANBAN_PROJECT_ID") or "")
-    return (
+        return None
+    if not (
         status == "running"
         and current_run_id == run_id
         and durable_claim == claim_lock
-        and workspace_kind == "worktree"
-        and stored_workspace == workspace
-        and durable_branch == branch
-        and str(durable_project or "") == expected_project
-    )
+        and stored_workspace == env_workspace
+    ):
+        return None
+
+    branch = str(os.environ.get("HERMES_KANBAN_BRANCH") or "").strip()
+    sealed_repo = str(
+        os.environ.get("HERMES_KANBAN_TRUSTED_REPO_ROOT") or ""
+    ).strip()
+    if workspace_kind == "worktree":
+        if (
+            not branch
+            or not sealed_repo
+            or "HERMES_KANBAN_PROJECT_ID" not in os.environ
+        ):
+            return None
+        try:
+            repo = Path(sealed_repo).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        expected = (repo / ".worktrees" / task_id).resolve(strict=False)
+        leaf = branch.rsplit("/", 1)[-1]
+        if not (
+            stored_workspace == expected
+            and durable_branch == branch
+            and str(durable_project or "")
+            == str(os.environ.get("HERMES_KANBAN_PROJECT_ID") or "")
+            and (
+                branch == f"wt/{task_id}"
+                or leaf == task_id
+                or leaf.startswith(f"{task_id}-")
+            )
+        ):
+            return None
+        return _LiveAssignment(stored_workspace, "worktree")
+
+    if workspace_kind == "scratch":
+        # Scratch tasks deliberately have no Git/project authority. A stale
+        # worktree seal inherited into one is a confused-deputy condition.
+        if branch or sealed_repo or "HERMES_KANBAN_PROJECT_ID" in os.environ:
+            return None
+        raw_root = str(
+            os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT") or ""
+        ).strip()
+        if not raw_root:
+            return None
+        try:
+            root = Path(raw_root).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if stored_workspace.parent != root or stored_workspace.name != task_id:
+            return None
+        return _LiveAssignment(stored_workspace, "scratch")
+    return None
 
 
-def assigned_workspace() -> Path | None:
-    """Return the exact dispatcher workspace only for the owning execution."""
+def _assigned_live_assignment() -> _LiveAssignment | None:
+    """Return the durable dispatcher assignment for the owning execution."""
     if not _boundary_expected():
         return None
     task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     run_id = str(os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     claim_lock = str(os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
-    branch = str(os.environ.get("HERMES_KANBAN_BRANCH") or "").strip()
-    sealed_repo = str(
-        os.environ.get("HERMES_KANBAN_TRUSTED_REPO_ROOT") or ""
-    ).strip()
-    if not all((task_id, run_id, claim_lock, branch, sealed_repo)):
+    if not all((task_id, run_id, claim_lock)):
         return None
     try:
         exact_run_id = int(run_id)
@@ -129,24 +178,23 @@ def assigned_workspace() -> Path | None:
         return None
     try:
         workspace = workspace.resolve(strict=True)
-        repo = Path(sealed_repo).expanduser().resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    expected = (repo / ".worktrees" / task_id).resolve(strict=False)
-    if workspace != expected:
-        return None
-    leaf = branch.rsplit("/", 1)[-1]
-    if not (branch == f"wt/{task_id}" or leaf == task_id or leaf.startswith(f"{task_id}-")):
-        return None
-    if not _live_claim_matches(
+    assignment = _live_assignment(
         task_id=task_id,
         run_id=exact_run_id,
         claim_lock=claim_lock,
-        workspace=workspace,
-        branch=branch,
-    ):
+        env_workspace=workspace,
+    )
+    if assignment is None:
         return None
-    return workspace
+    return assignment
+
+
+def assigned_workspace() -> Path | None:
+    """Return the exact dispatcher workspace only for the owning execution."""
+    assignment = _assigned_live_assignment()
+    return assignment.workspace if assignment is not None else None
 
 
 def current_local_sandbox_workspace() -> Path | None:
@@ -348,7 +396,7 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             raise WorkerSandboxUnavailable(
                 "Linux bubblewrap (bwrap) is required for Kanban workers"
             )
-        return [
+        args = [
             bubblewrap,
             "--die-with-parent",
             "--new-session",
@@ -357,12 +405,30 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             "--ro-bind",
             "/",
             "/",
+            # AF_UNIX sockets ignore network namespaces. Replace the host's
+            # runtime directory so Docker/systemd/Podman and similar daemon
+            # sockets under /run (and /var/run -> /run) are unreachable.
+            "--tmpfs",
+            "/run",
+        ]
+        try:
+            if Path("/var/run").exists() and (
+                Path("/var/run").resolve() != Path("/run").resolve()
+            ):
+                args.extend(("--tmpfs", "/var/run"))
+        except OSError:
+            # If the alias cannot be proven to resolve into the already-masked
+            # /run tree, mask it independently.
+            args.extend(("--tmpfs", "/var/run"))
+        args.extend([
             "--bind",
             str(exact_workspace),
             str(exact_workspace),
-            "--ro-bind",
-            str(exact_workspace / ".git"),
-            str(exact_workspace / ".git"),
+        ])
+        git_metadata = exact_workspace / ".git"
+        if git_metadata.exists():
+            args.extend(("--ro-bind", str(git_metadata), str(git_metadata)))
+        args.extend([
             *_bubblewrap_read_masks(temp_root, exact_workspace),
             "--bind",
             str(temp_root),
@@ -378,7 +444,8 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             "TMPDIR",
             str(temp_root),
             *argv,
-        ]
+        ])
+        return args
     raise WorkerSandboxUnavailable(
         f"{system or 'unknown'} has no supported Kanban worker filesystem sandbox"
     )
@@ -415,14 +482,20 @@ def terminal_backend_violation(env_type: str, *, background: bool) -> str | None
 
 
 def execute_code_violation() -> str | None:
-    """Disable the sibling arbitrary-code path for dispatcher workers."""
-    workspace = assigned_workspace()
-    if workspace is None:
+    """Disable the sibling arbitrary-code path for Git worktree workers."""
+    assignment = _assigned_live_assignment()
+    if assignment is None:
         if _boundary_expected():
             return (
                 "Blocked: dispatcher-owned Kanban workspace authority is missing "
                 "or inconsistent; refusing stale/confused-deputy execute_code."
             )
+        return None
+    if assignment.workspace_kind == "scratch":
+        # Scratch tasks have no repository/Git authority to protect and retain
+        # the normal execute_code capability. Worktree workers instead use the
+        # filesystem-sandboxed terminal so constructed Git calls cannot bypass
+        # the broker boundary.
         return None
     return (
         "Blocked: execute_code is disabled for dispatcher-owned Kanban workers. "

@@ -78,6 +78,11 @@ def broker_task(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", str(repo))
     monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "p_radulator")
 
+    # Existing publisher-contract tests exercise the explicit Radulator opt-in.
+    from hermes_cli import kanban_git_broker as broker
+
+    monkeypatch.setattr(broker, "_trusted_publisher_enabled", lambda: True)
+
     yield conn, tid, repo, workspace, branch, base_sha, claimed
     conn.close()
 
@@ -163,6 +168,74 @@ def test_broker_commits_only_exact_task_branch_and_emits_publish_contract(
         "head_sha": head_sha,
         "changed_paths": ["feature.txt"],
         "publisher_state": "awaiting",
+    }
+
+
+def test_trusted_publisher_is_default_false_and_requires_exact_boolean(monkeypatch):
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from hermes_cli import config, kanban_git_broker as broker
+
+    assert DEFAULT_CONFIG["kanban"]["trusted_publisher_enabled"] is False
+    monkeypatch.setattr(
+        config,
+        "load_config_readonly",
+        lambda: {"kanban": {"trusted_publisher_enabled": "true"}},
+    )
+    assert broker._trusted_publisher_enabled() is False
+    monkeypatch.setattr(
+        config,
+        "load_config_readonly",
+        lambda: {"kanban": {"trusted_publisher_enabled": True}},
+    )
+    assert broker._trusted_publisher_enabled() is True
+
+
+def test_broker_completes_normally_when_trusted_publisher_is_disabled(
+    broker_task, monkeypatch
+):
+    conn, tid, repo, workspace, branch, base_sha, claimed = broker_task
+    dependent = kb.create_task(
+        conn,
+        title="continue after local commit",
+        workspace_kind="scratch",
+        parents=(tid,),
+    )
+    assert kb.get_task(conn, dependent).status == "todo"
+    (workspace / "feature.txt").write_text("worker output\n", encoding="utf-8")
+    _stage(conn, tid, claimed.current_run_id)
+
+    from hermes_cli import kanban_git_broker as broker
+
+    monkeypatch.setattr(broker, "_trusted_publisher_enabled", lambda: False)
+    result = broker.finalize_current_worker_git_handoff()
+
+    head_sha = _git("rev-parse", branch, cwd=repo)
+    assert result == {
+        "outcome": "committed_locally",
+        "task_id": tid,
+        "head_sha": head_sha,
+        "branch": branch,
+    }
+    assert head_sha != base_sha
+    task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "done"
+    dependent_task = kb.get_task(conn, dependent)
+    assert dependent_task is not None and dependent_task.status == "ready"
+    events = kb.list_events(conn, task_id=tid)
+    assert not any(event.kind == "trusted_local_commit" for event in events)
+    assert not any(
+        event.kind == "blocked"
+        and event.payload.get("reason") == "AWAITING_TRUSTED_PUBLISHER v1"
+        for event in events
+    )
+    run = kb.list_runs(conn, tid)[-1]
+    assert run.summary == "implementation and tests complete"
+    assert run.metadata["tests_run"] == ["focused"]
+    assert run.metadata["trusted_local_commit"] == {
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "branch": branch,
+        "changed_paths": ["feature.txt"],
     }
 
 

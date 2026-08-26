@@ -8,6 +8,9 @@ import platform
 import shlex
 import shutil
 import socket
+import stat
+import subprocess
+import sys
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -69,10 +72,56 @@ def worker(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace.parent))
     monkeypatch.setenv("HERMES_KANBAN_BRANCH", branch)
     monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "")
     monkeypatch.setenv("TERMINAL_CWD", str(workspace))
     monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", str(tmp_path / "repo"))
+    return workspace
+
+
+@pytest.fixture
+def scratch_worker(tmp_path, monkeypatch):
+    """A real claimed scratch task has file/terminal authority but no Git seal."""
+    from hermes_cli import kanban_db as kb
+
+    db_path = tmp_path / "board" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    conn = kb.connect(db_path=db_path)
+    workspace = tmp_path / "workspaces" / "pending"
+    task_id = kb.create_task(
+        conn,
+        title="scratch worker",
+        initial_status="blocked",
+        workspace_kind="scratch",
+        workspace_path=str(workspace),
+    )
+    workspace = tmp_path / "workspaces" / task_id
+    workspace.mkdir(parents=True)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = 'ready' WHERE id = ?",
+            (str(workspace), task_id),
+        )
+    claimed = kb.claim_task(conn, task_id, claimer="host:scratch:claim")
+    assert claimed is not None
+    conn.close()
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspace.parent))
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    for name in (
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_PROJECT_ID",
+        "HERMES_KANBAN_TRUSTED_REPO_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
     return workspace
 
 
@@ -232,6 +281,43 @@ def test_model_file_tools_can_write_normal_task_file(worker):
     result = json.loads(write_file_tool("feature.txt", "safe\n"))
     assert not result.get("error")
     assert (worker / "feature.txt").read_text(encoding="utf-8") == "safe\n"
+
+
+def test_claimed_scratch_worker_can_write_normal_task_file(scratch_worker):
+    from tools.file_tools import write_file_tool
+
+    result = json.loads(write_file_tool("notes.txt", "safe scratch output\n"))
+
+    assert not result.get("error")
+    assert (scratch_worker / "notes.txt").read_text(encoding="utf-8") == (
+        "safe scratch output\n"
+    )
+
+
+def test_claimed_scratch_worker_can_run_foreground_terminal(scratch_worker):
+    result, env, boundaries = _run_terminal("python -m pytest -q", scratch_worker)
+
+    assert result.get("status") != "blocked"
+    env.execute.assert_called_once()
+    assert boundaries == [scratch_worker.resolve()]
+
+
+def test_claimed_scratch_worker_retains_execute_code(scratch_worker):
+    from tools.kanban_worker_boundary import execute_code_violation
+
+    assert execute_code_violation() is None
+
+
+def test_scratch_worker_rejects_stale_worktree_authority(scratch_worker, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BRANCH", "main")
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", str(scratch_worker.parent))
+    monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "attacker")
+
+    result, env, _boundaries = _run_terminal("python -m pytest -q", scratch_worker)
+
+    assert result["status"] == "blocked"
+    assert "stale/confused-deputy" in result["error"]
+    env.execute.assert_not_called()
 
 
 def test_model_file_tools_cannot_replace_worktree_gitfile(worker):
@@ -396,6 +482,7 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
     assert "--unshare-net" in argv
     assert "--unshare-pid" in argv
     assert f"--ro-bind\0/\0/" in joined
+    assert "--tmpfs\0/run" in joined
     assert f"--bind\0{worker.resolve()}\0{worker.resolve()}" in joined
     assert (
         f"--ro-bind\0{(worker / '.git').resolve()}\0{(worker / '.git').resolve()}"
@@ -409,6 +496,85 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
         if value == "--ro-bind"
     }
     assert hermes_home.resolve() not in masked_targets
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap integration",
+)
+def test_linux_sandbox_cannot_connect_to_host_run_socket(worker):
+    """Network namespaces do not isolate AF_UNIX; the /run view must."""
+    from tools.kanban_worker_boundary import local_sandbox_argv
+
+    run_user = Path("/run/user") / str(os.getuid())
+    if not run_user.is_dir() or not os.access(run_user, os.W_OK):
+        pytest.skip("no writable per-user /run directory for AF_UNIX fixture")
+    socket_path = run_user / f"hermes-kanban-{os.getpid()}.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        code = (
+            "import socket,sys; "
+            "s=socket.socket(socket.AF_UNIX); "
+            f"\ntry: s.connect({str(socket_path)!r})\n"
+            "except OSError: sys.exit(0)\n"
+            "else: sys.exit(1)"
+        )
+        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if completed.returncode not in (0, 1) and (
+            "Operation not permitted" in completed.stderr
+            or "No permissions" in completed.stderr
+        ):
+            pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+        assert completed.returncode == 0, completed.stderr
+    finally:
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap integration",
+)
+def test_linux_sandbox_cannot_connect_to_accessible_container_daemon(worker):
+    """Exercise the exact Docker/Podman confused-deputy primitive when present."""
+    from tools.kanban_worker_boundary import local_sandbox_argv
+
+    candidates = (
+        Path("/run/docker.sock"),
+        Path("/var/run/docker.sock"),
+        Path("/run/podman/podman.sock"),
+        Path("/run/user") / str(os.getuid()) / "podman" / "podman.sock",
+    )
+    daemon_socket = None
+    for candidate in candidates:
+        try:
+            if stat.S_ISSOCK(candidate.stat().st_mode) and os.access(
+                candidate, os.R_OK | os.W_OK
+            ):
+                daemon_socket = candidate
+                break
+        except OSError:
+            continue
+    if daemon_socket is None:
+        pytest.skip("no accessible Docker/Podman control socket on this host")
+
+    code = (
+        "import socket,sys; s=socket.socket(socket.AF_UNIX); "
+        f"\ntry: s.connect({str(daemon_socket)!r})\n"
+        "except OSError: sys.exit(0)\n"
+        "else: sys.exit(1)"
+    )
+    argv = local_sandbox_argv([sys.executable, "-c", code], worker)
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    if completed.returncode not in (0, 1) and (
+        "Operation not permitted" in completed.stderr
+        or "No permissions" in completed.stderr
+    ):
+        pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_managed_checkout_under_hermes_root_is_not_masked(

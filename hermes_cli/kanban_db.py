@@ -5514,6 +5514,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5548,6 +5549,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if expected_claim_lock is not None and expected_run_id is None:
+        raise ValueError("expected_claim_lock requires expected_run_id")
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5612,7 +5615,7 @@ def complete_task(
                 """,
                 (result, now, task_id),
             )
-        else:
+        elif expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5629,6 +5632,31 @@ def complete_task(
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND current_run_id = ?
+                   AND claim_lock = ?
+                """,
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id),
+                    expected_claim_lock,
+                ),
             )
         if cur.rowcount != 1:
             return False

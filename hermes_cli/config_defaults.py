@@ -2587,6 +2587,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Only installations with a separately installed trusted publisher
+        # may park local broker commits for that publisher. Upstream Hermes
+        # completes locally by default so ordinary worktree tasks cannot be
+        # stranded behind an absent deployment-specific consumer.
+        "trusted_publisher_enabled": False,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
