@@ -192,7 +192,7 @@ def _assigned_live_assignment() -> _LiveAssignment | None:
 
 
 def assigned_workspace() -> Path | None:
-    """Return the exact dispatcher workspace only for the owning execution."""
+    """Return the exact dispatcher workspace that requires the OS sandbox."""
     assignment = _assigned_live_assignment()
     return assignment.workspace if assignment is not None else None
 
@@ -453,14 +453,15 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
 
 def terminal_backend_violation(env_type: str, *, background: bool) -> str | None:
     """Fail closed unless this worker command can use a verified OS sandbox."""
-    workspace = assigned_workspace()
-    if workspace is None:
+    assignment = _assigned_live_assignment()
+    if assignment is None:
         if _boundary_expected():
             return (
                 "Blocked: dispatcher-owned Kanban workspace authority is missing "
                 "or inconsistent; refusing a stale/confused-deputy terminal run."
             )
         return None
+    workspace = assignment.workspace
     if background:
         return (
             "Blocked: dispatcher-owned Kanban workers cannot start background "
@@ -482,7 +483,7 @@ def terminal_backend_violation(env_type: str, *, background: bool) -> str | None
 
 
 def execute_code_violation() -> str | None:
-    """Disable the sibling arbitrary-code path for Git worktree workers."""
+    """Disable the unsandboxed sibling arbitrary-code path for workers."""
     assignment = _assigned_live_assignment()
     if assignment is None:
         if _boundary_expected():
@@ -490,12 +491,6 @@ def execute_code_violation() -> str | None:
                 "Blocked: dispatcher-owned Kanban workspace authority is missing "
                 "or inconsistent; refusing stale/confused-deputy execute_code."
             )
-        return None
-    if assignment.workspace_kind == "scratch":
-        # Scratch tasks have no repository/Git authority to protect and retain
-        # the normal execute_code capability. Worktree workers instead use the
-        # filesystem-sandboxed terminal so constructed Git calls cannot bypass
-        # the broker boundary.
         return None
     return (
         "Blocked: execute_code is disabled for dispatcher-owned Kanban workers. "
@@ -506,14 +501,15 @@ def execute_code_violation() -> str | None:
 
 def terminal_violation(command: str, cwd: str | None) -> str | None:
     """Return an unoverrideable denial for a model shell boundary crossing."""
-    workspace = assigned_workspace()
-    if workspace is None:
+    assignment = _assigned_live_assignment()
+    if assignment is None:
         if _boundary_expected():
             return (
                 "Blocked: dispatcher-owned Kanban workspace authority is missing "
                 "or inconsistent; refusing a stale/confused-deputy terminal run."
             )
         return None
+    workspace = assignment.workspace
     try:
         command_cwd = Path(cwd or os.getcwd()).expanduser().resolve(strict=True)
         command_cwd.relative_to(workspace)
@@ -589,14 +585,15 @@ def _command_git_violation(
 
 def write_path_violation(path: str | Path) -> str | None:
     """Return a denial when a model file tool targets control-plane state."""
-    workspace = assigned_workspace()
-    if workspace is None:
+    assignment = _assigned_live_assignment()
+    if assignment is None:
         if _boundary_expected():
             return (
                 "Blocked: dispatcher-owned Kanban workspace authority is missing "
                 "or inconsistent; refusing a stale/confused-deputy file write."
             )
         return None
+    workspace = assignment.workspace
     try:
         target = Path(path).expanduser().resolve(strict=False)
         relative = target.relative_to(workspace)

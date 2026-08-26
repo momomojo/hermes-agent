@@ -302,10 +302,35 @@ def test_claimed_scratch_worker_can_run_foreground_terminal(scratch_worker):
     assert boundaries == [scratch_worker.resolve()]
 
 
-def test_claimed_scratch_worker_retains_execute_code(scratch_worker):
+@pytest.mark.parametrize("env_type", ["ssh", "docker"])
+def test_claimed_scratch_worker_rejects_unverified_terminal_backend(
+    scratch_worker, env_type
+):
+    result, env, boundaries = _run_terminal(
+        "python -m pytest -q", scratch_worker, env_type=env_type
+    )
+
+    assert result["status"] == "blocked"
+    assert "verified local filesystem sandbox" in result["error"]
+    env.execute.assert_not_called()
+    assert boundaries == []
+
+
+def test_claimed_scratch_worker_rejects_background_terminal(scratch_worker):
+    result, env, _boundaries = _run_terminal(
+        "python -m pytest -q", scratch_worker, background=True
+    )
+
+    assert result["status"] == "blocked"
+    assert "background" in result["error"]
+    env.execute_background.assert_not_called()
+
+
+def test_claimed_scratch_worker_uses_terminal_instead_of_execute_code(scratch_worker):
     from tools.kanban_worker_boundary import execute_code_violation
 
-    assert execute_code_violation() is None
+    violation = execute_code_violation()
+    assert violation is not None and "execute_code" in violation
 
 
 def test_scratch_worker_rejects_stale_worktree_authority(scratch_worker, monkeypatch):
@@ -596,6 +621,73 @@ def test_managed_checkout_under_hermes_root_is_not_masked(
     assert secret.resolve() in masked
     assert hermes_root.resolve() not in masked
     assert all(path != managed_workspace.resolve() for path in masked)
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or shutil.which("sandbox-exec") is None,
+    reason="macOS Seatbelt integration",
+)
+def test_macos_scratch_terminal_blocks_absolute_credentials_and_host_sockets(
+    scratch_worker,
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise the actual foreground worker subprocess, not only guard text."""
+    from tools.environments.local import LocalEnvironment, hermes_subprocess_env
+    from tools.kanban_worker_boundary import local_worker_sandbox
+
+    hermes_home = tmp_path / "profiles" / "radulator"
+    gh_home = tmp_path / "user-home" / ".config" / "gh"
+    hermes_home.mkdir(parents=True)
+    gh_home.mkdir(parents=True)
+    profile_secret = hermes_home / ".env"
+    gh_secret = gh_home / "hosts.yml"
+    profile_secret.write_text("GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8")
+    gh_secret.write_text("oauth_token: must-not-enter-model\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user-home")
+
+    tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_listener.bind(("127.0.0.1", 0))
+    tcp_listener.listen(1)
+    tcp_port = tcp_listener.getsockname()[1]
+    unix_path = tmp_path / "host-control.sock"
+    unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_listener.bind(str(unix_path))
+    unix_listener.listen(1)
+    code = (
+        "from pathlib import Path; import socket,sys; escaped=False\n"
+        f"for p in ({str(profile_secret)!r}, {str(gh_secret)!r}):\n"
+        "  try: Path(p).read_text()\n"
+        "  except OSError: pass\n"
+        "  else: escaped=True\n"
+        f"for family,address in ((socket.AF_INET, ('127.0.0.1', {tcp_port})), "
+        f"(socket.AF_UNIX, {str(unix_path)!r})):\n"
+        "  s=socket.socket(family, socket.SOCK_STREAM); s.settimeout(1)\n"
+        "  try: s.connect(address)\n"
+        "  except OSError: pass\n"
+        "  else: escaped=True\n"
+        "  finally: s.close()\n"
+        "sys.exit(1 if escaped else 0)"
+    )
+    environment = LocalEnvironment(
+        cwd=str(scratch_worker),
+        timeout=30,
+        env=hermes_subprocess_env(inherit_credentials=True),
+    )
+    try:
+        with local_worker_sandbox(scratch_worker):
+            completed = environment.execute(
+                f"python3 -c {shlex.quote(code)}",
+                cwd=str(scratch_worker),
+            )
+    finally:
+        environment.cleanup()
+        tcp_listener.close()
+        unix_listener.close()
+        unix_path.unlink(missing_ok=True)
+
+    assert completed["returncode"] == 0, completed.get("output")
 
 
 @pytest.mark.skipif(
