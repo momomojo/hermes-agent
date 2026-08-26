@@ -632,6 +632,52 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
     assert hermes_home.resolve() not in masked_targets
 
 
+def test_linux_bubblewrap_pins_exact_resolved_python_executable_after_runtime_roots(
+    worker,
+    tmp_path,
+):
+    """A uv venv symlink target cannot disappear behind the empty-root view."""
+    from tools.kanban_worker_boundary import local_sandbox_argv
+
+    runtime = tmp_path / "uv-python-dir" / "cpython-3.11" / "bin"
+    runtime.mkdir(parents=True)
+    real_python = runtime / "python3.11"
+    real_python.write_text("runtime", encoding="utf-8")
+    venv_bin = tmp_path / "repo" / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(real_python)
+
+    with (
+        patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
+        patch("tools.kanban_worker_boundary.shutil.which", return_value="/usr/bin/bwrap"),
+        patch("tools.kanban_worker_boundary.sys.executable", str(venv_python)),
+        patch("tools.kanban_worker_boundary.sys.prefix", str(venv_bin.parent)),
+        patch("tools.kanban_worker_boundary.sys.base_prefix", str(runtime.parent)),
+    ):
+        argv = local_sandbox_argv(
+            [str(venv_python), "-c", "pass"], worker, seccomp_fd=71
+        )
+
+    exact_mount = ["--ro-bind", str(real_python), str(real_python)]
+    exact_index = next(
+        index
+        for index in range(len(argv) - 2)
+        if argv[index : index + 3] == exact_mount
+    )
+    runtime_root_mount = [
+        "--ro-bind",
+        str(runtime.parent),
+        str(runtime.parent),
+    ]
+    runtime_index = next(
+        index
+        for index in range(len(argv) - 2)
+        if argv[index : index + 3] == runtime_root_mount
+    )
+    assert exact_index > runtime_index
+
+
 def test_linux_sandbox_fails_closed_without_seccomp_fd(worker):
     from tools.kanban_worker_boundary import (
         WorkerSandboxUnavailable,

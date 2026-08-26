@@ -654,6 +654,18 @@ def local_sandbox_argv(
             args.extend(("--tmpfs", str(private_root)))
         for system_source, system_target in _bubblewrap_system_roots():
             args.extend(("--ro-bind", str(system_source), str(system_target)))
+        # Pin the exact resolved interpreter *after* its runtime roots.  uv's
+        # GitHub Actions venv uses an absolute symlink into a temporary Python
+        # installation; an empty-root mount can otherwise expose the venv
+        # symlink while still leaving its final executable absent.  This is a
+        # single trusted host file, mounted read-only, and does not broaden the
+        # model-visible filesystem.
+        try:
+            exact_python = Path(sys.executable).resolve(strict=True)
+        except (OSError, RuntimeError):
+            exact_python = None
+        if exact_python is not None and exact_python.is_file():
+            args.extend(("--ro-bind", str(exact_python), str(exact_python)))
         args.extend([
             "--bind",
             str(exact_workspace),
