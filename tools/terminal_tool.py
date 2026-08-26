@@ -2661,6 +2661,25 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # A dispatcher worker may execute arbitrary interpreters/build tools,
+        # so shell-text inspection is not the isolation boundary. Require a
+        # real local OS filesystem+network sandbox before creating any backend;
+        # remote/SSH/container paths and detached background processes fail
+        # closed and therefore never receive credentials or network access.
+        from tools.kanban_worker_boundary import terminal_backend_violation
+
+        backend_boundary_error = terminal_backend_violation(
+            env_type,
+            background=background,
+        )
+        if backend_boundary_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": backend_boundary_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
@@ -3381,7 +3400,17 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    from tools.kanban_worker_boundary import (
+                        assigned_workspace,
+                        local_worker_sandbox,
+                    )
+
+                    worker_workspace = assigned_workspace()
+                    if worker_workspace is None:
+                        result = env.execute(command, **execute_kwargs)
+                    else:
+                        with local_worker_sandbox(worker_workspace):
+                            result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

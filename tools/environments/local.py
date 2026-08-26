@@ -1294,9 +1294,11 @@ def _make_run_env(env: dict) -> dict:
     merged = dict(os.environ | env)
     run_env = {}
     for k, v in merged.items():
+        if k in _ALWAYS_STRIP_KEYS:
+            continue
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if real_key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
@@ -1792,6 +1794,19 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        # Dispatcher-owned Kanban commands enter this ContextVar only around
+        # the single foreground env.execute() call. Wrap the entire generated
+        # shell (snapshot restore, cwd tracking, model command, and children)
+        # in a kernel-enforced filesystem/network sandbox. Keeping this scoped
+        # avoids contaminating a reused LocalEnvironment or an in-process cron
+        # execution with stale worker authority.
+        from tools.kanban_worker_boundary import (
+            current_local_sandbox_workspace,
+            local_sandbox_argv,
+        )
+
+        if (worker_workspace := current_local_sandbox_workspace()) is not None:
+            args = local_sandbox_argv(args, worker_workspace)
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by

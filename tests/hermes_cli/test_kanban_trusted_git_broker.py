@@ -96,6 +96,7 @@ def test_broker_git_environment_scrubs_credentials_and_worker_git_overrides(
     monkeypatch,
 ):
     monkeypatch.setenv("GITHUB_TOKEN", "worker-token-must-not-reach-git")
+    monkeypatch.setenv("GH_TOKEN", "worker-token-alias-must-not-reach-git")
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret-must-not-reach-git")
     monkeypatch.setenv("GIT_DIR", "/attacker/repository.git")
     monkeypatch.setenv("GIT_INDEX_FILE", "/attacker/index")
@@ -107,6 +108,7 @@ def test_broker_git_environment_scrubs_credentials_and_worker_git_overrides(
     env = _base_git_env()
 
     assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
     assert "OPENAI_API_KEY" not in env
     assert "GIT_DIR" not in env
     assert "GIT_INDEX_FILE" not in env

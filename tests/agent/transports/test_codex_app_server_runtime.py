@@ -422,6 +422,7 @@ class TestSpawnEnvSecretStripping:
     def test_tier1_and_internal_secrets_stripped_from_spawn_env(self, monkeypatch):
         for var, val in {
             "GH_TOKEN": "ghp-secret",
+            "GITHUB_TOKEN": "github-secret",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "MODAL_TOKEN_SECRET": "modal-secret",
             "HERMES_DASHBOARD_SESSION_TOKEN": "dash-secret",
@@ -434,7 +435,7 @@ class TestSpawnEnvSecretStripping:
 
         env = self._capture_spawn_env(monkeypatch)
         for var in (
-            "GH_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
+            "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
             "HERMES_DASHBOARD_SESSION_TOKEN", "AUXILIARY_VISION_API_KEY",
             "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_ID", "GATEWAY_RELAY_DELIVERY_KEY",
         ):
