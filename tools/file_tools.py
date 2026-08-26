@@ -1638,6 +1638,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # Credential denial must precede document extraction, magic-byte
+        # sniffing, and binary classification.  Those paths open the file even
+        # when they ultimately withhold its content; host authority keys must
+        # never be opened on a model-facing read path at all.
+        block_error = get_read_block_error(str(_resolved))
+        if block_error:
+            return tool_error(block_error)
+
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
         # catches the class — any FIFO/socket/device wherever it lives. A
@@ -1773,10 +1781,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # TERMINAL_CWD == HERMES_HOME (e.g. "auth.json") still hits the
         # denylist — get_read_block_error's own resolve() runs against
         # the Python process cwd, which can differ.
-        block_error = get_read_block_error(str(_resolved))
-        if block_error:
-            return tool_error(block_error)
-
         # ── Negative-result cache ─────────────────────────────────────
         # If we already discovered this path doesn't exist (within TTL),
         # return the cached error without spawning the subprocess +

@@ -159,6 +159,40 @@ def _classify_write_denial(path: str) -> Optional[str]:
         except Exception:
             continue
 
+    # Host-sealed Kanban dispatch keys are model-inaccessible credentials.
+    # Keep this exact-file deny in the in-process file tool as well as the OS
+    # terminal sandbox so a worker cannot bypass the boundary by switching
+    # model-facing tools.
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_authority import authority_key_path_for_db
+
+        authority_db = _kb.kanban_db_path().resolve(strict=False)
+        authority_keys = {
+            authority_key_path_for_db(authority_db).resolve(strict=False),
+            authority_db,
+            Path(str(authority_db) + "-wal").resolve(strict=False),
+            Path(str(authority_db) + "-shm").resolve(strict=False),
+            (
+                _kb.board_dir(_kb.get_current_board())
+                / ".trusted-dispatch-authority.key"
+            ).resolve(strict=False),
+        }
+        boards = _kb.boards_root()
+        if boards.is_dir():
+            authority_keys.update(
+                (board / ".trusted-dispatch-authority.key").resolve(strict=False)
+                for board in boards.iterdir()
+                if board.is_dir()
+            )
+        if resolved in authority_keys:
+            return (
+                f"Access denied: {path} is a trusted Kanban dispatch credential "
+                "and cannot be read by model tools."
+            )
+    except (OSError, RuntimeError, ValueError):
+        pass
+
     for base_real in hermes_dirs:
         # Session transcripts are application-owned state.  Letting the agent's
         # generic file tools rewrite state.db or legacy JSON snapshots can
@@ -304,6 +338,37 @@ def get_read_block_error(path: str) -> Optional[str]:
                 hermes_dirs.append(real)
         except Exception:
             continue
+
+    # Host-sealed Kanban dispatch keys are model-inaccessible credentials.
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_authority import authority_key_path_for_db
+
+        authority_db = _kb.kanban_db_path().resolve(strict=False)
+        authority_keys = {
+            authority_key_path_for_db(authority_db).resolve(strict=False),
+            authority_db,
+            Path(str(authority_db) + "-wal").resolve(strict=False),
+            Path(str(authority_db) + "-shm").resolve(strict=False),
+            (
+                _kb.board_dir(_kb.get_current_board())
+                / ".trusted-dispatch-authority.key"
+            ).resolve(strict=False),
+        }
+        boards = _kb.boards_root()
+        if boards.is_dir():
+            authority_keys.update(
+                (board / ".trusted-dispatch-authority.key").resolve(strict=False)
+                for board in boards.iterdir()
+                if board.is_dir()
+            )
+        if resolved in authority_keys:
+            return (
+                f"Access denied: {path} is a trusted Kanban dispatch credential "
+                "and cannot be read by model tools."
+            )
+    except (OSError, RuntimeError, ValueError):
+        pass
 
     # Skills .hub: prompt-injection carriers.
     for hd in hermes_dirs:

@@ -414,6 +414,36 @@ def _credential_read_paths(workspace: Path | None = None) -> tuple[Path, ...]:
     for base in hermes_bases:
         candidates.extend(base / relative for relative in credential_files)
         candidates.extend((base / "mcp-tokens", base / "skills" / ".hub"))
+    # The board-local HMAC capability is the host/model trust boundary.  The
+    # macOS Seatbelt policy otherwise permits broad read access, so mask every
+    # known board key explicitly (Linux's empty-root mount boundary also omits
+    # these, but keeping the mask list symmetric prevents future regressions).
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.kanban_authority import authority_key_path_for_db
+
+        authority_db = _kb.kanban_db_path().expanduser().resolve(strict=False)
+        candidates.extend(
+            (
+                authority_key_path_for_db(authority_db),
+                authority_db,
+                Path(str(authority_db) + "-wal"),
+                Path(str(authority_db) + "-shm"),
+            )
+        )
+        candidates.append(
+            _kb.board_dir(_kb.get_current_board())
+            / ".trusted-dispatch-authority.key"
+        )
+        boards = _kb.boards_root()
+        if boards.is_dir():
+            candidates.extend(
+                board / ".trusted-dispatch-authority.key"
+                for board in boards.iterdir()
+                if board.is_dir()
+            )
+    except (OSError, RuntimeError, ValueError):
+        pass
     candidates.append(hermes_root / "shared" / "nous_auth.json")
     shared_auth_dir = str(os.environ.get("HERMES_SHARED_AUTH_DIR") or "").strip()
     if shared_auth_dir:
@@ -503,6 +533,15 @@ def _bubblewrap_read_masks(workspace: Path) -> list[str]:
 
 def _bubblewrap_system_roots() -> tuple[tuple[Path, Path], ...]:
     """Return the small immutable host view needed to execute local tools."""
+    try:
+        # GitHub Actions' uv setup can make ``sys.executable`` a venv symlink
+        # into a temporary standalone-Python tree that is not ``sys.prefix``
+        # or ``sys.base_prefix``.  Preserve that exact resolved interpreter
+        # prefix read-only; mounting the venv entry point without its target
+        # makes Bubblewrap report ENOENT even though the symlink itself exists.
+        executable_prefix = Path(sys.executable).resolve(strict=True).parent.parent
+    except (OSError, RuntimeError):
+        executable_prefix = Path(sys.executable).parent.parent
     candidates = (
         Path("/usr"),
         Path("/bin"),
@@ -515,6 +554,7 @@ def _bubblewrap_system_roots() -> tuple[tuple[Path, Path], ...]:
         Path("/nix/store"),
         Path(sys.prefix),
         Path(sys.base_prefix),
+        executable_prefix,
     )
     roots: list[tuple[Path, Path]] = []
     seen: set[tuple[Path, Path]] = set()

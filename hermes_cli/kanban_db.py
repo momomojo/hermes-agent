@@ -136,6 +136,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_TASK_CREATION_ORIGINS = {
+    "host_sealed",
     "internal",
     "legacy",
     "model_tool",
@@ -1451,6 +1452,23 @@ CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Host-only dispatch authority. The HMAC never leaves this board database;
+-- model/readback surfaces receive only receipt identity and verification
+-- metadata. A task row without a verified record here is never a trusted
+-- prerequisite, regardless of its human-readable creation_origin value.
+CREATE TABLE IF NOT EXISTS task_dispatch_authorities (
+    task_id             TEXT PRIMARY KEY,
+    contract            TEXT NOT NULL,
+    authority_id        TEXT NOT NULL UNIQUE,
+    key_id              TEXT NOT NULL,
+    payload_json        TEXT NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    receipt_hmac        BLOB NOT NULL,
+    sealed_at           INTEGER NOT NULL,
+    claim_generation    INTEGER NOT NULL DEFAULT 0,
+    last_claimed_run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -3208,6 +3226,8 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3534,8 +3554,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3562,6 +3583,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -4693,6 +4716,25 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        authority_task = get_task(conn, task_id)
+        requires_authority = bool(
+            authority_task is not None
+            and authority_task.creation_origin == "host_sealed"
+        )
+        authority_generation: int | None = None
+        if requires_authority:
+            from hermes_cli.kanban_authority import verify_task_authority
+
+            receipt = verify_task_authority(conn, task_id)
+            if receipt is None or not receipt["verified"]:
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "invalid_dispatch_authority"},
+                )
+                return None
+            authority_generation = int(receipt["claim_generation"])
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4754,6 +4796,18 @@ def claim_task(
             ),
         )
         run_id = run_cur.lastrowid
+        if requires_authority:
+            from hermes_cli.kanban_authority import consume_claim_authority
+
+            if not consume_claim_authority(
+                conn,
+                task_id,
+                int(run_id),
+                expected_generation=int(authority_generation),
+            ):
+                raise RuntimeError(
+                    "trusted dispatch authority CAS failed before worker access"
+                )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),

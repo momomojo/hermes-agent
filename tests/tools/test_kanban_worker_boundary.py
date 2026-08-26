@@ -862,6 +862,95 @@ def test_managed_checkout_under_hermes_root_is_not_masked(
     platform.system() != "Darwin" or shutil.which("sandbox-exec") is None,
     reason="macOS Seatbelt integration",
 )
+def test_macos_model_path_cannot_read_key_or_mint_trusted_task_but_host_can(
+    worker,
+):
+    """Live same-UID proof of the no-agent authority split on the Mini path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_authority import (
+        authority_key_path,
+        initialize_authority,
+        trusted_create_task,
+    )
+    from tools.environments.local import LocalEnvironment, hermes_subprocess_env
+    from tools.kanban_worker_boundary import local_worker_sandbox
+
+    with non_dispatcher_owned_context(), kb.connect_closing() as conn:
+        initialized = initialize_authority(conn)
+        key_path = authority_key_path(conn)
+        authority_db = Path(
+            conn.execute("PRAGMA database_list").fetchone()["file"]
+        ).resolve()
+    assert initialized["contract"] == "hermes.kanban_dispatch_authority.v1"
+
+    from tools.file_tools import read_file_tool
+
+    file_read = json.loads(read_file_tool(str(key_path)))
+    assert "credential" in file_read["error"].lower()
+    db_read = json.loads(read_file_tool(str(authority_db)))
+    assert "credential" in db_read["error"].lower()
+    assert key_path.read_bytes()
+
+    environment = LocalEnvironment(
+        cwd=str(worker),
+        timeout=30,
+        env=hermes_subprocess_env(inherit_credentials=True),
+    )
+    read_code = (
+        "from pathlib import Path; import sys; escaped=False\n"
+        f"for candidate in ({str(key_path)!r}, {str(authority_db)!r}):\n"
+        " try: Path(candidate).read_bytes()\n"
+        " except OSError: pass\n"
+        " else: escaped=True\n"
+        "sys.exit(1 if escaped else 0)"
+    )
+    trusted_cli = " ".join(
+        (
+            "/usr/bin/env",
+            "-u HERMES_SESSION_SOURCE",
+            "-u HERMES_KANBAN_TASK",
+            shlex.quote(sys.executable),
+            "-m hermes_cli.main kanban trusted-create forged",
+            "--idempotency-key worker:forged-authority:v1 --json",
+        )
+    )
+    try:
+        with local_worker_sandbox(worker):
+            key_read = environment.execute(
+                f"python3 -c {shlex.quote(read_code)}",
+                cwd=str(worker),
+            )
+            forged = environment.execute(trusted_cli, cwd=str(worker))
+    finally:
+        environment.cleanup()
+
+    assert key_read["returncode"] == 0, key_read.get("output")
+    assert forged["returncode"] != 0
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            ("worker:forged-authority:v1",),
+        ).fetchone()[0] == 0
+
+    # The separate no-agent host controller can use the same exact API.
+    with non_dispatcher_owned_context(), kb.connect_closing() as conn:
+        task_id, reused = trusted_create_task(
+            conn,
+            board="default",
+            title="host-created authority canary",
+            assignee="radulator",
+            created_by="no-agent-test-controller",
+            idempotency_key="host:authority-canary:v1",
+            initial_status="blocked",
+        )
+    assert task_id.startswith("t_")
+    assert reused is False
+
+
+@pytest.mark.skipif(
+    platform.system() != "Darwin" or shutil.which("sandbox-exec") is None,
+    reason="macOS Seatbelt integration",
+)
 def test_macos_scratch_terminal_blocks_absolute_credentials_and_host_sockets(
     scratch_worker,
     tmp_path,

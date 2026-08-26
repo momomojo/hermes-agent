@@ -91,6 +91,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "reasoning_effort": t.reasoning_effort,
+        "goal_mode": bool(t.goal_mode),
+        "goal_max_turns": t.goal_max_turns,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -226,7 +228,11 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
-def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+def build_parser(
+    parent_subparsers: argparse._SubParsersAction,
+    *,
+    include_host_authority: bool = True,
+) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
     Returns the top-level ``kanban`` parser so caller can ``set_defaults``.
@@ -393,6 +399,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument("--reasoning", default=None, dest="reasoning_effort",
+                          help="Pin the worker reasoning effort without changing "
+                               "the assignee profile default.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -406,6 +415,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--session-id", default=None,
+                          help="Exact originating session id (host controller use).")
+    p_create.add_argument("--workflow-template-id", default=None,
+                          help="Exact workflow template id (host controller use).")
+    p_create.add_argument("--current-step-key", default=None,
+                          help="Exact initial workflow step (host controller use).")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -413,6 +428,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # The signing controller is intentionally omitted from the AI-facing
+    # ``/kanban`` parser.  The real host CLI includes it, but a model can reach
+    # it only through the OS-sandboxed terminal where the board key and DB are
+    # unavailable.
+    if include_host_authority:
+        p_authority = sub.add_parser(
+            "authority", help="Manage no-agent host dispatch authority"
+        )
+        authority_sub = p_authority.add_subparsers(dest="authority_action")
+        p_authority_init = authority_sub.add_parser(
+            "init", help="Initialize the board-local signing capability"
+        )
+        p_authority_init.add_argument("--json", action="store_true")
+        sub.add_parser(
+            "trusted-create",
+            parents=[p_create],
+            add_help=False,
+            help="Create/reuse one exact host-sealed task prerequisite",
+        )
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -1120,7 +1155,9 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "authority": _cmd_authority,
             "create":   _cmd_create,
+            "trusted-create": _cmd_trusted_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1195,7 +1232,9 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
+    "authority",
     "create",
+    "trusted-create",
     "swarm",
     "assign",
     "reclaim",
@@ -1597,9 +1636,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
             initial_status=getattr(args, "initial_status", "running"),
+            session_id=getattr(args, "session_id", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1618,6 +1661,89 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_authority(args: argparse.Namespace) -> int:
+    """Initialize the host-only board authority; never exposed by run_slash."""
+    if getattr(args, "authority_action", None) != "init":
+        print("kanban authority: choose 'init'", file=sys.stderr)
+        return 2
+    from hermes_cli.kanban_authority import initialize_authority
+
+    with kb.connect_closing() as conn:
+        result = initialize_authority(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        state = "initialized" if result["initialized"] else "already initialized"
+        print(
+            f"Dispatch authority {state} "
+            f"({result['contract']}, key_id={result['key_id']})"
+        )
+    return 0
+
+
+def _cmd_trusted_create(args: argparse.Namespace) -> int:
+    """Create/reuse a signed task from the separate no-agent host surface."""
+    from hermes_cli.kanban_authority import trusted_create_task
+
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        branch_name = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if branch_name and ws_kind != "worktree":
+        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
+        return 2
+    try:
+        max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
+        return 2
+    max_retries = getattr(args, "max_retries", None)
+    if max_retries is not None and max_retries < 1:
+        print("kanban: --max-retries must be >= 1", file=sys.stderr)
+        return 2
+    board = kb.get_current_board()
+    with kb.connect_closing() as conn:
+        task_id, reused = trusted_create_task(
+            conn,
+            board=board,
+            title=args.title,
+            body=args.body,
+            assignee=args.assignee,
+            created_by=args.created_by or "no-agent-host-controller",
+            workspace_kind=ws_kind,
+            workspace_path=ws_path,
+            branch_name=branch_name,
+            project_id=getattr(args, "project", None),
+            tenant=args.tenant,
+            priority=args.priority,
+            parents=tuple(args.parent or ()),
+            triage=bool(getattr(args, "triage", False)),
+            idempotency_key=getattr(args, "idempotency_key", None),
+            max_runtime_seconds=max_runtime,
+            skills=getattr(args, "skills", None) or None,
+            max_retries=max_retries,
+            model_override=getattr(args, "model_override", None),
+            provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            goal_mode=bool(getattr(args, "goal_mode", False)),
+            goal_max_turns=getattr(args, "goal_max_turns", None),
+            initial_status=getattr(args, "initial_status", "running"),
+            session_id=getattr(args, "session_id", None),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
+        )
+        task = kb.get_task(conn, task_id)
+    result = {**_task_to_dict(task), "reused": reused}
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        verb = "Reused" if reused else "Created"
+        print(f"{verb} sealed task {task_id}")
     return 0
 
 
@@ -1706,6 +1832,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
+    dispatch_authority = None
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1726,6 +1853,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     (task.idempotency_key,),
                 ).fetchall()
             ]
+        from hermes_cli.kanban_authority import verify_task_authority
+
+        dispatch_authority = verify_task_authority(conn, task.id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1736,6 +1866,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "dispatch_authority": dispatch_authority,
             "idempotency_readback": {
                 "key": task.idempotency_key,
                 "active_match_count": len(idempotency_task_ids),
@@ -3424,7 +3555,7 @@ def run_slash(rest: str) -> str:
     _wrap = argparse.ArgumentParser(prog="/kanban-wrap", add_help=False)
     _wrap.exit_on_error = False  # type: ignore[attr-defined]
     _top_sub = _wrap.add_subparsers(dest="_top")
-    kanban_parser = build_parser(_top_sub)
+    kanban_parser = build_parser(_top_sub, include_host_authority=False)
     kanban_parser.prog = "/kanban"
     kanban_parser.exit_on_error = False  # type: ignore[attr-defined]
     for _action in kanban_parser._actions:
