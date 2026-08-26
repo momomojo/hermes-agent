@@ -1436,9 +1436,26 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+def _finalize_kanban_git_handoff() -> None:
+    """Run the trusted post-model Git broker for a staged worker handoff."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    try:
+        from hermes_cli.kanban_git_broker import finalize_current_worker_git_handoff
+
+        outcome = finalize_current_worker_git_handoff()
+        logger.debug("kanban trusted Git handoff: %s", outcome)
+    except Exception:
+        # Leave the task/run active so the dispatcher can reclaim it. Never
+        # falsely mark uncommitted work complete on a broker implementation or
+        # host failure.
+        logger.exception("kanban trusted Git handoff failed")
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
+        _finalize_kanban_git_handoff()
         # Durable flush FIRST: memory-provider shutdown inside _run_cleanup
         # can issue aux-LLM calls, and nothing after it may fail in a way
         # that loses the turn (#88583).
@@ -21365,6 +21382,13 @@ def main(
                             print(f"Error: {result['error']}", file=sys.stderr)
                         elif response:
                             print(response)
+
+                        # A worktree worker's kanban_complete call stages a
+                        # request rather than granting the model shared .git
+                        # write authority. Broker it before goal-mode inspects
+                        # task status; _finalize_single_query repeats this as an
+                        # idempotent crash/fallback boundary.
+                        _finalize_kanban_git_handoff()
 
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an

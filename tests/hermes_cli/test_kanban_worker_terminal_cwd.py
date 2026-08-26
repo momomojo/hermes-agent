@@ -79,16 +79,11 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
     assert "HERMES_KANBAN_GIT_COMMON_DIR" not in captured["env"]
+    assert "HERMES_KANBAN_TRUSTED_REPO_ROOT" not in captured["env"]
 
 
-def test_linked_worktree_spawn_pins_exact_git_common_dir(monkeypatch, tmp_path):
-    """The trusted dispatcher exports the repo metadata root for Codex.
-
-    A linked worktree's visible ``.git`` is a file and the actual writable Git
-    metadata lives outside the task cwd.  The dispatcher, which materializes
-    and owns the task worktree, resolves that shared directory before spawn so
-    the model-facing transport never has to trust a workspace-authored path.
-    """
+def test_linked_worktree_spawn_never_exports_git_common_dir(monkeypatch, tmp_path):
+    """The model-facing worker never receives shared Git path authority."""
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
     (root / "profiles" / "w" / "config.yaml").write_text(
@@ -156,10 +151,11 @@ def test_linked_worktree_spawn_pins_exact_git_common_dir(monkeypatch, tmp_path):
         tenant=None,
         current_run_id=1,
         branch_name="wt/t_git",
+        project_id="p_radulator",
     )
 
     kb._default_spawn(task, str(workspace))
 
-    assert captured["env"]["HERMES_KANBAN_GIT_COMMON_DIR"] == str(
-        (repo / ".git").resolve()
-    )
+    assert "HERMES_KANBAN_GIT_COMMON_DIR" not in captured["env"]
+    assert captured["env"]["HERMES_KANBAN_TRUSTED_REPO_ROOT"] == str(repo)
+    assert captured["env"]["HERMES_KANBAN_PROJECT_ID"] == "p_radulator"

@@ -765,6 +765,48 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            # Dispatcher-owned worktree workers never receive shared Git
+            # metadata write access. Their terminal completion tool records a
+            # durable request while the run stays active; after the model turn
+            # returns, the trusted Hermes host validates the exact claim,
+            # board/project/workspace/branch and performs the local commit.
+            # Orchestrators/manual completion and non-worktree tasks retain the
+            # established direct-completion path below.
+            if (
+                task is not None
+                and task.workspace_kind == "worktree"
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+                and os.environ.get("HERMES_SESSION_SOURCE") == "kanban"
+                and _is_dispatcher_owned_worker()
+            ):
+                try:
+                    staged = kb.stage_trusted_git_completion(
+                        conn,
+                        tid,
+                        result=result,
+                        summary=summary,
+                        metadata=metadata,
+                        created_cards=created_cards,
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                except kb.HallucinatedCardsError as hall_err:
+                    return tool_error(
+                        "kanban_complete blocked: the following created_cards "
+                        "do not exist or were not created by this worker: "
+                        f"{', '.join(hall_err.phantom)}. Your task is still "
+                        "in-flight (no state change). Retry with corrected ids."
+                    )
+                if not staged:
+                    return tool_error(
+                        f"could not stage trusted Git completion for {tid} "
+                        "(claim/run/workspace mismatch)"
+                    )
+                return _ok(
+                    task_id=tid,
+                    run_id=_worker_run_id(tid),
+                    handoff="pending_trusted_local_commit",
+                )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,

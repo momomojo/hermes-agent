@@ -36,11 +36,10 @@ def _kanban_writable_roots(env: dict[str, str]) -> list[str]:
     """Return the narrow host paths a dispatcher-owned worker must mutate.
 
     The task workspace itself is already Codex's cwd and therefore writable in
-    ``workspace-write`` mode.  Board state and a linked worktree's shared Git
-    metadata live outside that cwd, so the trusted dispatcher pins those paths
-    in environment variables before the worker starts.  Normalize and
-    deduplicate them here, rejecting relative paths and filesystem roots so a
-    malformed deployment setting cannot widen the sandbox to the whole host.
+    ``workspace-write`` mode. Board lifecycle state lives outside that cwd, so
+    the dispatcher pins the board paths. Git metadata is deliberately excluded:
+    a model must never receive shared refs, hooks, config, sibling worktree
+    metadata, or protected-branch write authority.
     """
     kanban_db = (env.get("HERMES_KANBAN_DB") or "").strip()
     legacy_root = (env.get("HERMES_KANBAN_ROOT") or "").strip()
@@ -58,7 +57,6 @@ def _kanban_writable_roots(env: dict[str, str]) -> list[str]:
         board_root,
         env.get("HERMES_KANBAN_WORKSPACES_ROOT", ""),
         legacy_root,
-        env.get("HERMES_KANBAN_GIT_COMMON_DIR", ""),
     )
     roots: list[str] = []
     seen: set[str] = set()
@@ -142,15 +140,32 @@ class CodexAppServerClient:
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
+        # A cron turn or delegate_task child can execute in-process inside a
+        # dispatcher worker while inheriting its process-global env. ContextVar
+        # ownership is the authority; raw HERMES_KANBAN_* values are not. Strip
+        # every task pin before spawning Codex when this execution is not the
+        # dispatcher-owned worker so the child process cannot regain authority.
+        from agent.delegation_context import (
+            KANBAN_ENV_KEYS,
+            is_dispatcher_owned_worker_context,
+        )
+
+        dispatcher_worker = (
+            is_dispatcher_owned_worker_context()
+            and spawn_env.get("HERMES_SESSION_SOURCE") == "kanban"
+            and bool(spawn_env.get("HERMES_KANBAN_TASK"))
+        )
+        if not dispatcher_worker:
+            for key in KANBAN_ENV_KEYS:
+                spawn_env.pop(key, None)
+
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to the
-        # board DB. Linked Git worktrees also keep their index, refs, objects,
-        # and logs under the repository's shared .git directory, outside the
-        # task cwd. Keep the Codex sandbox and network isolation on, while
-        # granting only the dispatcher-pinned board and assigned-repo roots.
-        # Without the Git root, workers can test/edit but cannot commit or
-        # publish; without the board root, their lifecycle handoff fails.
-        if spawn_env.get("HERMES_KANBAN_TASK"):
+        # Workers edit and test inside the task cwd, but never mutate Git
+        # metadata. A trusted post-turn broker commits the exact validated
+        # worktree after the model stages a machine-readable completion handoff.
+        # Board roots remain available for lifecycle MCP calls; network stays
+        # disabled. GitHub publishing is a separate host-side control plane.
+        if dispatcher_worker:
             writable_roots = _kanban_writable_roots(spawn_env)
             app_server_args.extend(
                 [

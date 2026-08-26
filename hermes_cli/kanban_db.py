@@ -49,12 +49,10 @@ overrides still work:
 The dispatcher injects ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
 worker subprocess env so workers converge on the exact DB the dispatcher used
-to claim their task — even under unusual symlink or Docker layouts. For a
-linked-worktree task it also injects the internal
-``HERMES_KANBAN_GIT_COMMON_DIR`` pin resolved by the dispatcher. The Codex
-runtime uses that exact repository metadata directory as a narrow additional
-workspace-write root so the worker can commit without disabling its sandbox or
-network isolation.
+to claim their task — even under unusual symlink or Docker layouts. Linked
+worktree Git metadata is never made model-writable. Workers edit/test files and
+stage a structured completion request; the unsandboxed worker host validates
+the exact task/run/board/project/workspace/branch before committing locally.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -5352,6 +5350,159 @@ class HallucinatedCardsError(ValueError):
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+TRUSTED_GIT_COMPLETION_REQUEST_EVENT = "trusted_git_completion_requested"
+
+
+def stage_trusted_git_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Durably stage a worktree worker handoff for the trusted Git broker.
+
+    The model-facing tool process is intentionally unable to write shared Git
+    metadata. It records the requested completion while leaving the task and
+    run active. After the model turn returns, the unsandboxed Hermes worker
+    host validates the dispatcher's exact claim pins, commits locally, emits a
+    structured publisher contract, and parks the task for the separate trusted
+    publisher. A crash between staging and brokering leaves the run reclaimable
+    rather than falsely marking uncommitted work done.
+    """
+    if not _parents_satisfied(conn, task_id):
+        return False
+    requested_cards = [str(card) for card in (created_cards or []) if str(card)]
+    if requested_cards:
+        verified, phantom = _verify_created_cards(conn, task_id, requested_cards)
+        if phantom:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_hallucination",
+                    {"phantom_cards": phantom, "verified_cards": verified},
+                )
+            raise HallucinatedCardsError(phantom, task_id)
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["workspace_kind"] != "worktree":
+            return False
+        run_id = row["current_run_id"]
+        if run_id is None:
+            return False
+        if expected_run_id is not None and int(run_id) != int(expected_run_id):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            TRUSTED_GIT_COMPLETION_REQUEST_EVENT,
+            {
+                "contract": "hermes.trusted_git_completion_request.v1",
+                "result": result,
+                "summary": summary,
+                "metadata": metadata if isinstance(metadata, dict) else None,
+                "created_cards": requested_cards,
+            },
+            run_id=int(run_id),
+        )
+    return True
+
+
+def park_trusted_git_commit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    contract: dict[str, Any],
+    reason: str,
+    expected_run_id: int,
+    expected_claim_lock: str,
+) -> bool:
+    """Atomically record a broker commit and park its task for publishing.
+
+    The Git object is necessarily created before SQLite can describe it. This
+    transaction makes the durable publisher event and the blocked task state a
+    single compare-and-set, so a publisher can never observe one without the
+    other. The broker's commit trailer handles a host crash before this
+    transaction begins and makes the next invocation idempotent.
+    """
+    blocked_task = None
+    run_id: Optional[int] = None
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT status, current_run_id, claim_lock
+              FROM tasks
+             WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+            or row["claim_lock"] != expected_claim_lock
+        ):
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = 'capability',
+                   block_recurrences = 1
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+               AND claim_lock = ?
+            """,
+            (task_id, int(expected_run_id), expected_claim_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+        )
+        if run_id is None:
+            raise RuntimeError("active trusted Git handoff run could not be ended")
+        _append_event(conn, task_id, "trusted_local_commit", contract, run_id=run_id)
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": reason,
+                "kind": "capability",
+                "recurrences": 1,
+                "source_status": "ready",
+            },
+            run_id=run_id,
+        )
+        blocked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=blocked_task.assignee if blocked_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
+    return True
 
 
 def complete_task(
@@ -10794,20 +10945,28 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
-    # Never inherit another worker's repository authority from the long-lived
-    # parent process. A task receives this pin only when its own resolved
-    # workspace is a linked worktree below.
+    # This obsolete pin previously widened Codex's sandbox to a repository's
+    # shared .git directory. Always scrub it: Git mutation now belongs solely to
+    # the trusted post-turn broker, which derives authority from durable board
+    # state and the dispatcher's exact claim pins rather than a path env var.
     env.pop("HERMES_KANBAN_GIT_COMMON_DIR", None)
-    # A linked worktree keeps the task-local index plus shared refs/objects
-    # outside ``workspace``. Resolve that trusted path in the dispatcher that
-    # materialized the worktree, before the model-facing worker starts. The
-    # Codex app-server transport uses this exact pin as an additional
-    # workspace-write root; it never derives authority from model-authored
-    # files inside the checkout.
+    env.pop("HERMES_KANBAN_TRUSTED_REPO_ROOT", None)
+    env.pop("HERMES_KANBAN_PROJECT_ID", None)
     if task.workspace_kind == "worktree":
-        git_common_dir = _git_common_dir(Path(workspace))
-        if git_common_dir is not None and git_common_dir.is_dir():
-            env["HERMES_KANBAN_GIT_COMMON_DIR"] = str(git_common_dir)
+        common_dir = _git_common_dir(Path(workspace))
+        if common_dir is not None and common_dir.name == ".git":
+            repo_root = common_dir.parent.resolve(strict=False)
+            expected_workspace = repo_root / ".worktrees" / task.id
+            if Path(workspace).resolve(strict=False) == expected_workspace.resolve(
+                strict=False
+            ):
+                # Dispatcher-sealed identity for the post-turn broker. This is
+                # never a sandbox writable-root grant and it is insufficient
+                # without the dispatcher ContextVar plus exact task/run/claim
+                # validation. The worker can read it, but a child process cannot
+                # mutate its parent Hermes process environment.
+                env["HERMES_KANBAN_TRUSTED_REPO_ROOT"] = str(repo_root)
+                env["HERMES_KANBAN_PROJECT_ID"] = task.project_id or ""
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation

@@ -209,17 +209,10 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_board_and_assigned_repo_writable_roots(
+    def test_kanban_worker_never_grants_git_metadata_writable_roots(
         self, monkeypatch
     ):
-        """Codex-runtime Kanban workers need the board plus assigned Git repo.
-
-        A linked worktree stores its index under ``.git/worktrees/<task>`` and
-        commits/refs/objects under the repository's shared ``.git`` directory,
-        outside the worktree cwd.  The dispatcher pins that exact common dir;
-        the transport must pass it alongside the board roots while retaining
-        workspace-write mode and disabled network access.
-        """
+        """Worker-controlled env can never widen Codex into shared Git state."""
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -263,6 +256,7 @@ class TestSpawnEnvIsolation:
             "HERMES_KANBAN_GIT_COMMON_DIR",
             "/users/alice/projects/radulator/.git",
         )
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
@@ -273,12 +267,63 @@ class TestSpawnEnvIsolation:
         assert (
             "sandbox_workspace_write.writable_roots="
             '["/users/alice/.hermes/kanban/boards/smoke", '
-            '"/users/alice/.hermes/kanban/boards/smoke/workspaces", '
-            '"/users/alice/projects/radulator/.git"]'
+            '"/users/alice/.hermes/kanban/boards/smoke/workspaces"]'
             in cmd
         )
+        assert all("radulator/.git" not in part for part in cmd)
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+
+    def test_inherited_kanban_env_in_cron_context_grants_no_board_authority(
+        self, monkeypatch
+    ):
+        """A cron turn inside a worker must not inherit task sandbox grants."""
+        import subprocess
+        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = dict(kwargs.get("env") or {})
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/board/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", "/repo/.git")
+        monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", "/repo")
+        monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "p_radulator")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+
+        with non_dispatcher_owned_context():
+            client = cas.CodexAppServerClient(codex_bin="codex")
+            client._closed = True
+
+        assert all("sandbox_workspace_write.writable_roots" not in p for p in captured["cmd"])
+        assert "HERMES_KANBAN_TASK" not in captured["env"]
+        assert "HERMES_KANBAN_DB" not in captured["env"]
+        assert "HERMES_KANBAN_GIT_COMMON_DIR" not in captured["env"]
+        assert "HERMES_KANBAN_TRUSTED_REPO_ROOT" not in captured["env"]
+        assert "HERMES_KANBAN_PROJECT_ID" not in captured["env"]
 
     def test_kanban_writable_roots_are_deduplicated_and_never_include_fs_root(
         self, monkeypatch
@@ -316,6 +361,7 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "/board")
         monkeypatch.setenv("HERMES_KANBAN_ROOT", "/")
         monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", "relative/.git")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True

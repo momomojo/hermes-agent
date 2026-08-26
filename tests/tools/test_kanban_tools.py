@@ -132,6 +132,51 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_dispatcher_worktree_complete_stages_trusted_host_handoff(
+    worker_env, monkeypatch, tmp_path
+):
+    """Worktree completion must stay active until the host broker commits."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "repo" / ".worktrees" / worker_env
+    workspace.mkdir(parents=True)
+    branch = f"wt/{worker_env}"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? WHERE id=?",
+                (str(workspace), branch, worker_env),
+            )
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(task.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_BRANCH", branch)
+
+    out = json.loads(kt._handle_complete({"summary": "edits and tests done"}))
+
+    assert out["ok"] is True
+    assert out["handoff"] == "pending_trusted_local_commit"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"
+        staged = [
+            event
+            for event in kb.list_events(conn, worker_env)
+            if event.kind == kb.TRUSTED_GIT_COMPLETION_REQUEST_EVENT
+        ]
+        assert len(staged) == 1
+        assert staged[0].run_id == task.current_run_id
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
