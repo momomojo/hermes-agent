@@ -63,6 +63,9 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_GIT_COMMON_DIR", "/stale/parent/repository/.git"
+    )
 
     from hermes_cli import kanban_db as kb
 
@@ -75,5 +78,88 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
     assert captured["cwd"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert "HERMES_KANBAN_GIT_COMMON_DIR" not in captured["env"]
 
 
+def test_linked_worktree_spawn_pins_exact_git_common_dir(monkeypatch, tmp_path):
+    """The trusted dispatcher exports the repo metadata root for Codex.
+
+    A linked worktree's visible ``.git`` is a file and the actual writable Git
+    metadata lives outside the task cwd.  The dispatcher, which materializes
+    and owns the task worktree, resolves that shared directory before spawn so
+    the model-facing transport never has to trust a workspace-authored path.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    root.joinpath("config.yaml").write_text(
+        "toolsets:\n  - kanban\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Hermes Test"],
+        check=True,
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    workspace = repo / ".worktrees" / "t_git"
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "worktree", "add", "-qb", "wt/t_git",
+            str(workspace),
+        ],
+        check=True,
+    )
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured: dict = {}
+    real_popen = subprocess.Popen
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "git":
+            return real_popen(cmd, *args, **kwargs)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    task = kb.Task(
+        id="t_git",
+        title="git metadata pin",
+        body=None,
+        assignee="w",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="worktree",
+        workspace_path=str(workspace),
+        claim_lock="lock",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=1,
+        branch_name="wt/t_git",
+    )
+
+    kb._default_spawn(task, str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_GIT_COMMON_DIR"] == str(
+        (repo / ".git").resolve()
+    )

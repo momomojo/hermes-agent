@@ -32,6 +32,55 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def _kanban_writable_roots(env: dict[str, str]) -> list[str]:
+    """Return the narrow host paths a dispatcher-owned worker must mutate.
+
+    The task workspace itself is already Codex's cwd and therefore writable in
+    ``workspace-write`` mode.  Board state and a linked worktree's shared Git
+    metadata live outside that cwd, so the trusted dispatcher pins those paths
+    in environment variables before the worker starts.  Normalize and
+    deduplicate them here, rejecting relative paths and filesystem roots so a
+    malformed deployment setting cannot widen the sandbox to the whole host.
+    """
+    kanban_db = (env.get("HERMES_KANBAN_DB") or "").strip()
+    legacy_root = (env.get("HERMES_KANBAN_ROOT") or "").strip()
+    if kanban_db:
+        board_root = os.path.dirname(kanban_db)
+    elif legacy_root:
+        board_root = legacy_root
+    else:
+        board_root = os.path.join(
+            env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "kanban",
+        )
+
+    candidates = (
+        board_root,
+        env.get("HERMES_KANBAN_WORKSPACES_ROOT", ""),
+        legacy_root,
+        env.get("HERMES_KANBAN_GIT_COMMON_DIR", ""),
+    )
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        expanded = os.path.expanduser(raw)
+        if not os.path.isabs(expanded):
+            continue
+        normalized = os.path.realpath(os.path.normpath(expanded))
+        # ``dirname('/') == '/'`` (and likewise for a Windows drive root).
+        if os.path.dirname(normalized) == normalized:
+            continue
+        key = os.path.normcase(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(normalized)
+    return roots
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -94,30 +143,22 @@ class CodexAppServerClient:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
+        # Kanban workers must be able to write their handoff/status back to the
+        # board DB. Linked Git worktrees also keep their index, refs, objects,
+        # and logs under the repository's shared .git directory, outside the
+        # task cwd. Keep the Codex sandbox and network isolation on, while
+        # granting only the dispatcher-pinned board and assigned-repo roots.
+        # Without the Git root, workers can test/edit but cannot commit or
+        # publish; without the board root, their lifecycle handoff fails.
         if spawn_env.get("HERMES_KANBAN_TASK"):
-            kanban_db = spawn_env.get("HERMES_KANBAN_DB")
-            kanban_root = (
-                os.path.dirname(kanban_db)
-                if kanban_db
-                else spawn_env.get(
-                    "HERMES_KANBAN_ROOT",
-                    os.path.join(
-                        spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                        "kanban",
-                    ),
-                )
-            )
+            writable_roots = _kanban_writable_roots(spawn_env)
             app_server_args.extend(
                 [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
+                    "sandbox_workspace_write.writable_roots="
+                    + json.dumps(writable_roots),
                     "-c",
                     "sandbox_workspace_write.network_access=false",
                 ]

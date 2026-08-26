@@ -48,9 +48,13 @@ overrides still work:
 
 The dispatcher injects ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+worker subprocess env so workers converge on the exact DB the dispatcher used
+to claim their task — even under unusual symlink or Docker layouts. For a
+linked-worktree task it also injects the internal
+``HERMES_KANBAN_GIT_COMMON_DIR`` pin resolved by the dispatcher. The Codex
+runtime uses that exact repository metadata directory as a narrow additional
+workspace-write root so the worker can commit without disabling its sandbox or
+network isolation.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -10790,6 +10794,20 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Never inherit another worker's repository authority from the long-lived
+    # parent process. A task receives this pin only when its own resolved
+    # workspace is a linked worktree below.
+    env.pop("HERMES_KANBAN_GIT_COMMON_DIR", None)
+    # A linked worktree keeps the task-local index plus shared refs/objects
+    # outside ``workspace``. Resolve that trusted path in the dispatcher that
+    # materialized the worktree, before the model-facing worker starts. The
+    # Codex app-server transport uses this exact pin as an additional
+    # workspace-write root; it never derives authority from model-authored
+    # files inside the checkout.
+    if task.workspace_kind == "worktree":
+        git_common_dir = _git_common_dir(Path(workspace))
+        if git_common_dir is not None and git_common_dir.is_dir():
+            env["HERMES_KANBAN_GIT_COMMON_DIR"] = str(git_common_dir)
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation

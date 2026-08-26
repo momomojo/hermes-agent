@@ -209,11 +209,16 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
+    def test_kanban_worker_adds_board_and_assigned_repo_writable_roots(
+        self, monkeypatch
+    ):
+        """Codex-runtime Kanban workers need the board plus assigned Git repo.
+
+        A linked worktree stores its index under ``.git/worktrees/<task>`` and
+        commits/refs/objects under the repository's shared ``.git`` directory,
+        outside the worktree cwd.  The dispatcher pins that exact common dir;
+        the transport must pass it alongside the board roots while retaining
+        workspace-write mode and disabled network access.
         """
         import subprocess
         from agent.transports import codex_app_server as cas
@@ -250,6 +255,14 @@ class TestSpawnEnvIsolation:
             "HERMES_KANBAN_DB",
             "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
         )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "/users/alice/.hermes/kanban/boards/smoke/workspaces",
+        )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_GIT_COMMON_DIR",
+            "/users/alice/projects/radulator/.git",
+        )
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
@@ -258,11 +271,62 @@ class TestSpawnEnvIsolation:
         assert cmd[:2] == ["codex", "app-server"]
         assert 'sandbox_mode="workspace-write"' in cmd
         assert (
-            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
+            "sandbox_workspace_write.writable_roots="
+            '["/users/alice/.hermes/kanban/boards/smoke", '
+            '"/users/alice/.hermes/kanban/boards/smoke/workspaces", '
+            '"/users/alice/projects/radulator/.git"]'
             in cmd
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+
+    def test_kanban_writable_roots_are_deduplicated_and_never_include_fs_root(
+        self, monkeypatch
+    ):
+        """A malformed path pin must not silently grant filesystem-wide writes."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/board/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "/board")
+        monkeypatch.setenv("HERMES_KANBAN_ROOT", "/")
+        monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", "relative/.git")
+
+        client = cas.CodexAppServerClient(codex_bin="codex")
+        client._closed = True
+
+        writable = next(
+            part for part in captured["cmd"]
+            if part.startswith("sandbox_workspace_write.writable_roots=")
+        )
+        assert writable == 'sandbox_workspace_write.writable_roots=["/board"]'
+        assert '"/"' not in writable
+        assert "relative" not in writable
 
 
 class TestSpawnEnvSecretStripping:
@@ -339,4 +403,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-
