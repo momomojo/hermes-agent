@@ -1,6 +1,6 @@
 name: CI
 
-# Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
+# Canonical orchestrator workflow. Runs ``detect-changes`` once, then conditionally
 # calls the sub-workflows that a PR can actually affect. A final
 # ``all-checks-pass`` gate job aggregates results so branch protection only
 # needs to require a single check.

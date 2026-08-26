@@ -820,12 +820,16 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        # Borrow through the pool contract, attach the callback, then return
+        # the connection so search_messages can actually reuse the traced
+        # reader. Calling _get_read_conn() directly strands its descriptor
+        # permit and forces the search onto an untraced second connection.
+        with db._read_ctx() as read_conn:
+            if read_conn is not db._conn:
+                traced_connections.append(read_conn)
+            for conn in traced_connections:
+                conn.set_trace_callback(statements.append)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)

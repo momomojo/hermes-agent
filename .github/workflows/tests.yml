@@ -91,10 +91,14 @@ jobs:
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
+        # `uv venv` step is needed. Tests forbid lazy installs, so the SDK
+        # extras exercised by the suite must be present before collection.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev
+          command: >-
+            uv sync --locked --python 3.11 --extra all --extra dev
+            --extra anthropic --extra mistral --extra fal --extra modal
+            --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
@@ -205,10 +209,14 @@ jobs:
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
+        # `uv venv` step is needed. Tests forbid lazy installs, so the SDK
+        # extras exercised by the suite must be present before collection.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev
+          command: >-
+            uv sync --locked --python 3.11 --extra all --extra dev
+            --extra anthropic --extra mistral --extra fal --extra modal
+            --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
