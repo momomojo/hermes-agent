@@ -759,6 +759,40 @@ def _run_linux_sandbox(command, worker):
         )
 
 
+def _linux_socket_denial_probe_code(probes):
+    """Return a probe where denial at socket creation or connect is success."""
+    literal_probes = tuple((int(family), address) for family, address in probes)
+    source = (
+        "import socket,sys\n"
+        "escaped=False\n"
+        f"for family,address in {literal_probes!r}:\n"
+        " s=None\n"
+        " try:\n"
+        "  s=socket.socket(family, socket.SOCK_STREAM); s.settimeout(1)\n"
+        "  s.connect(address)\n"
+        " except OSError: pass\n"
+        " else: escaped=True\n"
+        " finally:\n"
+        "  if s is not None: s.close()\n"
+        "sys.exit(1 if escaped else 0)"
+    )
+    compile(source, "<linux-socket-denial-probe>", "exec")
+    return source
+
+
+def test_linux_socket_probe_accepts_seccomp_denial_at_socket_creation(monkeypatch):
+    fake_socket = MagicMock()
+    fake_socket.SOCK_STREAM = socket.SOCK_STREAM
+    fake_socket.socket.side_effect = PermissionError(1, "Operation not permitted")
+    monkeypatch.setitem(sys.modules, "socket", fake_socket)
+    code = _linux_socket_denial_probe_code(((socket.AF_UNIX, "/blocked"),))
+
+    with pytest.raises(SystemExit) as exit_info:
+        exec(code, {})
+
+    assert exit_info.value.code == 0
+
+
 @pytest.mark.skipif(
     platform.system() != "Linux" or shutil.which("bwrap") is None,
     reason="Linux bubblewrap integration",
@@ -801,16 +835,11 @@ def test_linux_sandbox_cannot_connect_to_host_ip_or_abstract_socket(worker):
         tcp_port = tcp_listener.getsockname()[1]
         abstract_listener.bind(abstract_address)
         abstract_listener.listen(1)
-        code = (
-            "import socket,sys; escaped=False\n"
-            f"for family,address in ((socket.AF_INET, ('127.0.0.1', {tcp_port})), "
-            f"(socket.AF_UNIX, {abstract_address!r})):\n"
-            " s=socket.socket(family, socket.SOCK_STREAM); s.settimeout(1)\n"
-            " try: s.connect(address)\n"
-            " except OSError: pass\n"
-            " else: escaped=True\n"
-            " s.close()\n"
-            "sys.exit(1 if escaped else 0)"
+        code = _linux_socket_denial_probe_code(
+            (
+                (socket.AF_INET, ("127.0.0.1", tcp_port)),
+                (socket.AF_UNIX, abstract_address),
+            )
         )
         completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
@@ -838,11 +867,8 @@ def test_linux_sandbox_cannot_connect_to_host_runtime_socket(worker, socket_dir)
     try:
         listener.bind(str(socket_path))
         listener.listen(1)
-        code = (
-            "import socket,sys; s=socket.socket(socket.AF_UNIX); "
-            f"\ntry: s.connect({str(socket_path)!r})\n"
-            "except OSError: sys.exit(0)\n"
-            "else: sys.exit(1)"
+        code = _linux_socket_denial_probe_code(
+            ((socket.AF_UNIX, str(socket_path)),)
         )
         completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
@@ -866,12 +892,8 @@ def test_linux_sandbox_cannot_connect_to_host_run_socket(worker):
     try:
         listener.bind(str(socket_path))
         listener.listen(1)
-        code = (
-            "import socket,sys; "
-            "s=socket.socket(socket.AF_UNIX); "
-            f"\ntry: s.connect({str(socket_path)!r})\n"
-            "except OSError: sys.exit(0)\n"
-            "else: sys.exit(1)"
+        code = _linux_socket_denial_probe_code(
+            ((socket.AF_UNIX, str(socket_path)),)
         )
         completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
         assert completed.returncode == 0, completed.stderr
@@ -906,11 +928,8 @@ def test_linux_sandbox_cannot_connect_to_accessible_container_daemon(worker):
     if daemon_socket is None:
         pytest.skip("no accessible Docker/Podman control socket on this host")
 
-    code = (
-        "import socket,sys; s=socket.socket(socket.AF_UNIX); "
-        f"\ntry: s.connect({str(daemon_socket)!r})\n"
-        "except OSError: sys.exit(0)\n"
-        "else: sys.exit(1)"
+    code = _linux_socket_denial_probe_code(
+        ((socket.AF_UNIX, str(daemon_socket)),)
     )
     completed = _run_linux_sandbox([sys.executable, "-c", code], worker)
     assert completed.returncode == 0, completed.stderr
