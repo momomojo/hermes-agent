@@ -82,6 +82,32 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert "HERMES_KANBAN_TRUSTED_REPO_ROOT" not in captured["env"]
 
 
+def test_publisher_opt_in_is_pinned_from_dispatcher_before_profile_switch(
+    monkeypatch, tmp_path
+):
+    """A named worker's config cannot override the board dispatcher's opt-in."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text(
+        "kanban:\n  trusted_publisher_enabled: true\n", encoding="utf-8"
+    )
+    profile.joinpath("config.yaml").write_text(
+        "kanban:\n  trusted_publisher_enabled: false\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", "stale")
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
+
+    assert captured["env"]["HERMES_HOME"] == str(profile)
+    assert captured["env"]["HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED"] == "1"
+
+
 def test_linked_worktree_spawn_never_exports_git_common_dir(monkeypatch, tmp_path):
     """The model-facing worker never receives shared Git path authority."""
     root = tmp_path / ".hermes"

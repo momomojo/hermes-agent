@@ -171,22 +171,18 @@ def test_broker_commits_only_exact_task_branch_and_emits_publish_contract(
     }
 
 
-def test_trusted_publisher_is_default_false_and_requires_exact_boolean(monkeypatch):
+def test_trusted_publisher_is_default_false_and_requires_dispatcher_pin(monkeypatch):
     from hermes_cli.config_defaults import DEFAULT_CONFIG
-    from hermes_cli import config, kanban_git_broker as broker
+    from hermes_cli import kanban_git_broker as broker
 
     assert DEFAULT_CONFIG["kanban"]["trusted_publisher_enabled"] is False
-    monkeypatch.setattr(
-        config,
-        "load_config_readonly",
-        lambda: {"kanban": {"trusted_publisher_enabled": "true"}},
-    )
+    monkeypatch.delenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", raising=False)
     assert broker._trusted_publisher_enabled() is False
-    monkeypatch.setattr(
-        config,
-        "load_config_readonly",
-        lambda: {"kanban": {"trusted_publisher_enabled": True}},
-    )
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", "true")
+    assert broker._trusted_publisher_enabled() is False
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", "0")
+    assert broker._trusted_publisher_enabled() is False
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", "1")
     assert broker._trusted_publisher_enabled() is True
 
 

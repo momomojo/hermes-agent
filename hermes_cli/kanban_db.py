@@ -10951,6 +10951,26 @@ def _default_spawn(
     for key in _VAR_MAP:
         env.pop(key, None)
 
+    # Resolve deployment policy while HERMES_HOME still names the board-owning
+    # dispatcher. Named workers are re-homed to their assignee profile below;
+    # reading config in the post-turn broker would therefore consult the wrong
+    # profile. Always overwrite stale inherited values with an exact 1/0 pin.
+    from agent.delegation_context import TRUSTED_PUBLISHER_POLICY_ENV
+    from hermes_cli.config import load_config_readonly
+
+    dispatcher_config = load_config_readonly()
+    dispatcher_kanban = (
+        dispatcher_config.get("kanban")
+        if isinstance(dispatcher_config, dict)
+        else None
+    )
+    env[TRUSTED_PUBLISHER_POLICY_ENV] = (
+        "1"
+        if isinstance(dispatcher_kanban, dict)
+        and dispatcher_kanban.get("trusted_publisher_enabled") is True
+        else "0"
+    )
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's

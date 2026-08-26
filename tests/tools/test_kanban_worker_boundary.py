@@ -125,6 +125,62 @@ def scratch_worker(tmp_path, monkeypatch):
     return workspace
 
 
+def _claimed_non_git_worker(tmp_path, monkeypatch, *, workspace_kind: str, legacy: bool):
+    """Create an exact live non-Git assignment outside the managed task-id root."""
+    from hermes_cli import kanban_db as kb
+
+    db_path = tmp_path / "board" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    conn = kb.connect(db_path=db_path)
+    workspace = tmp_path / ("legacy-explicit" if legacy else "durable-dir")
+    workspace.mkdir()
+    task_id = kb.create_task(
+        conn,
+        title=f"{workspace_kind} worker",
+        initial_status="blocked",
+        workspace_kind=workspace_kind,
+        workspace_path=str(workspace),
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    claimed = kb.claim_task(conn, task_id, claimer=f"host:{workspace_kind}:claim")
+    assert claimed is not None
+    conn.close()
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(claimed.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    workspaces_root = tmp_path / "workspaces"
+    workspaces_root.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspaces_root))
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    for name in (
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_PROJECT_ID",
+        "HERMES_KANBAN_TRUSTED_REPO_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return workspace
+
+
+@pytest.fixture
+def dir_worker(tmp_path, monkeypatch):
+    return _claimed_non_git_worker(
+        tmp_path, monkeypatch, workspace_kind="dir", legacy=False
+    )
+
+
+@pytest.fixture
+def legacy_scratch_worker(tmp_path, monkeypatch):
+    return _claimed_non_git_worker(
+        tmp_path, monkeypatch, workspace_kind="scratch", legacy=True
+    )
+
+
 def _run_terminal(
     command: str,
     workspace: Path,
@@ -300,6 +356,39 @@ def test_claimed_scratch_worker_can_run_foreground_terminal(scratch_worker):
     assert result.get("status") != "blocked"
     env.execute.assert_called_once()
     assert boundaries == [scratch_worker.resolve()]
+
+
+@pytest.mark.parametrize("fixture_name", ["dir_worker", "legacy_scratch_worker"])
+def test_durable_nonstandard_workspace_can_write_and_run_terminal(
+    fixture_name, request
+):
+    from tools.file_tools import write_file_tool
+
+    workspace = request.getfixturevalue(fixture_name)
+    write_result = json.loads(write_file_tool("result.txt", "durable output\n"))
+    terminal_result, env, boundaries = _run_terminal("python -m pytest -q", workspace)
+
+    assert not write_result.get("error")
+    assert (workspace / "result.txt").read_text(encoding="utf-8") == "durable output\n"
+    assert terminal_result.get("status") != "blocked"
+    env.execute.assert_called_once()
+    assert boundaries == [workspace.resolve()]
+
+
+def test_durable_nonstandard_workspace_rejects_worker_supplied_path(
+    dir_worker, monkeypatch, tmp_path
+):
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(attacker))
+    monkeypatch.setenv("TERMINAL_CWD", str(attacker))
+
+    result, env, boundaries = _run_terminal("python -m pytest -q", attacker)
+
+    assert result["status"] == "blocked"
+    assert "stale/confused-deputy" in result["error"]
+    env.execute.assert_not_called()
+    assert boundaries == []
 
 
 @pytest.mark.parametrize("env_type", ["ssh", "docker"])
@@ -493,8 +582,9 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
 
     hermes_home = tmp_path / "profiles" / "radulator"
     hermes_home.mkdir(parents=True)
-    secret = hermes_home / ".env"
-    secret.write_text("GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8")
+    (hermes_home / ".env").write_text(
+        "GITHUB_TOKEN=must-not-enter-model\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     with (
         patch("tools.kanban_worker_boundary.platform.system", return_value="Linux"),
@@ -506,21 +596,62 @@ def test_linux_bubblewrap_is_read_only_except_workspace_and_private_temp(
     assert argv[0] == "/usr/bin/bwrap"
     assert "--unshare-net" in argv
     assert "--unshare-pid" in argv
-    assert f"--ro-bind\0/\0/" in joined
+    assert f"--ro-bind\0/\0/" not in joined
     assert "--tmpfs\0/run" in joined
+    assert "--tmpfs\0/tmp" in joined
+    assert "--tmpfs\0/var/tmp" in joined
+    assert f"--tmpfs\0{Path.home().resolve()}" in joined
     assert f"--bind\0{worker.resolve()}\0{worker.resolve()}" in joined
     assert (
         f"--ro-bind\0{(worker / '.git').resolve()}\0{(worker / '.git').resolve()}"
         in joined
     )
     assert f"--ro-bind\0" in joined
-    assert f"\0{secret.resolve()}" in joined
     masked_targets = {
         Path(argv[index + 2]).resolve(strict=False)
         for index, value in enumerate(argv[:-2])
         if value == "--ro-bind"
     }
     assert hermes_home.resolve() not in masked_targets
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap integration",
+)
+@pytest.mark.parametrize(
+    "socket_dir",
+    [Path("/tmp"), Path("/var/tmp"), Path.home()],
+    ids=["tmp", "var-tmp", "home"],
+)
+def test_linux_sandbox_cannot_connect_to_host_runtime_socket(worker, socket_dir):
+    """Host control sockets outside /run must disappear from the worker."""
+    from tools.kanban_worker_boundary import local_sandbox_argv
+
+    if not socket_dir.is_dir() or not os.access(socket_dir, os.W_OK):
+        pytest.skip(f"socket fixture directory is not writable: {socket_dir}")
+    socket_path = socket_dir / f"hermes-kanban-{os.getpid()}.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(socket_path))
+        listener.listen(1)
+        code = (
+            "import socket,sys; s=socket.socket(socket.AF_UNIX); "
+            f"\ntry: s.connect({str(socket_path)!r})\n"
+            "except OSError: sys.exit(0)\n"
+            "else: sys.exit(1)"
+        )
+        argv = local_sandbox_argv([sys.executable, "-c", code], worker)
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if completed.returncode not in (0, 1) and (
+            "Operation not permitted" in completed.stderr
+            or "No permissions" in completed.stderr
+        ):
+            pytest.skip("bubblewrap is installed but user namespaces are unavailable")
+        assert completed.returncode == 0, completed.stderr
+    finally:
+        listener.close()
+        socket_path.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(

@@ -1756,6 +1756,21 @@ class LocalEnvironment(BaseEnvironment):
             # Force forward slashes so the same string serves both contexts.
             return str(cache_dir).replace("\\", "/")
 
+        # A dispatcher worker's later command runs with host /tmp and $HOME
+        # hidden by the OS sandbox. Put the shell snapshot/cwd artifacts in the
+        # same exact task/run-bound temp mount that the sandbox rebinds, so the
+        # worker does not need visibility into any shared host temp directory.
+        try:
+            from tools.kanban_worker_boundary import (
+                _worker_temp_root,
+                assigned_workspace,
+            )
+
+            if (worker_workspace := assigned_workspace()) is not None:
+                return str(_worker_temp_root(worker_workspace))
+        except (OSError, RuntimeError):
+            pass
+
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):

@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import sqlite3
+import sys
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -106,6 +107,30 @@ def _live_assignment(
     ):
         return None
 
+    # Durable ``dir`` and legacy explicit ``scratch`` paths are supported, but
+    # a board row must never turn its own database or a known credential store
+    # into the model's writable workspace.  This is host-state validation, not
+    # trust in a worker-provided path: ``stored_workspace`` and ``db_path`` were
+    # both read back from the exact live board claim above.
+    try:
+        if stored_workspace == Path("/"):
+            return None
+        db_path.relative_to(stored_workspace)
+    except ValueError:
+        pass
+    else:
+        return None
+    try:
+        sensitive_paths = _credential_read_paths(stored_workspace)
+    except (OSError, RuntimeError, WorkerSandboxUnavailable):
+        return None
+    for sensitive in sensitive_paths:
+        try:
+            sensitive.relative_to(stored_workspace)
+        except ValueError:
+            continue
+        return None
+
     branch = str(os.environ.get("HERMES_KANBAN_BRANCH") or "").strip()
     sealed_repo = str(
         os.environ.get("HERMES_KANBAN_TRUSTED_REPO_ROOT") or ""
@@ -137,11 +162,20 @@ def _live_assignment(
             return None
         return _LiveAssignment(stored_workspace, "worktree")
 
-    if workspace_kind == "scratch":
-        # Scratch tasks deliberately have no Git/project authority. A stale
+    if workspace_kind in {"scratch", "dir"}:
+        # Non-Git tasks deliberately have no Git/project authority. A stale
         # worktree seal inherited into one is a confused-deputy condition.
         if branch or sealed_repo or "HERMES_KANBAN_PROJECT_ID" in os.environ:
             return None
+        if durable_branch:
+            return None
+        if workspace_kind == "dir":
+            return _LiveAssignment(stored_workspace, "dir")
+
+        # The current scratch layout is exactly <managed-root>/<task-id>. Keep
+        # that sibling isolation. Older durable tasks may carry an explicit
+        # absolute path outside the managed root; resolve_workspace() preserves
+        # those by design, so the exact live DB path is their authority.
         raw_root = str(
             os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT") or ""
         ).strip()
@@ -151,7 +185,11 @@ def _live_assignment(
             root = Path(raw_root).expanduser().resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
             return None
-        if stored_workspace.parent != root or stored_workspace.name != task_id:
+        try:
+            relative = stored_workspace.relative_to(root)
+        except ValueError:
+            relative = None
+        if relative is not None and relative.parts != (task_id,):
             return None
         return _LiveAssignment(stored_workspace, "scratch")
     return None
@@ -346,32 +384,68 @@ def _seatbelt_profile(workspace: Path, temp_root: Path) -> str:
     return " ".join(rules)
 
 
-def _bubblewrap_read_masks(temp_root: Path, workspace: Path) -> list[str]:
-    """Mask existing host credential paths inside a read-only root bind."""
-    empty_dir = temp_root / ".masked-credential-dir"
-    empty_file = temp_root / ".masked-credential-file"
-    empty_dir.mkdir(mode=0o700, exist_ok=True)
-    empty_file.touch(mode=0o600, exist_ok=True)
+def _bubblewrap_read_masks(workspace: Path) -> list[str]:
+    """Mask exact host credential paths that lie in an exposed system tree."""
     args: list[str] = []
     for sensitive in _credential_read_paths(workspace):
         try:
             if sensitive.is_dir():
-                source = empty_dir
+                args.extend(("--tmpfs", str(sensitive)))
             elif sensitive.exists():
-                source = empty_file
+                args.extend(("--ro-bind", "/dev/null", str(sensitive)))
             else:
                 continue
         except OSError:
             continue
-        args.extend(("--ro-bind", str(source), str(sensitive)))
     return args
+
+
+def _bubblewrap_system_roots() -> tuple[tuple[Path, Path], ...]:
+    """Return the small immutable host view needed to execute local tools."""
+    candidates = (
+        Path("/usr"),
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/usr/local"),
+        Path("/opt"),
+        Path("/etc"),
+        Path("/nix/store"),
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+    )
+    roots: list[tuple[Path, Path]] = []
+    seen: set[tuple[Path, Path]] = set()
+    for candidate in candidates:
+        try:
+            if not candidate.exists():
+                continue
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        destination = candidate
+        pair = (resolved, destination)
+        if resolved == Path("/") or pair in seen:
+            continue
+        # Avoid redundant identity mounts below an already exposed immutable
+        # tree, but preserve merged-/usr aliases such as /bin -> /usr/bin: the
+        # empty sandbox root does not otherwise contain the alias path.
+        if destination == resolved and any(
+            resolved == source or resolved.is_relative_to(source)
+            for source, _target in roots
+        ):
+            continue
+        seen.add(pair)
+        roots.append(pair)
+    return tuple(roots)
 
 
 def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
     """Wrap argv in a real local filesystem+network sandbox.
 
-    macOS uses Seatbelt. Linux uses bubblewrap with a read-only host root and
-    only the exact task workspace plus private task temp rebound writable.
+    macOS uses Seatbelt. Linux uses bubblewrap with a minimal immutable system
+    view and only the exact task workspace plus private task temp writable.
     Unsupported hosts fail closed instead of falling back to command parsing.
     """
     exact_workspace = workspace.expanduser().resolve(strict=True)
@@ -402,24 +476,28 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
             "--new-session",
             "--unshare-net",
             "--unshare-pid",
-            "--ro-bind",
-            "/",
-            "/",
-            # AF_UNIX sockets ignore network namespaces. Replace the host's
-            # runtime directory so Docker/systemd/Podman and similar daemon
-            # sockets under /run (and /var/run -> /run) are unreachable.
-            "--tmpfs",
-            "/run",
         ]
-        try:
-            if Path("/var/run").exists() and (
-                Path("/var/run").resolve() != Path("/run").resolve()
-            ):
-                args.extend(("--tmpfs", "/var/run"))
-        except OSError:
-            # If the alias cannot be proven to resolve into the already-masked
-            # /run tree, mask it independently.
-            args.extend(("--tmpfs", "/var/run"))
+        # Do not bind host /. AF_UNIX ignores network namespaces, so a
+        # read-only full-root view still exposes control sockets anywhere on
+        # the host. Bind only immutable executable/runtime trees; /run, /tmp,
+        # /var/tmp, and the user's home are private empty mounts.
+        private_roots = (Path("/run"), Path("/tmp"), Path("/var/tmp"), Path.home())
+        seen_private: set[Path] = set()
+        for private_root in private_roots:
+            if private_root == Path("/") or private_root in seen_private:
+                continue
+            try:
+                private_root.relative_to(exact_workspace)
+            except ValueError:
+                pass
+            else:
+                raise WorkerSandboxUnavailable(
+                    "assigned workspace is too broad for private runtime isolation"
+                )
+            seen_private.add(private_root)
+            args.extend(("--tmpfs", str(private_root)))
+        for system_source, system_target in _bubblewrap_system_roots():
+            args.extend(("--ro-bind", str(system_source), str(system_target)))
         args.extend([
             "--bind",
             str(exact_workspace),
@@ -429,14 +507,14 @@ def local_sandbox_argv(argv: Sequence[str], workspace: Path) -> list[str]:
         if git_metadata.exists():
             args.extend(("--ro-bind", str(git_metadata), str(git_metadata)))
         args.extend([
-            *_bubblewrap_read_masks(temp_root, exact_workspace),
-            "--bind",
-            str(temp_root),
-            str(temp_root),
             "--proc",
             "/proc",
             "--dev",
             "/dev",
+            *_bubblewrap_read_masks(exact_workspace),
+            "--bind",
+            str(temp_root),
+            str(temp_root),
             "--setenv",
             "HOME",
             str(temp_root),

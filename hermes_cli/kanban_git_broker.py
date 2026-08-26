@@ -14,7 +14,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from agent.delegation_context import is_dispatcher_owned_worker_context
+from agent.delegation_context import (
+    TRUSTED_PUBLISHER_POLICY_ENV,
+    is_dispatcher_owned_worker_context,
+)
 from hermes_cli import kanban_db as kb
 
 PUBLISH_CONTRACT = "hermes.trusted_local_commit.v1"
@@ -42,15 +45,8 @@ class BrokerRejected(RuntimeError):
 
 
 def _trusted_publisher_enabled() -> bool:
-    """Return the explicit deployment-specific publisher opt-in."""
-    from hermes_cli.config import load_config_readonly
-
-    config = load_config_readonly()
-    kanban = config.get("kanban") if isinstance(config, dict) else None
-    return (
-        isinstance(kanban, dict)
-        and kanban.get("trusted_publisher_enabled") is True
-    )
+    """Return the dispatcher-resolved deployment opt-in sealed at spawn."""
+    return os.environ.get(TRUSTED_PUBLISHER_POLICY_ENV) == "1"
 
 
 def _base_git_env() -> dict[str, str]:
