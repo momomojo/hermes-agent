@@ -153,11 +153,16 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_origin = migrated.execute(
+            "SELECT creation_origin FROM tasks WHERE id = 'legacy'"
+        ).fetchone()["creation_origin"]
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "creation_origin" in task_columns
+    assert legacy_origin == "legacy"
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes

@@ -135,6 +135,12 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_CREATION_ORIGINS = {
+    "internal",
+    "legacy",
+    "model_tool",
+    "trusted_cli",
+}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1075,6 +1081,11 @@ class Task:
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
+    # Host-selected creation surface. Model-facing kanban_create hardcodes
+    # ``model_tool`` and does not accept this value from its arguments; the
+    # trusted CLI hardcodes ``trusted_cli``. Legacy rows are migrated to
+    # ``legacy`` so no-agent consumers can reject an origin they did not mint.
+    creation_origin: str = "legacy"
     # Unified non-success counter. Incremented on any of:
     #   * spawn failure (dispatcher couldn't launch the worker)
     #   * timed_out outcome (worker exceeded max_runtime_seconds)
@@ -1177,6 +1188,11 @@ class Task:
             tenant=row["tenant"] if "tenant" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            creation_origin=(
+                row["creation_origin"]
+                if "creation_origin" in keys and row["creation_origin"]
+                else "legacy"
+            ),
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
@@ -1341,6 +1357,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
+    -- Host-selected creation surface. Model tools cannot supply this field.
+    -- Existing rows migrate to 'legacy' so trusted consumers fail closed.
+    creation_origin      TEXT NOT NULL DEFAULT 'legacy',
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
@@ -2549,6 +2568,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "creation_origin" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "creation_origin",
+            "creation_origin TEXT NOT NULL DEFAULT 'legacy'",
+        )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3165,6 +3191,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
+    creation_origin: str = "internal",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
@@ -3229,6 +3256,12 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    creation_origin = str(creation_origin or "").strip()
+    if creation_origin not in VALID_TASK_CREATION_ORIGINS:
+        raise ValueError(
+            "creation_origin must be one of "
+            f"{sorted(VALID_TASK_CREATION_ORIGINS)}, got {creation_origin!r}"
+        )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3495,13 +3528,14 @@ def create_task(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
+                        created_by, creation_origin, created_at,
+                        workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3511,6 +3545,7 @@ def create_task(
                         task_status,
                         priority,
                         created_by,
+                        creation_origin,
                         now,
                         workspace_kind,
                         workspace_path,

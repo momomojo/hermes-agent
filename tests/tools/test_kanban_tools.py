@@ -446,6 +446,7 @@ def test_create_happy_path(worker_env):
         "title": "child task",
         "assignee": "peer",
         "parents": [worker_env],
+        "creation_origin": "trusted_cli",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -457,6 +458,7 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+        assert child.creation_origin == "model_tool"
     finally:
         conn.close()
 

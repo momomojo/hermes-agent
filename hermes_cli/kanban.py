@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shlex
@@ -42,6 +43,8 @@ _STATUS_ICONS = {
     "archived": "—",
 }
 
+KANBAN_TASK_READBACK_CONTRACT = "hermes.kanban_task_readback.v1"
+
 
 def _fmt_ts(ts: Optional[int]) -> str:
     if not ts:
@@ -58,9 +61,15 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
+        "readback_contract": KANBAN_TASK_READBACK_CONTRACT,
         "id": t.id,
         "title": t.title,
         "body": t.body,
+        "body_sha256": (
+            hashlib.sha256(t.body.encode("utf-8")).hexdigest()
+            if t.body is not None
+            else None
+        ),
         "assignee": t.assignee,
         "status": t.status,
         "priority": t.priority,
@@ -70,14 +79,18 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
+        "creation_origin": t.creation_origin,
         "created_at": t.created_at,
         "started_at": t.started_at,
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "idempotency_key": t.idempotency_key,
+        "max_runtime_seconds": t.max_runtime_seconds,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "reasoning_effort": t.reasoning_effort,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -1569,6 +1582,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
+            creation_origin="trusted_cli",
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
@@ -1702,6 +1716,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        idempotency_task_ids: list[str] = []
+        if task.idempotency_key:
+            idempotency_task_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' ORDER BY id",
+                    (task.idempotency_key,),
+                ).fetchall()
+            ]
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1712,6 +1736,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "idempotency_readback": {
+                "key": task.idempotency_key,
+                "active_match_count": len(idempotency_task_ids),
+                "active_task_ids": idempotency_task_ids,
+            },
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
