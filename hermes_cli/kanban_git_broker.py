@@ -49,6 +49,15 @@ def _trusted_publisher_enabled() -> bool:
     return os.environ.get(TRUSTED_PUBLISHER_POLICY_ENV) == "1"
 
 
+def _dedicated_broker_enabled() -> bool:
+    """Resolve the exact-bool global ownership switch without env authority."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly() or {}
+    kanban = config.get("kanban") if isinstance(config, dict) else None
+    return isinstance(kanban, dict) and kanban.get("dedicated_broker_enabled") is True
+
+
 def _base_git_env() -> dict[str, str]:
     # Git is strictly local here. Build a small allowlist instead of copying
     # the long-lived Hermes process env: stale worker GIT_* overrides,
@@ -339,6 +348,8 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
     a deterministic failure marker; inherited cron/delegation contexts receive
     no mutation at all.
     """
+    if _dedicated_broker_enabled():
+        return {"outcome": "dedicated_broker_owned"}
     if not is_dispatcher_owned_worker_context():
         return {"outcome": "not_dispatcher_worker"}
     if os.environ.get("HERMES_SESSION_SOURCE") != "kanban":
@@ -494,7 +505,9 @@ def finalize_current_worker_git_handoff() -> dict[str, Any]:
                         current_run_id=run_id,
                     )
                     if reclaimed is None:
-                        raise BrokerRejected("worker produced no file changes to commit")
+                        raise BrokerRejected(
+                            "worker produced no file changes to commit"
+                        )
                     base_sha, head_sha, recovered_from_run_id = reclaimed
                 else:
                     base_sha, head_sha = recovered

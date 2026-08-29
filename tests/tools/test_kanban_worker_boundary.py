@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1073,7 +1074,8 @@ def test_macos_scratch_terminal_blocks_absolute_credentials_and_host_sockets(
     tcp_listener.bind(("127.0.0.1", 0))
     tcp_listener.listen(1)
     tcp_port = tcp_listener.getsockname()[1]
-    unix_path = tmp_path / "host-control.sock"
+    unix_socket_dir = Path(tempfile.mkdtemp(prefix="hkwb-", dir="/tmp"))
+    unix_path = unix_socket_dir / "control.sock"
     unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     unix_listener.bind(str(unix_path))
     unix_listener.listen(1)
@@ -1108,6 +1110,7 @@ def test_macos_scratch_terminal_blocks_absolute_credentials_and_host_sockets(
         tcp_listener.close()
         unix_listener.close()
         unix_path.unlink(missing_ok=True)
+        unix_socket_dir.rmdir()
 
     assert completed["returncode"] == 0, completed.get("output")
 

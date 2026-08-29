@@ -2587,6 +2587,18 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Use a separately installed, dedicated-OS-identity Kanban broker for
+        # authoritative task seals and local Git commits.  This remains off in
+        # upstream Hermes: enabling it without the matching launchd service,
+        # ownership boundary, and canaries must fail closed rather than
+        # silently falling back to same-user authority files.
+        "dedicated_broker_enabled": False,
+        # Surface configs are installed for distinct no-agent identities and
+        # remain unset upstream. Enabling without the current identity's exact
+        # client config fails closed; no legacy DB/key fallback is permitted.
+        "dedicated_broker_controller_client_config": None,
+        "dedicated_broker_publisher_client_config": None,
+        "dedicated_broker_operator_client_config": None,
         # Only installations with a separately installed trusted publisher
         # may park local broker commits for that publisher. Upstream Hermes
         # completes locally by default so ordinary worktree tasks cannot be

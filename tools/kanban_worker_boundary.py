@@ -20,6 +20,7 @@ from agent.delegation_context import is_dispatcher_owned_worker_context
 
 
 WORKER_GIT_SECURITY_BOUNDARY = "hermes.worker_git_isolation.v1"
+DEDICATED_BROKER_SECURITY_BOUNDARY = "hermes.dedicated_broker_identity.v1"
 
 
 _LOCAL_SANDBOX_WORKSPACE: ContextVar[Path | None] = ContextVar(
@@ -159,6 +160,40 @@ def _live_assignment(
     env_workspace: Path,
 ) -> _LiveAssignment | None:
     """Read back the durable claim so a reclaimed process loses authority."""
+    if (
+        os.environ.get("HERMES_KANBAN_DEDICATED_BOUNDARY")
+        == DEDICATED_BROKER_SECURITY_BOUNDARY
+    ):
+        # Dedicated workers are one-shot child processes launched by the
+        # model-UID reverse listener.  They never receive the broker-private
+        # database or HMAC key.  This marker grants no host authority: it only
+        # turns on the restrictive file/terminal sandbox for the exact
+        # .git-free workspace selected in the parent process environment.
+        # Delegate/cron contexts are already rejected by _boundary_expected(),
+        # and any model-spawned descendant remains inside the same OS sandbox.
+        raw_root = str(
+            os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT") or ""
+        ).strip()
+        expected_lock = f"dedicated:{task_id}:{run_id}:{env_workspace.name}"
+        if not raw_root or claim_lock != expected_lock:
+            return None
+        try:
+            root = Path(raw_root).expanduser().resolve(strict=True)
+            terminal_cwd = Path(
+                str(os.environ.get("TERMINAL_CWD") or "")
+            ).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if env_workspace.parent != root or terminal_cwd != env_workspace:
+            return None
+        try:
+            entries = list(env_workspace.iterdir())
+        except OSError:
+            return None
+        if any(entry.name.casefold() == ".git" for entry in entries):
+            return None
+        return _LiveAssignment(env_workspace, "broker_workspace")
+
     raw_db = str(os.environ.get("HERMES_KANBAN_DB") or "").strip()
     board = str(os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
     if not raw_db or not board:

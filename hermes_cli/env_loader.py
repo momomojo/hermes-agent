@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import io
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -81,6 +82,56 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "COPILOT_CLI_PATH",
     "COPILOT_ACP_BASE_URL",
 })
+
+_KANBAN_GITHUB_DENIED_POLICY = "github-denied-v1"
+_KANBAN_CONFIG_KEY_RE = re.compile(
+    r"^\s*(?:export\s+)?[\"']?([A-Za-z_][A-Za-z0-9_.-]*)[\"']?\s*[:=]"
+)
+_KANBAN_GITHUB_CREDENTIAL_MATERIAL_RE = re.compile(
+    r"(?i)(?:github_pat_|gh[pousr]_|https?://[^/\s:@]+:[^@\s]+@github\.com)"
+)
+
+
+def _is_kanban_github_credential_key(name: str) -> bool:
+    normalized = str(name).strip().upper().replace("-", "_").replace(".", "_")
+    return (
+        normalized.startswith("GH_")
+        or normalized.startswith("GITHUB_")
+        or normalized.startswith("COPILOT_")
+        or normalized
+        in {
+            "GIT_ASKPASS",
+            "GIT_CREDENTIAL_HELPER",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "SSH_ASKPASS",
+            "SSH_AUTH_SOCK",
+        }
+    )
+
+
+def _kanban_env_github_credential_finding(path: Path) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                match = _KANBAN_CONFIG_KEY_RE.match(line)
+                if match and _is_kanban_github_credential_key(match.group(1)):
+                    return "key"
+                if _KANBAN_GITHUB_CREDENTIAL_MATERIAL_RE.search(line):
+                    return "material"
+    except OSError as exc:
+        raise RuntimeError(
+            "dedicated worker credential configuration is unreadable"
+        ) from exc
+    return None
+
+
+def _scrub_kanban_github_credential_env() -> None:
+    for name, value in list(os.environ.items()):
+        if _is_kanban_github_credential_key(
+            name
+        ) or _KANBAN_GITHUB_CREDENTIAL_MATERIAL_RE.search(value):
+            os.environ.pop(name, None)
 
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
@@ -485,10 +536,18 @@ def load_hermes_dotenv(
       dependencies into the process that replaces that same environment.
     """
     loaded: list[Path] = []
+    dedicated_worker = (
+        os.environ.get("HERMES_KANBAN_CREDENTIAL_POLICY")
+        == _KANBAN_GITHUB_DENIED_POLICY
+    )
+    if dedicated_worker:
+        _scrub_kanban_github_credential_env()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
-    project_env_path = Path(project_env) if project_env else None
+    project_env_path = (
+        None if dedicated_worker else (Path(project_env) if project_env else None)
+    )
 
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
     if user_env.exists():
@@ -497,6 +556,16 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
+        if dedicated_worker:
+            finding = _kanban_env_github_credential_finding(user_env)
+            if finding == "key":
+                raise RuntimeError(
+                    "dedicated worker profile contains a GitHub credential key"
+                )
+            if finding == "material":
+                raise RuntimeError(
+                    "dedicated worker profile contains GitHub credential material"
+                )
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
@@ -514,7 +583,11 @@ def load_hermes_dotenv(
     # in their gateway unit, which takes precedence (override=False below
     # ensures .op.env never clobbers a token already in the environment).
     op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+    if (
+        not dedicated_worker
+        and op_env.exists()
+        and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")
+    ):
         _load_dotenv_with_fallback(op_env, override=False)
 
     if project_env_path and project_env_path.exists():
@@ -534,9 +607,14 @@ def load_hermes_dotenv(
     # resolution is unnecessary for the updater.
     from hermes_cli import _early_recovery
 
-    if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
+    if (
+        not dedicated_worker
+        and load_external_secrets
+        and not _early_recovery._should_skip_external_secret_sources()
+    ):
         _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    if not dedicated_worker:
+        _apply_managed_env()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -551,6 +629,9 @@ def load_hermes_dotenv(
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
     _reapply_terminal_config_bridge(home_path)
+
+    if dedicated_worker:
+        _scrub_kanban_github_credential_env()
 
     return loaded
 
