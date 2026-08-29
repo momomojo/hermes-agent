@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -61,6 +63,20 @@ class TestMaybeApplyCodexAppServerRuntime:
             model_cfg={"openai_runtime": "codex_app_server"},
         )
         assert got == "codex_app_server"
+
+    def test_dispatcher_worker_keeps_hermes_sandboxed_runtime(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+
+        got = _maybe_apply_codex_app_server_runtime(
+            provider="openai",
+            api_mode="codex_responses",
+            model_cfg={"openai_runtime": "codex_app_server"},
+        )
+
+        assert got == "codex_responses"
 
 
 
@@ -209,13 +225,43 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
-    def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
-        """Codex-runtime Kanban workers need to write board state outside
-        their scratch/worktree workspace, but should not fall back to
-        danger-full-access. Hermes passes a narrow app-server config override
-        for the Kanban root only.
-        """
+    def test_kanban_worker_cannot_spawn_codex_app_server(
+        self, monkeypatch
+    ):
+        """Codex's own shell cannot bypass the Hermes worker sandbox."""
         import subprocess
+        from agent.transports import codex_app_server as cas
+
+        popen = MagicMock(side_effect=AssertionError("must not spawn Codex"))
+        monkeypatch.setattr(subprocess, "Popen", popen)
+        monkeypatch.setenv("HOME", "/users/alice")
+        monkeypatch.setenv("HERMES_HOME", "/users/alice/.hermes/profiles/backend-worker")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
+        )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "/users/alice/.hermes/kanban/boards/smoke/workspaces",
+        )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_GIT_COMMON_DIR",
+            "/users/alice/projects/radulator/.git",
+        )
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+
+        with pytest.raises(RuntimeError, match="disabled for dispatcher-owned"):
+            cas.CodexAppServerClient(codex_bin="codex")
+
+        popen.assert_not_called()
+
+    def test_inherited_kanban_env_in_cron_context_grants_no_board_authority(
+        self, monkeypatch
+    ):
+        """A cron turn inside a worker must not inherit task sandbox grants."""
+        import subprocess
+        from agent.delegation_context import non_dispatcher_owned_context
         from agent.transports import codex_app_server as cas
 
         captured = {}
@@ -223,7 +269,7 @@ class TestSpawnEnvIsolation:
         class FakePopen:
             def __init__(self, cmd, *args, **kwargs):
                 captured["cmd"] = list(cmd)
-                captured["env"] = kwargs.get("env", {}).copy()
+                captured["env"] = dict(kwargs.get("env") or {})
                 self.stdin = None
                 self.stdout = None
                 self.stderr = None
@@ -243,26 +289,44 @@ class TestSpawnEnvIsolation:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
-        monkeypatch.setenv("HOME", "/users/alice")
-        monkeypatch.setenv("HERMES_HOME", "/users/alice/.hermes/profiles/backend-worker")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/board/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", "/repo/.git")
+        monkeypatch.setenv("HERMES_KANBAN_TRUSTED_REPO_ROOT", "/repo")
+        monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "p_radulator")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+
+        with non_dispatcher_owned_context():
+            client = cas.CodexAppServerClient(codex_bin="codex")
+            client._closed = True
+
+        assert all("sandbox_workspace_write.writable_roots" not in p for p in captured["cmd"])
+        assert "HERMES_KANBAN_TASK" not in captured["env"]
+        assert "HERMES_KANBAN_DB" not in captured["env"]
+        assert "HERMES_KANBAN_GIT_COMMON_DIR" not in captured["env"]
+        assert "HERMES_KANBAN_TRUSTED_REPO_ROOT" not in captured["env"]
+        assert "HERMES_KANBAN_PROJECT_ID" not in captured["env"]
+
+    def test_kanban_worker_never_grants_board_or_legacy_roots(
+        self, monkeypatch
+    ):
+        """A malformed path pin must not silently grant filesystem-wide writes."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        popen = MagicMock(side_effect=AssertionError("must not spawn Codex"))
+        monkeypatch.setattr(subprocess, "Popen", popen)
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
-        monkeypatch.setenv(
-            "HERMES_KANBAN_DB",
-            "/users/alice/.hermes/kanban/boards/smoke/kanban.db",
-        )
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/board/kanban.db")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "/board")
+        monkeypatch.setenv("HERMES_KANBAN_ROOT", "/")
+        monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", "relative/.git")
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
 
-        client = cas.CodexAppServerClient(codex_bin="codex")
-        client._closed = True
+        with pytest.raises(RuntimeError, match="disabled for dispatcher-owned"):
+            cas.CodexAppServerClient(codex_bin="codex")
 
-        cmd = captured["cmd"]
-        assert cmd[:2] == ["codex", "app-server"]
-        assert 'sandbox_mode="workspace-write"' in cmd
-        assert (
-            'sandbox_workspace_write.writable_roots=["/users/alice/.hermes/kanban/boards/smoke"]'
-            in cmd
-        )
-        assert "sandbox_workspace_write.network_access=false" in cmd
-        assert all("danger" not in part for part in cmd)
+        popen.assert_not_called()
 
 
 class TestSpawnEnvSecretStripping:
@@ -315,6 +379,7 @@ class TestSpawnEnvSecretStripping:
     def test_tier1_and_internal_secrets_stripped_from_spawn_env(self, monkeypatch):
         for var, val in {
             "GH_TOKEN": "ghp-secret",
+            "GITHUB_TOKEN": "github-secret",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "MODAL_TOKEN_SECRET": "modal-secret",
             "HERMES_DASHBOARD_SESSION_TOKEN": "dash-secret",
@@ -327,7 +392,7 @@ class TestSpawnEnvSecretStripping:
 
         env = self._capture_spawn_env(monkeypatch)
         for var in (
-            "GH_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
+            "GH_TOKEN", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
             "HERMES_DASHBOARD_SESSION_TOKEN", "AUXILIARY_VISION_API_KEY",
             "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_ID", "GATEWAY_RELAY_DELIVERY_KEY",
         ):
@@ -339,4 +404,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

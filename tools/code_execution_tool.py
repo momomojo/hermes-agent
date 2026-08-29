@@ -1291,6 +1291,21 @@ def execute_code(
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
 
+    # execute_code is a sibling arbitrary-process surface, not a terminal()
+    # wrapper: Python can construct Git commands/paths dynamically and call
+    # subprocess/os.system without crossing the shell-text guards. Dispatcher
+    # workers retain bounded test execution through the kernel-sandboxed local
+    # terminal, so this path is unconditionally disabled for that context.
+    from tools.kanban_worker_boundary import execute_code_violation
+
+    if (worker_boundary_error := execute_code_violation()) is not None:
+        return json.dumps({
+            "status": "blocked",
+            "error": worker_boundary_error,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
     # here before either dispatch path spawns it. Runs synchronously in the

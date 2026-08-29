@@ -26,12 +26,17 @@ def test_finalize_single_query_releases_session_when_cleanup_fails(monkeypatch):
         "_notify_single_query_session_finalize",
         lambda _cli: calls.append("finalize"),
     )
+    monkeypatch.setattr(
+        cli,
+        "_finalize_kanban_git_handoff",
+        lambda: calls.append("trusted-git-handoff"),
+    )
     monkeypatch.setattr(cli, "_run_cleanup", cleanup)
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
         cli._finalize_single_query(fake_cli)
 
-    assert calls == ["finalize", "cleanup", "release"]
+    assert calls == ["trusted-git-handoff", "finalize", "cleanup", "release"]
 
 
 def test_finalize_single_query_runs_cleanup_when_finalize_hook_fails(monkeypatch):

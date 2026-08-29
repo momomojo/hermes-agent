@@ -765,6 +765,48 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            # Dispatcher-owned worktree workers never receive shared Git
+            # metadata write access. Their terminal completion tool records a
+            # durable request while the run stays active; after the model turn
+            # returns, the trusted Hermes host validates the exact claim,
+            # board/project/workspace/branch and performs the local commit.
+            # Orchestrators/manual completion and non-worktree tasks retain the
+            # established direct-completion path below.
+            if (
+                task is not None
+                and task.workspace_kind == "worktree"
+                and os.environ.get("HERMES_KANBAN_TASK") == tid
+                and os.environ.get("HERMES_SESSION_SOURCE") == "kanban"
+                and _is_dispatcher_owned_worker()
+            ):
+                try:
+                    staged = kb.stage_trusted_git_completion(
+                        conn,
+                        tid,
+                        result=result,
+                        summary=summary,
+                        metadata=metadata,
+                        created_cards=created_cards,
+                        expected_run_id=_worker_run_id(tid),
+                    )
+                except kb.HallucinatedCardsError as hall_err:
+                    return tool_error(
+                        "kanban_complete blocked: the following created_cards "
+                        "do not exist or were not created by this worker: "
+                        f"{', '.join(hall_err.phantom)}. Your task is still "
+                        "in-flight (no state change). Retry with corrected ids."
+                    )
+                if not staged:
+                    return tool_error(
+                        f"could not stage trusted Git completion for {tid} "
+                        "(claim/run/workspace mismatch)"
+                    )
+                return _ok(
+                    task_id=tid,
+                    run_id=_worker_run_id(tid),
+                    handoff="pending_trusted_local_commit",
+                )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -1386,6 +1428,18 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    # This is a model-facing tool. An explicit host path (or ``dir`` which
+    # resolves to the board's shared host directory) would let a worker mint a
+    # new durable authority row and trick a later dispatcher turn into granting
+    # write access to arbitrary same-UID state such as ~/.local/bin or
+    # LaunchAgents. Human-created durable dir/legacy tasks remain supported via
+    # the trusted CLI/dashboard paths, which bypass this module entirely.
+    if workspace_kind == "dir" or workspace_path is not None:
+        return tool_error(
+            "kanban_create refused: model-facing tools cannot mint a host "
+            "workspace grant. Use a scratch or project-linked task; create "
+            "durable dir/explicit-path tasks through the trusted CLI or dashboard."
+        )
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1460,6 +1514,7 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                creation_origin="model_tool",
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -2190,18 +2245,12 @@ KANBAN_CREATE_SCHEMA = {
             },
             "workspace_kind": {
                 "type": "string",
-                "enum": ["scratch", "dir", "worktree"],
+                "enum": ["scratch", "worktree"],
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
-                ),
-            },
-            "workspace_path": {
-                "type": "string",
-                "description": (
-                    "Absolute path for 'dir' or 'worktree' workspace. "
-                    "Relative paths are rejected at dispatch."
+                    "default) or 'worktree' (fresh task-local git worktree "
+                    "anchored by the board/project). Model-facing calls cannot "
+                    "create shared-directory or explicit-path grants."
                 ),
             },
             "project": {

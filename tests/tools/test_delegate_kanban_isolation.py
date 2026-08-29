@@ -147,7 +147,9 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "parent-workspace"))
+    monkeypatch.setenv("HERMES_KANBAN_GIT_COMMON_DIR", str(tmp_path / "repo" / ".git"))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+    monkeypatch.setenv("HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED", "1")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
 
     from agent.delegation_context import delegated_child_context
@@ -167,7 +169,9 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_RUN_ID" not in env
     assert "HERMES_KANBAN_DB" not in env
     assert "HERMES_KANBAN_WORKSPACE" not in env
+    assert "HERMES_KANBAN_GIT_COMMON_DIR" not in env
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+    assert "HERMES_KANBAN_TRUSTED_PUBLISHER_ENABLED" not in env
 
 
 def test_delegate_child_kanban_cli_cannot_delete_parent_board(

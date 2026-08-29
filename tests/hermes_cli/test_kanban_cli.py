@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import threading
@@ -68,6 +69,71 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert f"Task {child_id}: child task" in output
     assert f"parents:   {parent_id}" in output
     assert "Cannot operate on a closed database" not in output
+
+
+def test_kanban_show_json_exposes_exact_trusted_task_readback(kanban_home):
+    """A no-agent consumer can reject an idempotency-key collision exactly."""
+    body = "Pinned Radulator publisher prerequisite v1"
+    created = json.loads(
+        kc.run_slash(
+            "create 'publisher prerequisite' "
+            f"--body {body!r} "
+            "--assignee radulator --priority 17 "
+            "--idempotency-key radulator-publisher-prerequisite-v1 "
+            "--max-runtime 45m --created-by radulator-installer "
+            "--model qwen-local --provider custom "
+            "--initial-status blocked --json"
+        )
+    )
+
+    payload = json.loads(kc.run_slash(f"show {created['id']} --json"))
+    task = payload["task"]
+
+    assert task["readback_contract"] == "hermes.kanban_task_readback.v1"
+    assert task["idempotency_key"] == "radulator-publisher-prerequisite-v1"
+    assert task["body"] == body
+    assert task["body_sha256"] == hashlib.sha256(body.encode()).hexdigest()
+    assert task["created_by"] == "radulator-installer"
+    assert task["creation_origin"] == "trusted_cli"
+    assert task["workspace_kind"] == "scratch"
+    assert task["workspace_path"] is None
+    assert task["project_id"] is None
+    assert task["assignee"] == "radulator"
+    assert task["model_override"] == "qwen-local"
+    assert task["provider_override"] == "custom"
+    assert task["max_runtime_seconds"] == 45 * 60
+    assert task["priority"] == 17
+    assert task["status"] == "blocked"
+    assert payload["idempotency_readback"] == {
+        "key": "radulator-publisher-prerequisite-v1",
+        "active_match_count": 1,
+        "active_task_ids": [created["id"]],
+    }
+
+
+def test_kanban_show_json_exposes_idempotency_collision(kanban_home):
+    """A final readback must reveal every active row sharing the key."""
+    with kb.connect_closing() as conn:
+        first = kb.create_task(
+            conn,
+            title="expected prerequisite",
+            idempotency_key="publisher-prerequisite-v1",
+            creation_origin="trusted_cli",
+        )
+        conflicting = kb.create_task(conn, title="conflicting prerequisite")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                ("publisher-prerequisite-v1", conflicting),
+            )
+
+    payload = json.loads(kc.run_slash(f"show {first} --json"))
+
+    assert payload["idempotency_readback"] == {
+        "key": "publisher-prerequisite-v1",
+        "active_match_count": 2,
+        "active_task_ids": sorted([first, conflicting]),
+    }
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
@@ -177,5 +243,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-

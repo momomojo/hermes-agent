@@ -337,17 +337,24 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
             "print('KEY=' + os.environ.get('OPENAI_API_KEY', 'MISSING'))\n"
             "print('TOK=' + os.environ.get('ANTHROPIC_API_KEY', 'MISSING'))\n"
             "print('SEC=' + os.environ.get('GITHUB_TOKEN', 'MISSING'))\n"
+            "print('GH=' + os.environ.get('GH_TOKEN', 'MISSING'))\n"
         )
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "sk-should-not-leak",
             "ANTHROPIC_API_KEY": "ant-should-not-leak",
             "GITHUB_TOKEN": "ghp-should-not-leak",
+            "GH_TOKEN": "gh-alias-should-not-leak",
         }):
             result = self._run(code, mode="project")
         self.assertEqual(result["status"], "success")
-        for needle in ("KEY=MISSING", "TOK=MISSING", "SEC=MISSING"):
+        for needle in ("KEY=MISSING", "TOK=MISSING", "SEC=MISSING", "GH=MISSING"):
             self.assertIn(needle, result["output"])
-        for leaked in ("sk-should-not-leak", "ant-should-not-leak", "ghp-should-not-leak"):
+        for leaked in (
+            "sk-should-not-leak",
+            "ant-should-not-leak",
+            "ghp-should-not-leak",
+            "gh-alias-should-not-leak",
+        ):
             self.assertNotIn(leaked, result["output"])
 
     def test_secret_substrings_scrubbed_in_project_mode(self):

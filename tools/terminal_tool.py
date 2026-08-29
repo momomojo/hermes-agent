@@ -2661,6 +2661,25 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # A dispatcher worker may execute arbitrary interpreters/build tools,
+        # so shell-text inspection is not the isolation boundary. Require a
+        # real local OS filesystem+network sandbox before creating any backend;
+        # remote/SSH/container paths and detached background processes fail
+        # closed and therefore never receive credentials or network access.
+        from tools.kanban_worker_boundary import terminal_backend_violation
+
+        backend_boundary_error = terminal_backend_violation(
+            env_type,
+            background=background,
+        )
+        if backend_boundary_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": backend_boundary_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
@@ -2965,6 +2984,31 @@ def terminal_tool(
                     "exit_code": -1,
                     "error": workdir_error,
                     "status": "blocked"
+                }, ensure_ascii=False)
+
+        # Dispatcher worktree workers are model-facing even when their profile
+        # uses the ordinary Hermes local runtime rather than Codex app-server.
+        # Enforce the same Git/control-plane boundary before the user-bypassable
+        # approval layer; force=True can never grant commit/ref/config/publish.
+        if env_type == "local":
+            from tools.kanban_worker_boundary import terminal_violation
+
+            guard_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+            )
+            kanban_boundary_error = terminal_violation(command, guard_cwd)
+            if kanban_boundary_error:
+                logger.warning(
+                    "Blocked Kanban worker boundary crossing (command: %s)",
+                    _safe_command_preview(command),
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": kanban_boundary_error,
+                    "status": "blocked",
                 }, ensure_ascii=False)
 
         # Windows-only: NTFS locks loaded module files, so rewriting the local
@@ -3356,7 +3400,17 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    from tools.kanban_worker_boundary import (
+                        assigned_workspace,
+                        local_worker_sandbox,
+                    )
+
+                    worker_workspace = assigned_workspace()
+                    if worker_workspace is None:
+                        result = env.execute(command, **execute_kwargs)
+                    else:
+                        with local_worker_sandbox(worker_workspace):
+                            result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

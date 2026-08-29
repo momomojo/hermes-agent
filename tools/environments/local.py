@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -1294,9 +1295,11 @@ def _make_run_env(env: dict) -> dict:
     merged = dict(os.environ | env)
     run_env = {}
     for k, v in merged.items():
+        if k in _ALWAYS_STRIP_KEYS:
+            continue
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if real_key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
@@ -1754,6 +1757,21 @@ class LocalEnvironment(BaseEnvironment):
             # Force forward slashes so the same string serves both contexts.
             return str(cache_dir).replace("\\", "/")
 
+        # A dispatcher worker's later command runs with host /tmp and $HOME
+        # hidden by the OS sandbox. Put the shell snapshot/cwd artifacts in the
+        # same exact task/run-bound temp mount that the sandbox rebinds, so the
+        # worker does not need visibility into any shared host temp directory.
+        try:
+            from tools.kanban_worker_boundary import (
+                _worker_temp_root,
+                assigned_workspace,
+            )
+
+            if (worker_workspace := assigned_workspace()) is not None:
+                return str(_worker_temp_root(worker_workspace))
+        except (OSError, RuntimeError):
+            pass
+
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):
@@ -1792,6 +1810,19 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        # Dispatcher-owned Kanban commands enter this ContextVar only around
+        # the single foreground env.execute() call. Wrap the entire generated
+        # shell (snapshot restore, cwd tracking, model command, and children)
+        # in a kernel-enforced filesystem/network sandbox. Keeping this scoped
+        # avoids contaminating a reused LocalEnvironment or an in-process cron
+        # execution with stale worker authority.
+        from tools.kanban_worker_boundary import (
+            LocalSandboxLaunch,
+            current_local_sandbox_workspace,
+            local_sandbox_launch,
+        )
+
+        worker_workspace = current_local_sandbox_workspace()
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
@@ -1821,24 +1852,31 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_creationflags = windows_hide_flags() if _IS_WINDOWS else 0
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=_popen_cwd,
-            **_popen_kwargs,
+        sandbox_context = (
+            local_sandbox_launch(args, worker_workspace)
+            if worker_workspace is not None
+            else nullcontext(LocalSandboxLaunch(args))
         )
+        with sandbox_context as launch:
+            proc = subprocess.Popen(
+                launch.argv,
+                text=True,
+                env=run_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=_popen_cwd,
+                creationflags=_popen_creationflags,
+                pass_fds=launch.pass_fds,
+            )
         if not _IS_WINDOWS:
             try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
+                setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
             except ProcessLookupError:
                 pass
 

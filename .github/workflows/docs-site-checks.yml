@@ -19,6 +19,14 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
 
+      # Node 22 currently bundles npm 10, while website/package.json enforces
+      # npm >=11.17.0 under engine-strict. Pin the declared toolchain before
+      # npm ci so docs CI does not deterministically fail at dependency setup.
+      - name: Install required npm version
+        uses: ./.github/actions/retry
+        with:
+          command: npm install --global npm@11.17.0
+
       - name: Install website dependencies
         uses: ./.github/actions/retry
         with:

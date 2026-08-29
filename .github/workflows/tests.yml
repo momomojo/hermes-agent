@@ -48,7 +48,11 @@ jobs:
   test:
     name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
     needs: generate
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 AppArmor blocks Bubblewrap's unprivileged user namespace.
+    # Keep the real worker-boundary canaries mandatory on the supported 22.04
+    # image while unrelated slices continue to track ubuntu-latest.  We do not
+    # disable AppArmor, invoke bwrap through sudo, or weaken the sandbox.
+    runs-on: ${{ contains(matrix.slice.files, 'tests/tools/test_kanban_worker_boundary.py') && 'ubuntu-22.04' || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -91,15 +95,25 @@ jobs:
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
+        # `uv venv` step is needed. Tests forbid lazy installs, so the SDK
+        # extras exercised by the suite must be present before collection.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev
+          command: >-
+            uv sync --locked --python 3.11 --extra all --extra dev
+            --extra anthropic --extra mistral --extra fal --extra modal
+            --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
+
+      - name: Install bubblewrap for worker-boundary integration
+        if: contains(matrix.slice.files, 'tests/tools/test_kanban_worker_boundary.py')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
 
       - name: Run tests (slice ${{ matrix.slice.index }}/${{ inputs.slice_count }})
         # Per-file isolation via scripts/run_tests.sh: each test file runs
@@ -205,10 +219,14 @@ jobs:
         # `uv sync --locked` installs the exact pinned set from uv.lock (and
         # fails if the lock is out of sync with pyproject.toml), giving a
         # reproducible env. It also creates .venv itself, so no separate
-        # `uv venv` step is needed.
+        # `uv venv` step is needed. Tests forbid lazy installs, so the SDK
+        # extras exercised by the suite must be present before collection.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev
+          command: >-
+            uv sync --locked --python 3.11 --extra all --extra dev
+            --extra anthropic --extra mistral --extra fal --extra modal
+            --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to

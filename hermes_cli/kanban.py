@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shlex
+import stat
 import sys
 import time
 from pathlib import Path
@@ -42,6 +44,8 @@ _STATUS_ICONS = {
     "archived": "—",
 }
 
+KANBAN_TASK_READBACK_CONTRACT = "hermes.kanban_task_readback.v1"
+
 
 def _fmt_ts(ts: Optional[int]) -> str:
     if not ts:
@@ -58,9 +62,15 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
+        "readback_contract": KANBAN_TASK_READBACK_CONTRACT,
         "id": t.id,
         "title": t.title,
         "body": t.body,
+        "body_sha256": (
+            hashlib.sha256(t.body.encode("utf-8")).hexdigest()
+            if t.body is not None
+            else None
+        ),
         "assignee": t.assignee,
         "status": t.status,
         "priority": t.priority,
@@ -70,14 +80,20 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
+        "creation_origin": t.creation_origin,
         "created_at": t.created_at,
         "started_at": t.started_at,
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "idempotency_key": t.idempotency_key,
+        "max_runtime_seconds": t.max_runtime_seconds,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "reasoning_effort": t.reasoning_effort,
+        "goal_mode": bool(t.goal_mode),
+        "goal_max_turns": t.goal_max_turns,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -213,7 +229,11 @@ def _check_dispatcher_presence(
 # Argparse builder
 # ---------------------------------------------------------------------------
 
-def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+def build_parser(
+    parent_subparsers: argparse._SubParsersAction,
+    *,
+    include_host_authority: bool = True,
+) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
 
     Returns the top-level ``kanban`` parser so caller can ``set_defaults``.
@@ -380,6 +400,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Provider the --model belongs to (passed as "
                                "--provider <name> to the worker). Requires "
                                "--model.")
+    p_create.add_argument("--reasoning", default=None, dest="reasoning_effort",
+                          help="Pin the worker reasoning effort without changing "
+                               "the assignee profile default.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -393,6 +416,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--session-id", default=None,
+                          help="Exact originating session id (host controller use).")
+    p_create.add_argument("--workflow-template-id", default=None,
+                          help="Exact workflow template id (host controller use).")
+    p_create.add_argument("--current-step-key", default=None,
+                          help="Exact initial workflow step (host controller use).")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -400,6 +429,78 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # The signing controller is intentionally omitted from the AI-facing
+    # ``/kanban`` parser.  The real host CLI includes it, but a model can reach
+    # it only through the OS-sandboxed terminal where the board key and DB are
+    # unavailable.
+    if include_host_authority:
+        p_authority = sub.add_parser(
+            "authority", help="Manage no-agent host dispatch authority"
+        )
+        authority_sub = p_authority.add_subparsers(dest="authority_action")
+        p_authority_init = authority_sub.add_parser(
+            "init", help="Initialize the board-local signing capability"
+        )
+        p_authority_init.add_argument("--json", action="store_true")
+        p_trusted_create = sub.add_parser(
+            "trusted-create",
+            parents=[p_create],
+            add_help=False,
+            help="Create/reuse one exact host-sealed task prerequisite",
+        )
+        p_trusted_create.add_argument(
+            "--broker-repository",
+            default=None,
+            help="Dedicated broker repository id (required when its capability is on)",
+        )
+        # Keep the shared create parser's historical ``running`` default.  The
+        # dedicated handler translates that parser default to its broker-owned
+        # ``ready`` state rather than mutating the parent action (argparse
+        # shares parent Action objects across both subparsers).
+        p_broker_dispatch = sub.add_parser(
+            "broker-dispatch",
+            help="Dispatch one dedicated-broker task through the controller socket",
+        )
+        p_broker_dispatch.add_argument("task_id")
+        p_broker_dispatch.add_argument("--operation-id", required=True)
+        p_broker_dispatch.add_argument("--json", action="store_true")
+        p_broker_status = sub.add_parser(
+            "broker-dispatch-status",
+            help="Read one durable dedicated-broker dispatch operation",
+        )
+        p_broker_status.add_argument("--operation-id", required=True)
+        p_broker_status.add_argument("--json", action="store_true")
+        p_broker_export = sub.add_parser(
+            "broker-export",
+            help="Export one exact receipt bundle through the publisher socket",
+        )
+        p_broker_export.add_argument("--receipt-id", required=True)
+        p_broker_export.add_argument("--payload-sha256", required=True)
+        p_broker_export.add_argument("--json", action="store_true")
+        p_broker_ack = sub.add_parser(
+            "broker-ack",
+            help="Acknowledge one publisher-readback JSON object",
+        )
+        p_broker_ack.add_argument("--ack-json", type=Path, required=True)
+        p_broker_ack.add_argument("--json", action="store_true")
+        p_broker_refresh = sub.add_parser(
+            "broker-refresh",
+            help="Fast-forward a registered broker base from its trusted checkout",
+        )
+        p_broker_refresh.add_argument("--repository-id", required=True)
+        p_broker_refresh.add_argument("--expected-old-base-sha", required=True)
+        p_broker_refresh.add_argument("--json", action="store_true")
+        p_broker_register = sub.add_parser(
+            "broker-register",
+            help="Register a trusted checkout and exact GitHub publication policy",
+        )
+        p_broker_register.add_argument("--repository-id", required=True)
+        p_broker_register.add_argument("--source-path", type=Path, required=True)
+        p_broker_register.add_argument("--default-branch", required=True)
+        p_broker_register.add_argument("--project-id", default=None)
+        p_broker_register.add_argument("--remote-repository-json", type=Path, required=True)
+        p_broker_register.add_argument("--json", action="store_true")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -1050,6 +1151,32 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    dedicated_actions = {
+        "broker-dispatch": _cmd_broker_dispatch,
+        "broker-dispatch-status": _cmd_broker_dispatch_status,
+        "broker-export": _cmd_broker_export,
+        "broker-ack": _cmd_broker_ack,
+        "broker-refresh": _cmd_broker_refresh,
+        "broker-register": _cmd_broker_register,
+    }
+    if action == "trusted-create" or action in dedicated_actions:
+        from hermes_cli.kanban_broker_routing import dedicated_broker_enabled
+
+        if dedicated_broker_enabled():
+            handler = (
+                _cmd_dedicated_trusted_create
+                if action == "trusted-create"
+                else dedicated_actions[action]
+            )
+            try:
+                return int(handler(args) or 0)
+            except (ValueError, RuntimeError) as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
+        if action in dedicated_actions:
+            print("kanban: dedicated broker capability is not enabled", file=sys.stderr)
+            return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1107,7 +1234,9 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "authority": _cmd_authority,
             "create":   _cmd_create,
+            "trusted-create": _cmd_trusted_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1182,7 +1311,15 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
+    "authority",
     "create",
+    "trusted-create",
+    "broker-dispatch",
+    "broker-dispatch-status",
+    "broker-export",
+    "broker-ack",
+    "broker-refresh",
+    "broker-register",
     "swarm",
     "assign",
     "reclaim",
@@ -1569,6 +1706,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
+            creation_origin="trusted_cli",
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
@@ -1583,9 +1721,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
             initial_status=getattr(args, "initial_status", "running"),
+            session_id=getattr(args, "session_id", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1604,6 +1746,246 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_authority(args: argparse.Namespace) -> int:
+    """Initialize the host-only board authority; never exposed by run_slash."""
+    if getattr(args, "authority_action", None) != "init":
+        print("kanban authority: choose 'init'", file=sys.stderr)
+        return 2
+    from hermes_cli.kanban_authority import initialize_authority
+
+    with kb.connect_closing() as conn:
+        result = initialize_authority(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        state = "initialized" if result["initialized"] else "already initialized"
+        print(
+            f"Dispatch authority {state} "
+            f"({result['contract']}, key_id={result['key_id']})"
+        )
+    return 0
+
+
+def _emit_broker_result(result: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+
+
+def _cmd_dedicated_trusted_create(args: argparse.Namespace) -> int:
+    """Route the host trusted-create command exclusively through controller RPC."""
+
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.kanban_broker_routing import trusted_create
+
+    repository_id = getattr(args, "broker_repository", None)
+    if not repository_id:
+        raise ValueError(
+            "--broker-repository is required by the dedicated broker capability"
+        )
+    if getattr(args, "workspace", "scratch") != "scratch" or getattr(
+        args, "branch", None
+    ):
+        raise ValueError(
+            "dedicated broker workspaces and branches are broker-selected"
+        )
+    if getattr(args, "initial_status", "running") != "running":
+        raise ValueError(
+            "dedicated broker trusted-create always starts in broker-owned ready state"
+        )
+    if not getattr(args, "idempotency_key", None):
+        raise ValueError("dedicated broker trusted-create requires --idempotency-key")
+    max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    max_retries = getattr(args, "max_retries", None)
+    if max_retries is None:
+        config = load_config_readonly() or {}
+        kanban = config.get("kanban") if isinstance(config, dict) else {}
+        max_retries = int(
+            (kanban if isinstance(kanban, dict) else {}).get("failure_limit", 2)
+        )
+    if max_retries < 1:
+        raise ValueError("--max-retries must be >= 1")
+    board = getattr(args, "board", None) or kb.DEFAULT_BOARD
+    request = {
+        "contract": "hermes.kanban_trusted_create_request.v1",
+        "request_id": str(args.idempotency_key),
+        "board": board,
+        "repository_id": repository_id,
+        "idempotency_key": args.idempotency_key,
+        "title": args.title,
+        "body": args.body,
+        "assignee": args.assignee,
+        "created_by": args.created_by or "no-agent-host-controller",
+        "tenant": args.tenant,
+        "priority": args.priority,
+        "requested_initial_status": "ready",
+        "requested_workspace_kind": "broker_workspace",
+        "requested_workspace_path": None,
+        "requested_branch_name": None,
+        "requested_project_id": getattr(args, "project", None),
+        "requested_triage": bool(getattr(args, "triage", False)),
+        "parent_ids": list(args.parent or ()),
+        "max_runtime_seconds": max_runtime,
+        "skills": list(getattr(args, "skills", None) or ()),
+        "max_retries": max_retries,
+        "model_override": getattr(args, "model_override", None),
+        "provider_override": getattr(args, "provider_override", None),
+        "reasoning_effort": getattr(args, "reasoning_effort", None),
+        "goal_mode": bool(getattr(args, "goal_mode", False)),
+        "goal_max_turns": getattr(args, "goal_max_turns", None),
+        "session_id": getattr(args, "session_id", None),
+        "workflow_template_id": getattr(args, "workflow_template_id", None),
+        "current_step_key": getattr(args, "current_step_key", None),
+    }
+    result = trusted_create(request)
+    _emit_broker_result(result, as_json=bool(getattr(args, "json", False)))
+    return 0
+
+
+def _cmd_broker_dispatch(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import dispatch_task
+
+    result = dispatch_task(task_id=args.task_id, operation_id=args.operation_id)
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_broker_dispatch_status(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import dispatch_status
+
+    result = dispatch_status(operation_id=args.operation_id)
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_broker_export(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import export_bundle
+
+    result = export_bundle(
+        receipt_id=args.receipt_id,
+        payload_sha256=args.payload_sha256,
+    )
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _read_broker_json(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(Path(path), flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("broker JSON input must be a real file")
+        raw = os.read(fd, 1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("broker JSON input exceeds size limit")
+    finally:
+        os.close(fd)
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("broker JSON input must be an object")
+    return value
+
+
+def _cmd_broker_ack(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import acknowledge_publish
+
+    result = acknowledge_publish(_read_broker_json(args.ack_json))
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_broker_refresh(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import refresh_repository_base
+
+    result = refresh_repository_base(
+        repository_id=args.repository_id,
+        expected_old_base_sha=args.expected_old_base_sha,
+    )
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_broker_register(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_broker_routing import register_repository
+
+    result = register_repository(
+        {
+            "repository_id": args.repository_id,
+            "source_path": str(args.source_path),
+            "default_branch": args.default_branch,
+            "project_id": args.project_id,
+            "remote_repository": _read_broker_json(args.remote_repository_json),
+        }
+    )
+    _emit_broker_result(result, as_json=bool(args.json))
+    return 0
+
+
+def _cmd_trusted_create(args: argparse.Namespace) -> int:
+    """Create/reuse a signed task from the separate no-agent host surface."""
+    from hermes_cli.kanban_authority import trusted_create_task
+
+    try:
+        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        branch_name = _parse_branch_flag(getattr(args, "branch", None))
+    except argparse.ArgumentTypeError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if branch_name and ws_kind != "worktree":
+        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
+        return 2
+    try:
+        max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
+        return 2
+    max_retries = getattr(args, "max_retries", None)
+    if max_retries is not None and max_retries < 1:
+        print("kanban: --max-retries must be >= 1", file=sys.stderr)
+        return 2
+    board = kb.get_current_board()
+    with kb.connect_closing() as conn:
+        task_id, reused = trusted_create_task(
+            conn,
+            board=board,
+            title=args.title,
+            body=args.body,
+            assignee=args.assignee,
+            created_by=args.created_by or "no-agent-host-controller",
+            workspace_kind=ws_kind,
+            workspace_path=ws_path,
+            branch_name=branch_name,
+            project_id=getattr(args, "project", None),
+            tenant=args.tenant,
+            priority=args.priority,
+            parents=tuple(args.parent or ()),
+            triage=bool(getattr(args, "triage", False)),
+            idempotency_key=getattr(args, "idempotency_key", None),
+            max_runtime_seconds=max_runtime,
+            skills=getattr(args, "skills", None) or None,
+            max_retries=max_retries,
+            model_override=getattr(args, "model_override", None),
+            provider_override=getattr(args, "provider_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            goal_mode=bool(getattr(args, "goal_mode", False)),
+            goal_max_turns=getattr(args, "goal_max_turns", None),
+            initial_status=getattr(args, "initial_status", None) or "running",
+            session_id=getattr(args, "session_id", None),
+            workflow_template_id=getattr(args, "workflow_template_id", None),
+            current_step_key=getattr(args, "current_step_key", None),
+        )
+        task = kb.get_task(conn, task_id)
+    result = {**_task_to_dict(task), "reused": reused}
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        verb = "Reused" if reused else "Created"
+        print(f"{verb} sealed task {task_id}")
     return 0
 
 
@@ -1692,6 +2074,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         return 2
     graph = None
+    dispatch_authority = None
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1702,6 +2085,19 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        idempotency_task_ids: list[str] = []
+        if task.idempotency_key:
+            idempotency_task_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' ORDER BY id",
+                    (task.idempotency_key,),
+                ).fetchall()
+            ]
+        from hermes_cli.kanban_authority import verify_task_authority
+
+        dispatch_authority = verify_task_authority(conn, task.id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1712,6 +2108,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "dispatch_authority": dispatch_authority,
+            "idempotency_readback": {
+                "key": task.idempotency_key,
+                "active_match_count": len(idempotency_task_ids),
+                "active_task_ids": idempotency_task_ids,
+            },
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -3395,7 +3797,7 @@ def run_slash(rest: str) -> str:
     _wrap = argparse.ArgumentParser(prog="/kanban-wrap", add_help=False)
     _wrap.exit_on_error = False  # type: ignore[attr-defined]
     _top_sub = _wrap.add_subparsers(dest="_top")
-    kanban_parser = build_parser(_top_sub)
+    kanban_parser = build_parser(_top_sub, include_host_authority=False)
     kanban_parser.prog = "/kanban"
     kanban_parser.exit_on_error = False  # type: ignore[attr-defined]
     for _action in kanban_parser._actions:

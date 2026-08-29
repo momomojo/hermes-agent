@@ -48,9 +48,11 @@ overrides still work:
 
 The dispatcher injects ``HERMES_KANBAN_DB``,
 ``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+worker subprocess env so workers converge on the exact DB the dispatcher used
+to claim their task — even under unusual symlink or Docker layouts. Linked
+worktree Git metadata is never made model-writable. Workers edit/test files and
+stage a structured completion request; the unsandboxed worker host validates
+the exact task/run/board/project/workspace/branch before committing locally.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -133,6 +135,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_TASK_CREATION_ORIGINS = {
+    "host_sealed",
+    "internal",
+    "legacy",
+    "model_tool",
+    "trusted_cli",
+}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1073,6 +1082,11 @@ class Task:
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
+    # Host-selected creation surface. Model-facing kanban_create hardcodes
+    # ``model_tool`` and does not accept this value from its arguments; the
+    # trusted CLI hardcodes ``trusted_cli``. Legacy rows are migrated to
+    # ``legacy`` so no-agent consumers can reject an origin they did not mint.
+    creation_origin: str = "legacy"
     # Unified non-success counter. Incremented on any of:
     #   * spawn failure (dispatcher couldn't launch the worker)
     #   * timed_out outcome (worker exceeded max_runtime_seconds)
@@ -1175,6 +1189,11 @@ class Task:
             tenant=row["tenant"] if "tenant" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            creation_origin=(
+                row["creation_origin"]
+                if "creation_origin" in keys and row["creation_origin"]
+                else "legacy"
+            ),
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
@@ -1339,6 +1358,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
+    -- Host-selected creation surface. Model tools cannot supply this field.
+    -- Existing rows migrate to 'legacy' so trusted consumers fail closed.
+    creation_origin      TEXT NOT NULL DEFAULT 'legacy',
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
@@ -1430,6 +1452,23 @@ CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
     PRIMARY KEY (parent_id, child_id)
+);
+
+-- Host-only dispatch authority. The HMAC never leaves this board database;
+-- model/readback surfaces receive only receipt identity and verification
+-- metadata. A task row without a verified record here is never a trusted
+-- prerequisite, regardless of its human-readable creation_origin value.
+CREATE TABLE IF NOT EXISTS task_dispatch_authorities (
+    task_id             TEXT PRIMARY KEY,
+    contract            TEXT NOT NULL,
+    authority_id        TEXT NOT NULL UNIQUE,
+    key_id              TEXT NOT NULL,
+    payload_json        TEXT NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    receipt_hmac        BLOB NOT NULL,
+    sealed_at           INTEGER NOT NULL,
+    claim_generation    INTEGER NOT NULL DEFAULT 0,
+    last_claimed_run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -2547,6 +2586,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "creation_origin" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "creation_origin",
+            "creation_origin TEXT NOT NULL DEFAULT 'legacy'",
+        )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3163,6 +3209,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
+    creation_origin: str = "internal",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
@@ -3179,6 +3226,8 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3227,6 +3276,12 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    creation_origin = str(creation_origin or "").strip()
+    if creation_origin not in VALID_TASK_CREATION_ORIGINS:
+        raise ValueError(
+            "creation_origin must be one of "
+            f"{sorted(VALID_TASK_CREATION_ORIGINS)}, got {creation_origin!r}"
+        )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3493,13 +3548,15 @@ def create_task(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
+                        created_by, creation_origin, created_at,
+                        workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3509,6 +3566,7 @@ def create_task(
                         task_status,
                         priority,
                         created_by,
+                        creation_origin,
                         now,
                         workspace_kind,
                         workspace_path,
@@ -3525,6 +3583,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -4656,6 +4716,25 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        authority_task = get_task(conn, task_id)
+        requires_authority = bool(
+            authority_task is not None
+            and authority_task.creation_origin == "host_sealed"
+        )
+        authority_generation: int | None = None
+        if requires_authority:
+            from hermes_cli.kanban_authority import verify_task_authority
+
+            receipt = verify_task_authority(conn, task_id)
+            if receipt is None or not receipt["verified"]:
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "invalid_dispatch_authority"},
+                )
+                return None
+            authority_generation = int(receipt["claim_generation"])
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4717,6 +4796,18 @@ def claim_task(
             ),
         )
         run_id = run_cur.lastrowid
+        if requires_authority:
+            from hermes_cli.kanban_authority import consume_claim_authority
+
+            if not consume_claim_authority(
+                conn,
+                task_id,
+                int(run_id),
+                expected_generation=int(authority_generation),
+            ):
+                raise RuntimeError(
+                    "trusted dispatch authority CAS failed before worker access"
+                )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -5350,6 +5441,159 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+TRUSTED_GIT_COMPLETION_REQUEST_EVENT = "trusted_git_completion_requested"
+
+
+def stage_trusted_git_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Durably stage a worktree worker handoff for the trusted Git broker.
+
+    The model-facing tool process is intentionally unable to write shared Git
+    metadata. It records the requested completion while leaving the task and
+    run active. After the model turn returns, the unsandboxed Hermes worker
+    host validates the dispatcher's exact claim pins, commits locally, emits a
+    structured publisher contract, and parks the task for the separate trusted
+    publisher. A crash between staging and brokering leaves the run reclaimable
+    rather than falsely marking uncommitted work done.
+    """
+    if not _parents_satisfied(conn, task_id):
+        return False
+    requested_cards = [str(card) for card in (created_cards or []) if str(card)]
+    if requested_cards:
+        verified, phantom = _verify_created_cards(conn, task_id, requested_cards)
+        if phantom:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_hallucination",
+                    {"phantom_cards": phantom, "verified_cards": verified},
+                )
+            raise HallucinatedCardsError(phantom, task_id)
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["workspace_kind"] != "worktree":
+            return False
+        run_id = row["current_run_id"]
+        if run_id is None:
+            return False
+        if expected_run_id is not None and int(run_id) != int(expected_run_id):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            TRUSTED_GIT_COMPLETION_REQUEST_EVENT,
+            {
+                "contract": "hermes.trusted_git_completion_request.v1",
+                "result": result,
+                "summary": summary,
+                "metadata": metadata if isinstance(metadata, dict) else None,
+                "created_cards": requested_cards,
+            },
+            run_id=int(run_id),
+        )
+    return True
+
+
+def park_trusted_git_commit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    contract: dict[str, Any],
+    reason: str,
+    expected_run_id: int,
+    expected_claim_lock: str,
+) -> bool:
+    """Atomically record a broker commit and park its task for publishing.
+
+    The Git object is necessarily created before SQLite can describe it. This
+    transaction makes the durable publisher event and the blocked task state a
+    single compare-and-set, so a publisher can never observe one without the
+    other. The broker's commit trailer handles a host crash before this
+    transaction begins and makes the next invocation idempotent.
+    """
+    blocked_task = None
+    run_id: Optional[int] = None
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT status, current_run_id, claim_lock
+              FROM tasks
+             WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+            or row["claim_lock"] != expected_claim_lock
+        ):
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = 'capability',
+                   block_recurrences = 1
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+               AND claim_lock = ?
+            """,
+            (task_id, int(expected_run_id), expected_claim_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+        )
+        if run_id is None:
+            raise RuntimeError("active trusted Git handoff run could not be ended")
+        _append_event(conn, task_id, "trusted_local_commit", contract, run_id=run_id)
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": reason,
+                "kind": "capability",
+                "recurrences": 1,
+                "source_status": "ready",
+            },
+            run_id=run_id,
+        )
+        blocked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=blocked_task.assignee if blocked_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5359,6 +5603,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5393,6 +5638,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if expected_claim_lock is not None and expected_run_id is None:
+        raise ValueError("expected_claim_lock requires expected_run_id")
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5457,7 +5704,7 @@ def complete_task(
                 """,
                 (result, now, task_id),
             )
-        else:
+        elif expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5474,6 +5721,31 @@ def complete_task(
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND current_run_id = ?
+                   AND claim_lock = ?
+                """,
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id),
+                    expected_claim_lock,
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -10768,6 +11040,26 @@ def _default_spawn(
     for key in _VAR_MAP:
         env.pop(key, None)
 
+    # Resolve deployment policy while HERMES_HOME still names the board-owning
+    # dispatcher. Named workers are re-homed to their assignee profile below;
+    # reading config in the post-turn broker would therefore consult the wrong
+    # profile. Always overwrite stale inherited values with an exact 1/0 pin.
+    from agent.delegation_context import TRUSTED_PUBLISHER_POLICY_ENV
+    from hermes_cli.config import load_config_readonly
+
+    dispatcher_config = load_config_readonly()
+    dispatcher_kanban = (
+        dispatcher_config.get("kanban")
+        if isinstance(dispatcher_config, dict)
+        else None
+    )
+    env[TRUSTED_PUBLISHER_POLICY_ENV] = (
+        "1"
+        if isinstance(dispatcher_kanban, dict)
+        and dispatcher_kanban.get("trusted_publisher_enabled") is True
+        else "0"
+    )
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's
@@ -10790,6 +11082,28 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # This obsolete pin previously widened Codex's sandbox to a repository's
+    # shared .git directory. Always scrub it: Git mutation now belongs solely to
+    # the trusted post-turn broker, which derives authority from durable board
+    # state and the dispatcher's exact claim pins rather than a path env var.
+    env.pop("HERMES_KANBAN_GIT_COMMON_DIR", None)
+    env.pop("HERMES_KANBAN_TRUSTED_REPO_ROOT", None)
+    env.pop("HERMES_KANBAN_PROJECT_ID", None)
+    if task.workspace_kind == "worktree":
+        common_dir = _git_common_dir(Path(workspace))
+        if common_dir is not None and common_dir.name == ".git":
+            repo_root = common_dir.parent.resolve(strict=False)
+            expected_workspace = repo_root / ".worktrees" / task.id
+            if Path(workspace).resolve(strict=False) == expected_workspace.resolve(
+                strict=False
+            ):
+                # Dispatcher-sealed identity for the post-turn broker. This is
+                # never a sandbox writable-root grant and it is insufficient
+                # without the dispatcher ContextVar plus exact task/run/claim
+                # validation. The worker can read it, but a child process cannot
+                # mutate its parent Hermes process environment.
+                env["HERMES_KANBAN_TRUSTED_REPO_ROOT"] = str(repo_root)
+                env["HERMES_KANBAN_PROJECT_ID"] = task.project_id or ""
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation

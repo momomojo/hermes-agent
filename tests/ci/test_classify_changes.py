@@ -279,6 +279,51 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     assert referenced - declared == set(), "job(s) gate on an output detect never declares"
 
 
+def test_docs_workflow_installs_declared_npm_before_dependency_install():
+    """Node 22 bundles npm 10, but the website manifest is engine-strict >=11.17."""
+    workflow = _yaml(".github/workflows/docs-site-checks.yml")
+    steps = workflow["jobs"]["docs-site-checks"]["steps"]
+    commands = [
+        str((step.get("with") or {}).get("command") or "")
+        for step in steps
+    ]
+    npm_toolchain = next(
+        index
+        for index, command in enumerate(commands)
+        if "npm install --global npm@11.17.0" in command
+    )
+    npm_ci = next(
+        index for index, command in enumerate(commands) if command == "npm ci"
+    )
+    assert npm_toolchain < npm_ci
+
+
+def test_worker_boundary_slice_uses_rootless_bubblewrap_compatible_runner():
+    """The real Linux canaries must run, not silently skip or need root.
+
+    Ubuntu 24.04's AppArmor policy denies the unprivileged user namespace that
+    Bubblewrap needs.  Pin only the slice containing the worker-boundary tests
+    to the still-supported 22.04 image; every other slice can follow latest.
+    """
+    workflow = _yaml(".github/workflows/tests.yml")
+    test_job = workflow["jobs"]["test"]
+    runner = str(test_job["runs-on"])
+    boundary_test = "tests/tools/test_kanban_worker_boundary.py"
+
+    assert boundary_test in runner
+    assert "ubuntu-22.04" in runner
+    assert "ubuntu-latest" in runner
+    assert "matrix.slice.files" in runner
+
+    install_step = next(
+        step
+        for step in test_job["steps"]
+        if step.get("name") == "Install bubblewrap for worker-boundary integration"
+    )
+    assert boundary_test in str(install_step.get("if", ""))
+    assert "bubblewrap" in str(install_step.get("run", ""))
+
+
 def _iter_if_expressions(job: object):
     """Yield every ``if:`` string in a job, including inside its steps."""
     if not isinstance(job, dict):
