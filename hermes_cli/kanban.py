@@ -500,6 +500,7 @@ def build_parser(
         p_broker_register.add_argument("--default-branch", required=True)
         p_broker_register.add_argument("--project-id", default=None)
         p_broker_register.add_argument("--remote-repository-json", type=Path, required=True)
+        p_broker_register.add_argument("--expected-source-sha", default=None)
         p_broker_register.add_argument("--json", action="store_true")
 
     # --- swarm ---
@@ -1920,6 +1921,8 @@ def _cmd_broker_register(args: argparse.Namespace) -> int:
             "default_branch": args.default_branch,
             "project_id": args.project_id,
             "remote_repository": _read_broker_json(args.remote_repository_json),
+            **({"expected_source_sha": args.expected_source_sha}
+               if args.expected_source_sha is not None else {}),
         }
     )
     _emit_broker_result(result, as_json=bool(args.json))

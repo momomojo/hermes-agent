@@ -280,13 +280,14 @@ class BrokerRPCServer:
                 query=body,
             )
         elif self.surface == "operator" and method == "register_repository":
-            if set(body) != {
+            allowed = {
                 "repository_id",
                 "source_path",
                 "default_branch",
                 "project_id",
                 "remote_repository",
-            }:
+            }
+            if set(body) not in (allowed, allowed | {"expected_source_sha"}):
                 raise ProtocolError("register_repository contains unsupported fields")
             result = self.broker.register_repository(
                 peer_uid=peer_uid,
@@ -295,6 +296,7 @@ class BrokerRPCServer:
                 default_branch=str(body.get("default_branch") or ""),
                 project_id=body.get("project_id"),
                 remote_repository=body.get("remote_repository"),
+                expected_source_sha=body.get("expected_source_sha"),
             )
         elif self.surface == "operator" and method == "refresh_repository_base":
             if set(body) != {"repository_id", "expected_old_base_sha"}:

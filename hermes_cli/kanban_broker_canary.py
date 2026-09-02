@@ -307,11 +307,16 @@ def _credential_scrub_check(config: dict[str, Any]) -> bool:
     from hermes_cli.kanban_broker_worker import _safe_worker_env
     from hermes_cli.kanban_broker_worker import validate_worker_credential_home
 
-    validate_worker_credential_home(
-        Path(config["worker_hermes_root"]),
-        profile=None,
-        expected_owner_uid=int(config["model_uid"]),
-    )
+    dispatcher_profile = str(config.get("dispatcher_profile") or "")
+    # Keep this focused helper usable by legacy unit callers that only test
+    # environment scrubbing.  The full activation runner enforces the named
+    # profile before it invokes this check.
+    if dispatcher_profile:
+        validate_worker_credential_home(
+            Path(config["worker_hermes_root"]),
+            profile=dispatcher_profile,
+            expected_owner_uid=int(config["model_uid"]),
+        )
 
     prior = {name: os.environ.get(name) for name in forbidden}
     try:
@@ -326,7 +331,7 @@ def _credential_scrub_check(config: dict[str, Any]) -> bool:
                 "task": {
                     "board": "canary",
                     "project_id": None,
-                    "profile": "canary",
+                    "profile": dispatcher_profile,
                     "goal_mode": False,
                 },
             },
@@ -403,6 +408,9 @@ def run_activation_canaries(config: dict[str, Any]) -> dict[str, dict[str, str]]
 
     if _effective_uid() != 0:
         raise PermissionError("activation canary runner requires root")
+    dispatcher_profile = str(config.get("dispatcher_profile") or "")
+    if not dispatcher_profile:
+        raise ValueError("activation canary dispatcher profile is unavailable")
     checks: dict[str, Callable[[], bool]] = {}
     checks["root_execution"] = lambda: _effective_uid() == 0
     checks["identity_separation"] = lambda: (

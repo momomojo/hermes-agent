@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import socket
@@ -188,9 +189,18 @@ def validate_worker_runtime(
     package_root: Path,
     package_manifest_sha256: str,
     expected_package_owner_uid: int = 0,
+    expected_package_owner_gid: int | None = None,
     expected_python_owner_uid: int = 0,
+    runtime_entrypoint_path: Path | None = None,
+    runtime_entrypoint_sha256: str | None = None,
+    runtime_manifest_path: Path | None = None,
+    runtime_manifest_sha256: str | None = None,
 ) -> dict[str, str]:
     """Bind the model listener to the same immutable installed runtime."""
+
+    from hermes_cli.kanban_broker_install import _read_sealed_file_bytes
+    from hermes_cli.kanban_broker_install import _safe_file_sha256
+    from hermes_cli.kanban_broker_install import runtime_package_manifest
 
     python = Path(python_executable)
     try:
@@ -201,29 +211,103 @@ def validate_worker_runtime(
         stat.S_ISLNK(python_info.st_mode)
         or not stat.S_ISREG(python_info.st_mode)
         or python_info.st_uid != int(expected_python_owner_uid)
+        or python_info.st_nlink != 1
         or stat.S_IMODE(python_info.st_mode) & 0o022
         or not stat.S_IMODE(python_info.st_mode) & 0o111
     ):
         raise WorkerServiceError("worker Python runtime is mutable or unsafe")
-    digest = hashlib.sha256(python.read_bytes()).hexdigest()
+    try:
+        digest = _safe_file_sha256(python)
+    except (OSError, ValueError) as exc:
+        raise WorkerServiceError("worker Python runtime could not be hashed safely") from exc
     if digest != python_sha256:
         raise WorkerServiceError("worker Python runtime digest changed")
+    if runtime_entrypoint_path is not None:
+        entrypoint = Path(runtime_entrypoint_path)
+        runtime_root = python.parent.parent
+        if (
+            not entrypoint.is_absolute()
+            or ".." in entrypoint.parts
+            or entrypoint != runtime_root / "bin/hermes-python"
+            or not isinstance(runtime_entrypoint_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", runtime_entrypoint_sha256) is None
+        ):
+            raise WorkerServiceError("worker runtime entrypoint binding is invalid")
+        try:
+            entry_info = entrypoint.lstat()
+        except OSError as exc:
+            raise WorkerServiceError("worker runtime entrypoint is unavailable") from exc
+        if (
+            stat.S_ISLNK(entry_info.st_mode)
+            or not stat.S_ISREG(entry_info.st_mode)
+            or entry_info.st_uid != int(expected_python_owner_uid)
+            or entry_info.st_nlink != 1
+            or stat.S_IMODE(entry_info.st_mode) != 0o555
+        ):
+            raise WorkerServiceError("worker runtime entrypoint is mutable or unsafe")
+        try:
+            entry_bytes, _entry_read_info = _read_sealed_file_bytes(
+                entrypoint,
+                max_bytes=4 * 1024 * 1024,
+                expected_sha256=runtime_entrypoint_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            raise WorkerServiceError("worker runtime entrypoint changed during read") from exc
     root = Path(package_root).resolve(strict=True)
     if Path(__file__).resolve(strict=True).parent != root:
         raise WorkerServiceError("worker module is outside the installed package")
-    from hermes_cli.kanban_broker_install import runtime_package_manifest
-
     manifest = runtime_package_manifest(
         root,
         expected_owner_uid=expected_package_owner_uid,
+        expected_owner_gid=expected_package_owner_gid,
     )
     if manifest["sha256"] != package_manifest_sha256:
         raise WorkerServiceError("worker package manifest changed")
+    if runtime_manifest_path is not None:
+        if not isinstance(runtime_manifest_sha256, str) or re.fullmatch(
+            r"[0-9a-f]{64}", runtime_manifest_sha256
+        ) is None:
+            raise WorkerServiceError("worker runtime manifest digest is invalid")
+        manifest_path = Path(runtime_manifest_path)
+        if not manifest_path.is_absolute() or ".." in manifest_path.parts:
+            raise WorkerServiceError("worker runtime manifest path is invalid")
+        try:
+            raw, info = _read_sealed_file_bytes(
+                manifest_path, max_bytes=4 * 1024 * 1024
+            )
+            if info.st_uid != int(expected_package_owner_uid) or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o644:
+                raise WorkerServiceError("worker runtime manifest ownership is unsafe")
+        except (OSError, ValueError) as exc:
+            raise WorkerServiceError("worker runtime manifest is unavailable") from exc
+        try:
+            runtime_manifest = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkerServiceError("worker runtime manifest is invalid") from exc
+        if (
+            not isinstance(runtime_manifest, dict)
+            or set(runtime_manifest)
+            != {"contract", "schema_version", "runtime_root", "python_executable",
+                "python_version", "runtime_manifest_sha256", "entries"}
+            or runtime_manifest.get("contract") != "hermes.kanban_broker_runtime_manifest.v1"
+            or runtime_manifest.get("runtime_manifest_sha256") != runtime_manifest_sha256
+            or not isinstance(runtime_manifest.get("entries"), list)
+        ):
+            raise WorkerServiceError("worker runtime manifest fields are not exact")
+        encoded = json.dumps(
+            runtime_manifest["entries"], sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if hashlib.sha256(encoded).hexdigest() != runtime_manifest_sha256:
+            raise WorkerServiceError("worker runtime manifest digest changed")
     return {
         "python_executable": str(python),
         "python_sha256": digest,
         "package_root": str(root),
         "package_manifest_sha256": str(manifest["sha256"]),
+        **(
+            {"runtime_manifest_path": str(runtime_manifest_path),
+             "runtime_manifest_sha256": str(runtime_manifest_sha256)}
+            if runtime_manifest_path is not None else {}
+        ),
     }
 
 
@@ -335,6 +419,7 @@ def run_hermes_worker(
     *,
     python_executable: Path,
     worker_hermes_root: Path,
+    runtime_entrypoint: Path | None = None,
 ) -> dict[str, Any]:
     """Run the ordinary Hermes worker with only credential-free sealed inputs."""
 
@@ -355,14 +440,19 @@ def run_hermes_worker(
         "Edit and test files only; Git metadata, credentials, publishing, and "
         "task authority remain owned by the host broker."
     )
-    command = [
-        str(Path(python_executable)),
+    command = [str(Path(python_executable))]
+    if runtime_entrypoint is not None:
+        entrypoint = Path(runtime_entrypoint)
+        if not entrypoint.is_absolute() or ".." in entrypoint.parts:
+            raise WorkerServiceError("sealed worker runtime entrypoint is invalid")
+        command.extend(["-I", str(entrypoint)])
+    command.extend([
         "-m",
         "hermes_cli.main",
         "-p",
         profile,
         "--cli",
-    ]
+    ])
     for skill in task.get("skills") or []:
         if skill:
             command.extend(["--skills", str(skill)])
@@ -487,12 +577,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--package-root", type=Path, required=True)
     parser.add_argument("--package-manifest-sha256", required=True)
     parser.add_argument("--worker-hermes-root", type=Path, required=True)
+    parser.add_argument("--runtime-entrypoint", type=Path)
+    parser.add_argument("--runtime-entrypoint-sha256")
+    parser.add_argument("--runtime-manifest-path", type=Path)
+    parser.add_argument("--runtime-manifest-sha256")
     args = parser.parse_args(argv)
     validate_worker_runtime(
         python_executable=args.python,
         python_sha256=args.python_sha256,
         package_root=args.package_root,
         package_manifest_sha256=args.package_manifest_sha256,
+        runtime_entrypoint_path=args.runtime_entrypoint,
+        runtime_entrypoint_sha256=args.runtime_entrypoint_sha256,
+        runtime_manifest_path=args.runtime_manifest_path,
+        runtime_manifest_sha256=args.runtime_manifest_sha256,
     )
     service = WorkerSocketService(
         socket_path=args.socket,
@@ -503,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             envelope,
             python_executable=args.python,
             worker_hermes_root=args.worker_hermes_root,
+            runtime_entrypoint=args.runtime_entrypoint,
         ),
     )
     service.start()

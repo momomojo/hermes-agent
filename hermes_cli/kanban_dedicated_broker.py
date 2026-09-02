@@ -1464,10 +1464,16 @@ class DedicatedKanbanBroker:
         default_branch: str,
         project_id: str | None,
         remote_repository: dict[str, Any],
+        expected_source_sha: str | None = None,
     ) -> dict[str, Any]:
         self._authorize(peer_uid, self.operator_uid, "repository registration")
         repository_id = _safe_identifier(repository_id, field="repository_id")
         default_branch = _safe_identifier(default_branch, field="default branch")
+        if expected_source_sha is not None and (
+            not isinstance(expected_source_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", expected_source_sha) is None
+        ):
+            raise BrokerSecurityError("expected source SHA is invalid")
         canonical_remote = _normalize_github_repository(remote_repository)
         if (
             canonical_remote["publication_policy"]["pull_request_base"]
@@ -1490,6 +1496,8 @@ class DedicatedKanbanBroker:
             "SELECT * FROM repositories WHERE repository_id=?", (repository_id,)
         ).fetchone()
         if existing is not None:
+            if expected_source_sha is not None and existing["base_sha"] != expected_source_sha:
+                raise BrokerConflict("registered repository source SHA does not match")
             expected_fingerprint = _repository_fingerprint(
                 repository_id=repository_id,
                 source_path=str(source),
@@ -1570,6 +1578,8 @@ class DedicatedKanbanBroker:
                 .decode()
                 .strip()
             )
+            if expected_source_sha is not None and base_sha != expected_source_sha:
+                raise BrokerConflict("repository source SHA does not match the reviewed input")
         except Exception:
             if private.exists() and private.parent == self.state_dir / "repositories":
                 shutil.rmtree(private)

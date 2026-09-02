@@ -7,17 +7,21 @@ import base64
 import grp
 import hashlib
 import hmac
+import io
 import json
 import os
 import plistlib
+import posixpath
 import pwd
 import re
 import secrets
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from hermes_cli.kanban_dedicated_broker import KANBAN_BROKER_SECURITY_BOUNDARY
@@ -45,8 +49,18 @@ ACTIVATION_CANARY_CHECKS = (
 _ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,62}$")
 _MAX_POSIX_ID = 2**31 - 2
 _MAX_RUNTIME_FILE_BYTES = 4 * 1024 * 1024
+_MAX_RUNTIME_ARCHIVE_FILE_BYTES = 32 * 1024 * 1024
 _MAX_RUNTIME_PACKAGE_BYTES = 64 * 1024 * 1024
 _MAX_RUNTIME_PACKAGE_ENTRIES = 4096
+_MAX_RUNTIME_ARCHIVE_BYTES = 128 * 1024 * 1024
+_MAX_RUNTIME_ARCHIVE_UNPACKED_BYTES = 384 * 1024 * 1024
+_MAX_RUNTIME_ARCHIVE_ENTRIES = 100_000
+OFFICIAL_RUNTIME_RELEASE = "20260602"
+OFFICIAL_RUNTIME_ASSET_ID = 436826623
+OFFICIAL_RUNTIME_VERSION = "3.11.15"
+OFFICIAL_RUNTIME_ARCHIVE_SHA256 = "01f0de017aacd7528084dbacd46c66cfe9a0b0cd1255be0c24854b7985dd130e"
+SEALED_RUNTIME_CONTRACT = "hermes.kanban_broker_sealed_runtime.v1"
+RUNTIME_MANIFEST_CONTRACT = "hermes.kanban_broker_runtime_manifest.v1"
 
 # These contracts describe the reviewed, data-only provisioning edge.  The
 # existing v1 identity/filesystem/service contracts remain the apply boundary;
@@ -56,7 +70,7 @@ HOST_IDENTITY_INVENTORY_CONTRACT = "hermes.kanban_broker_host_inventory.v1"
 DESIRED_IDENTITIES_CONTRACT = "hermes.kanban_broker_desired_identities.v1"
 REMOTE_POLICY_CONTRACT = "hermes.github_repository.v1"
 ASSET_PAYLOAD_CONTRACT = "hermes.kanban_broker_asset_payloads.v1"
-RUNTIME_ENTRYPOINT_CONTENT = """#!/usr/bin/python3
+RUNTIME_ENTRYPOINT_CONTENT = """#!/bin/false
 \"\"\"Self-contained Hermes broker runtime entrypoint.\"\"\"
 from __future__ import annotations
 
@@ -68,12 +82,41 @@ from pathlib import Path
 
 def main() -> int:
     # The entrypoint is invoked as ``python3 -I entrypoint -m module ...``.
-    # -I removes PYTHONPATH and the ambient checkout; this explicit sibling
-    # path is the root-owned, immutable runtime selected by the plan.
+    # -I removes PYTHONPATH and the ambient checkout.  Hermes is installed in
+    # the interpreter's real site-packages directory so direct ``python -I
+    # script.py`` callers (including Radulator) use this same sealed closure.
     runtime_root = Path(__file__).resolve().parent.parent
-    sys.path.insert(0, str(runtime_root))
+    site_packages = runtime_root / "lib" / "python3.11" / "site-packages"
+    sys.path.insert(0, str(site_packages))
+    if not (str(runtime_root) == sys.prefix == sys.base_prefix):
+        raise SystemExit("sealed runtime prefix is outside the install root")
+    if not (sys.version_info >= (3, 11) and sys.version_info < (3, 14)):
+        raise SystemExit("sealed runtime Python version is unsupported")
+    if any(
+        not (Path(path).resolve() == runtime_root
+             or runtime_root in Path(path).resolve().parents)
+        for path in sys.path if path
+    ):
+        raise SystemExit("sealed runtime sys.path escaped the install root")
     if len(sys.argv) == 3 and sys.argv[1] == "--verify-import":
-        importlib.import_module(sys.argv[2])
+        module = importlib.import_module(sys.argv[2])
+        module_path = getattr(module, "__file__", None)
+        if not module_path:
+            raise SystemExit("sealed runtime module has no file identity")
+        resolved_module = Path(module_path).resolve()
+        if not (resolved_module == runtime_root
+                or runtime_root in resolved_module.parents):
+            raise SystemExit("sealed runtime module escaped the install root")
+        return 0
+    if len(sys.argv) == 2 and sys.argv[1] == "--verify-runtime":
+        module = importlib.import_module("hermes_cli.kanban_broker_client")
+        module_path = getattr(module, "__file__", None)
+        if not module_path:
+            raise SystemExit("Hermes broker client has no file identity")
+        resolved_module = Path(module_path).resolve()
+        if not (resolved_module == runtime_root
+                or runtime_root in resolved_module.parents):
+            raise SystemExit("Hermes broker client escaped the install root")
         return 0
     if len(sys.argv) < 3 or sys.argv[1] != "-m":
         raise SystemExit("runtime entrypoint requires -m module")
@@ -85,6 +128,32 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+"""
+RUNTIME_DIRECT_PROBE_CONTENT = """#!/bin/false
+\"\"\"Direct isolated-script canary for the sealed Hermes runtime.\"\"\"
+from __future__ import annotations
+
+import importlib
+import sys
+from pathlib import Path
+
+runtime_root = Path(__file__).resolve().parent
+if not (str(runtime_root) == sys.prefix == sys.base_prefix):
+    raise SystemExit(\"sealed runtime prefix is outside the install root\")
+if not (sys.version_info >= (3, 11) and sys.version_info < (3, 14)):
+    raise SystemExit(\"sealed runtime Python version is unsupported\")
+for path in sys.path:
+    if path:
+        resolved = Path(path).resolve()
+        if resolved != runtime_root and runtime_root not in resolved.parents:
+            raise SystemExit(\"sealed runtime sys.path escaped the install root\")
+module = importlib.import_module(\"hermes_cli.kanban_broker_client\")
+module_path = getattr(module, \"__file__\", None)
+if not module_path:
+    raise SystemExit(\"Hermes broker client has no file identity\")
+resolved_module = Path(module_path).resolve()
+if resolved_module != runtime_root and runtime_root not in resolved_module.parents:
+    raise SystemExit(\"Hermes broker client escaped the install root\")
 """
 
 
@@ -114,6 +183,7 @@ def render_broker_service_config(
     workspace_gid: int,
     trusted_publisher_enabled: bool,
     python_executable: Path = Path("/usr/bin/python3"),
+    python_sha256: str | None = None,
     git_executable: Path = Path("/usr/bin/git"),
     package_root: Path | None = None,
     package_manifest_sha256: str | None = None,
@@ -128,6 +198,12 @@ def render_broker_service_config(
     dispatcher_profile: str | None = None,
     worker_client_config_path: Path | None = None,
     worker_sequence_path: Path | None = None,
+    runtime_attestation_path: Path | None = None,
+    runtime_manifest_path: Path | None = None,
+    runtime_manifest_sha256: str | None = None,
+    hermes_source_sha: str | None = None,
+    hermes_install_archive_sha256: str | None = None,
+    python_version: str | None = None,
     install_nonce: str | None = None,
 ) -> str:
     """Render install-time broker assets in the mandatory disabled state."""
@@ -137,6 +213,16 @@ def render_broker_service_config(
         controller_uid=controller_uid,
         publisher_uid=publisher_uid,
     )
+    broker_uid = _validated_positive_id(broker_uid, field="broker uid")
+    broker_gid = _validated_positive_id(broker_gid, field="broker gid")
+    controller_uid = _validated_positive_id(controller_uid, field="controller uid")
+    controller_gid = _validated_positive_id(controller_gid, field="controller gid")
+    publisher_uid = _validated_positive_id(publisher_uid, field="publisher uid")
+    publisher_gid = _validated_positive_id(publisher_gid, field="publisher gid")
+    model_uid = _validated_positive_id(model_uid, field="model uid")
+    workspace_gid = _validated_positive_id(workspace_gid, field="workspace gid")
+    operator_uid = _validated_nonnegative_id(operator_uid, field="operator uid")
+    operator_gid = _validated_nonnegative_id(operator_gid, field="operator gid")
     if trusted_publisher_enabled is not False:
         raise ValueError("publisher activation must remain false during asset install")
     if (
@@ -177,6 +263,10 @@ def render_broker_service_config(
         worker_client_config_path = Path(worker_client_config_path)
     if worker_sequence_path is not None:
         worker_sequence_path = Path(worker_sequence_path)
+    if runtime_attestation_path is not None:
+        runtime_attestation_path = Path(runtime_attestation_path)
+    if runtime_manifest_path is not None:
+        runtime_manifest_path = Path(runtime_manifest_path)
     for runtime_path in (
         python_executable,
         git_executable,
@@ -190,6 +280,8 @@ def render_broker_service_config(
         *([remote_policy_path] if remote_policy_path is not None else []),
         *([worker_client_config_path] if worker_client_config_path is not None else []),
         *([worker_sequence_path] if worker_sequence_path is not None else []),
+        *([runtime_attestation_path] if runtime_attestation_path is not None else []),
+        *([runtime_manifest_path] if runtime_manifest_path is not None else []),
     ):
         if not runtime_path.is_absolute():
             raise ValueError("broker runtime identity paths must be absolute")
@@ -212,6 +304,8 @@ def render_broker_service_config(
         *([remote_policy_path] if remote_policy_path is not None else []),
         *([worker_client_config_path] if worker_client_config_path is not None else []),
         *([worker_sequence_path] if worker_sequence_path is not None else []),
+        *([runtime_attestation_path] if runtime_attestation_path is not None else []),
+        *([runtime_manifest_path] if runtime_manifest_path is not None else []),
     ):
         if private_path == install_root or install_root not in private_path.parents:
             raise ValueError("broker private assets must be below the install root")
@@ -245,7 +339,11 @@ def render_broker_service_config(
         "operator_gid": int(operator_gid),
         "workspace_gid": int(workspace_gid),
         "python_executable": str(python_executable),
-        "python_sha256": _safe_file_sha256(python_executable),
+        "python_sha256": (
+            _validated_hex_sha(python_sha256, field="Python SHA256", length=64)
+            if python_sha256 is not None
+            else _safe_file_sha256(python_executable)
+        ),
         "git_executable": str(git_executable),
         "git_sha256": _safe_file_sha256(git_executable),
         "package_root": str(package_root),
@@ -269,12 +367,46 @@ def render_broker_service_config(
         payload["worker_client_config_path"] = str(worker_client_config_path)
     if worker_sequence_path is not None:
         payload["worker_sequence_path"] = str(worker_sequence_path)
+    if runtime_attestation_path is not None:
+        payload["runtime_attestation_path"] = str(runtime_attestation_path)
+    if runtime_manifest_path is not None:
+        payload["runtime_manifest_path"] = str(runtime_manifest_path)
+        payload["runtime_manifest_sha256"] = _validated_hex_sha(
+            runtime_manifest_sha256, field="runtime manifest SHA256", length=64
+        )
+    elif any(value is not None for value in (runtime_manifest_sha256, hermes_source_sha,
+                                              hermes_install_archive_sha256,
+                                              python_version)):
+        raise ValueError("runtime manifest path is required for runtime metadata")
+    if hermes_source_sha is not None:
+        payload["hermes_source_sha"] = _validated_hex_sha(
+            hermes_source_sha, field="Hermes source SHA", length=40
+        )
+    if hermes_install_archive_sha256 is not None:
+        payload["hermes_install_archive_sha256"] = _validated_hex_sha(
+            hermes_install_archive_sha256,
+            field="Hermes install archive SHA256",
+            length=64,
+        )
+    if python_version is not None:
+        if python_version != OFFICIAL_RUNTIME_VERSION:
+            raise ValueError("Python runtime version is not the reviewed version")
+        payload["python_version"] = python_version
     return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def _safe_file_sha256(path: Path) -> str:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(Path(path), flags)
+    target = Path(path)
+    parent_fd: int | None = None
+    try:
+        parent_fd = _open_directory_fd(target.parent)
+        parent_before = os.fstat(parent_fd)
+        fd = os.open(target.name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise ValueError("runtime identity file is unavailable") from exc
     try:
         before = os.fstat(fd)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
@@ -293,13 +425,91 @@ def _safe_file_sha256(path: Path) -> str:
             after.st_mtime_ns,
         ):
             raise ValueError("runtime identity file changed during hashing")
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (
+            parent_after.st_dev, parent_after.st_ino
+        ):
+            raise ValueError("runtime identity file parent changed during hashing")
         return digest.hexdigest()
     finally:
         os.close(fd)
+        os.close(parent_fd)
+
+
+def _read_sealed_file_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> tuple[bytes, os.stat_result]:
+    """Read one regular file through an O_NOFOLLOW descriptor with readback."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    target = Path(path)
+    parent_fd: int | None = None
+    try:
+        parent_fd = _open_directory_fd(target.parent)
+        parent_before = os.fstat(parent_fd)
+        fd = os.open(target.name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise ValueError("sealed file is unavailable") from exc
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size > int(max_bytes)):
+            raise ValueError("sealed file is not a bounded regular file")
+        if expected_size is not None and before.st_size != int(expected_size):
+            raise ValueError("sealed file size differs from the reviewed input")
+        chunks: list[bytes] = []
+        remaining = int(max_bytes) + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) != before.st_size or len(content) > int(max_bytes):
+            raise ValueError("sealed file changed or exceeds the size limit")
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise ValueError("sealed file changed during read")
+        if expected_sha256 is not None and hashlib.sha256(content).hexdigest() != expected_sha256:
+            raise ValueError("sealed file digest differs from the reviewed input")
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (
+            parent_after.st_dev, parent_after.st_ino
+        ):
+            raise ValueError("sealed file parent changed during read")
+        return content, before
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def _apple_system_binary_sha256(path: Path) -> str:
+    """Pin an Apple system executable without treating cryptex hardlinks as mutable."""
+    binary = Path(path)
+    if binary != Path("/usr/bin/git"):
+        raise ValueError("Git executable must be the reviewed Apple /usr/bin/git")
+    info = binary.lstat()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or not stat.S_IMODE(info.st_mode) & 0o111
+    ):
+        raise ValueError("Apple Git executable is mutable or unsafe")
+    return _safe_file_sha256(binary)
 
 
 def runtime_package_manifest(
-    package_root: Path, *, expected_owner_uid: int
+    package_root: Path, *, expected_owner_uid: int, expected_owner_gid: int | None = None
 ) -> dict[str, object]:
     """Hash a symlink-free, owner-pinned immutable Python package tree."""
 
@@ -309,6 +519,10 @@ def runtime_package_manifest(
         stat.S_ISLNK(root_info.st_mode)
         or not stat.S_ISDIR(root_info.st_mode)
         or root_info.st_uid != int(expected_owner_uid)
+        or (
+            expected_owner_gid is not None
+            and root_info.st_gid != int(expected_owner_gid)
+        )
         or stat.S_IMODE(root_info.st_mode) & 0o022
     ):
         raise ValueError("runtime package root is mutable or unsafe")
@@ -318,7 +532,14 @@ def runtime_package_manifest(
         directory = pending.pop()
         for child in sorted(directory.iterdir(), key=lambda value: value.name):
             info = child.lstat()
-            if stat.S_ISLNK(info.st_mode) or info.st_uid != int(expected_owner_uid):
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or info.st_uid != int(expected_owner_uid)
+                or (
+                    expected_owner_gid is not None
+                    and info.st_gid != int(expected_owner_gid)
+                )
+            ):
                 raise ValueError("runtime package contains a symlink or wrong owner")
             relative = child.relative_to(root).as_posix()
             mode = stat.S_IMODE(info.st_mode)
@@ -430,6 +651,302 @@ def render_runtime_package_assets(
     }
 
 
+def _archive_relative_name(name: str) -> str:
+    if (
+        not isinstance(name, str)
+        or not name
+        or "\x00" in name
+        or name.startswith("/")
+        or "\\" in name
+    ):
+        raise ValueError("runtime archive member path is unsafe")
+    path = PurePosixPath(name)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("runtime archive member path is unsafe")
+    normalized = path.as_posix()
+    if normalized != name:
+        raise ValueError("runtime archive member path is not normalized")
+    return normalized
+
+
+def _archive_link_target(member_name: str, link_name: str, names: set[str]) -> str:
+    if (
+        not isinstance(link_name, str)
+        or not link_name
+        or "\x00" in link_name
+        or link_name.startswith("/")
+        or "\\" in link_name
+    ):
+        raise ValueError("runtime archive link target is unsafe")
+    parent = PurePosixPath(member_name).parent
+    target = PurePosixPath(posixpath.normpath((parent / link_name).as_posix()))
+    if target.is_absolute() or any(part in {"", ".", ".."} for part in target.parts):
+        raise ValueError("runtime archive link target escapes the sealed root")
+    normalized = target.as_posix()
+    if normalized not in names:
+        raise ValueError("runtime archive link target is missing")
+    return normalized
+
+
+def _read_runtime_archive_manifest(
+    archive_path: Path,
+    *,
+    expected_sha256: str,
+    strip_prefix: str,
+    required_paths: set[str],
+    role: str,
+) -> dict[str, object]:
+    """Validate one staged tar archive and return a recursive sealed manifest."""
+    archive = _validated_install_path(archive_path, field=f"{role} archive")
+    if not archive.is_absolute():
+        raise ValueError(f"{role} archive must be an absolute real file")
+    digest = _validated_hex_sha(expected_sha256, field=f"{role} archive SHA256", length=64)
+    archive_data, info = _read_sealed_file_bytes(
+        archive,
+        max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+        expected_sha256=digest,
+    )
+    observed = digest
+    prefix = _archive_relative_name(strip_prefix.rstrip("/")) + "/"
+    entries: list[dict[str, object]] = []
+    names: set[str] = set()
+    unpacked_bytes = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as stream:
+            members = stream.getmembers()
+            if len(members) > _MAX_RUNTIME_ARCHIVE_ENTRIES:
+                raise ValueError(f"{role} archive contains too many entries")
+            for member in members:
+                raw_name = member.name.rstrip("/") if member.isdir() else member.name
+                name = _archive_relative_name(raw_name)
+                if name == prefix[:-1]:
+                    continue
+                if not name.startswith(prefix):
+                    raise ValueError(f"{role} archive contains a path outside {prefix}")
+                relative = name[len(prefix):]
+                if not relative:
+                    continue
+                relative = _archive_relative_name(relative)
+                if relative in names:
+                    raise ValueError(f"{role} archive contains duplicate paths")
+                names.add(relative)
+            # Directory members are optional in tar archives.  Add implicit
+            # parent directories to the link target allow-list so a relative
+            # link may safely point at one without permitting an upward path.
+            for item in list(names):
+                parent = PurePosixPath(item).parent
+                while str(parent) not in {"", "."}:
+                    names.add(parent.as_posix())
+                    parent = parent.parent
+            for member in members:
+                raw_name = member.name.rstrip("/") if member.isdir() else member.name
+                name = _archive_relative_name(raw_name)
+                if not name.startswith(prefix) or name == prefix[:-1]:
+                    continue
+                relative = _archive_relative_name(name[len(prefix):])
+                mode = stat.S_IMODE(member.mode)
+                if member.isdir():
+                    entries.append({"path": relative + "/", "type": "directory", "mode": 0o555})
+                    continue
+                if member.issym():
+                    target = _archive_link_target(relative, member.linkname, names)
+                    entries.append({"path": relative, "type": "symlink", "target": target, "mode": 0o555})
+                    continue
+                if member.islnk() or not member.isfile():
+                    raise ValueError(f"{role} archive contains an unsupported special or hard-linked file")
+                if member.size < 0 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES or unpacked_bytes + member.size > _MAX_RUNTIME_ARCHIVE_UNPACKED_BYTES:
+                    raise ValueError(f"{role} archive exceeds the unpacked size limit")
+                handle = stream.extractfile(member)
+                if handle is None:
+                    raise ValueError(f"{role} archive file cannot be read")
+                content = handle.read(_MAX_RUNTIME_ARCHIVE_FILE_BYTES + 1)
+                if len(content) != member.size or len(content) > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                    raise ValueError(f"{role} archive file changed or exceeds the size limit")
+                unpacked_bytes += len(content)
+                digest = hashlib.sha256(content).hexdigest()
+                entries.append({
+                    "path": relative,
+                    "type": "file",
+                    "mode": 0o555 if mode & 0o111 else 0o444,
+                    "size": len(content),
+                    "sha256": digest,
+                })
+    except (tarfile.TarError, OSError) as exc:
+        raise ValueError(f"{role} archive is not a valid bounded tar.gz") from exc
+    entries.sort(key=lambda item: str(item["path"]))
+    available = {str(item["path"]).rstrip("/") for item in entries}
+    for item in list(available):
+        parent = PurePosixPath(item).parent
+        while str(parent) not in {"", "."}:
+            available.add(parent.as_posix())
+            parent = parent.parent
+    if not required_paths.issubset(available):
+        missing = sorted(required_paths - available)
+        raise ValueError(f"{role} archive is missing required runtime paths: {missing}")
+    return {
+        "source_path": str(archive),
+        "sha256": observed,
+        "size": int(info.st_size),
+        "strip_prefix": prefix,
+        "role": role,
+        "entries": entries,
+    }
+
+
+def render_sealed_runtime_plan(
+    *,
+    runtime_archive_path: Path,
+    runtime_archive_sha256: str,
+    hermes_install_archive_path: Path,
+    hermes_install_archive_sha256: str,
+    runtime_root: Path,
+    entrypoint_path: Path,
+) -> dict[str, object]:
+    """Bind official CPython and a complete staged Hermes install closure."""
+    root = _validated_install_path(runtime_root, field="sealed runtime root", allow_root=True)
+    entrypoint = _validated_install_path(entrypoint_path, field="sealed runtime entrypoint", install_root=root)
+    if entrypoint.parent.parent != root:
+        raise ValueError("sealed runtime entrypoint must be below runtime/bin")
+    python = _read_runtime_archive_manifest(
+        runtime_archive_path,
+        expected_sha256=runtime_archive_sha256,
+        strip_prefix="python",
+        required_paths={"bin/python3.11", "bin/python3", "lib/python3.11"},
+        role="CPython",
+    )
+    if runtime_archive_sha256 != OFFICIAL_RUNTIME_ARCHIVE_SHA256:
+        raise ValueError("CPython archive is not the reviewed official runtime artifact")
+    hermes = _read_runtime_archive_manifest(
+        hermes_install_archive_path,
+        expected_sha256=hermes_install_archive_sha256,
+        strip_prefix="hermes-install",
+        required_paths={
+            "hermes_cli/__init__.py",
+            # The worker launches ``hermes_cli.main`` through the sealed
+            # interpreter.  A broker-client-only snapshot would pass the
+            # import canary but fail at the first real worker turn.
+            "hermes_cli/main.py",
+            "hermes_cli/kanban_broker_canary.py",
+            "hermes_cli/kanban_broker_client.py",
+            "hermes_cli/kanban_broker_install.py",
+            "hermes_cli/kanban_broker_protocol.py",
+            "hermes_cli/kanban_broker_service.py",
+            "hermes_cli/kanban_broker_worker.py",
+            "hermes_cli/kanban_dedicated_broker.py",
+        },
+        role="Hermes install",
+    )
+    merged: dict[str, dict[str, object]] = {}
+    for item in python["entries"]:
+        path = str(item["path"])
+        merged[path] = dict(item)
+    # The Hermes archive is a staged install closure.  Relocating the package
+    # under CPython's real site-packages makes the sealed interpreter usable by
+    # direct ``python -I script.py`` callers as well as by hermes-python.
+    package_prefix = "lib/python3.11/site-packages/"
+    for item in hermes["entries"]:
+        source_path = str(item["path"])
+        path = package_prefix + source_path
+        if source_path == "hermes_cli":
+            path = package_prefix + "hermes_cli/"
+        elif source_path.startswith("hermes_cli/"):
+            path = package_prefix + source_path
+        else:
+            # Dependency closure entries are expected to be install-relative;
+            # preserve them beneath site-packages without allowing a second
+            # top-level tree outside the runtime.
+            path = package_prefix + source_path
+        if path.endswith("//"):
+            path = path[:-1]
+        relocated = dict(item)
+        relocated["path"] = path
+        if relocated.get("type") == "symlink":
+            target = str(relocated.get("target") or "")
+            # Symlink targets in the source archive are relative to their
+            # archive root (the manifest has already resolved the link
+            # relative to its member).  Relocate that root-relative target to
+            # the corresponding site-packages path while retaining an
+            # internal-only target.
+            relocated["target"] = package_prefix + target
+        prior = merged.get(path)
+        if prior is not None and prior != relocated:
+            raise ValueError("sealed runtime archives overlap with different entries")
+        merged[path] = relocated
+    # Tar files may omit directory members.  Materialization still creates
+    # those parents, so make the recursive sealed manifest describe them
+    # explicitly and bind the package manifest to the same tree.
+    for item in list(merged.values()):
+        relative = PurePosixPath(str(item["path"]).rstrip("/"))
+        parent = relative.parent
+        while str(parent) not in {"", "."}:
+            directory_path = parent.as_posix() + "/"
+            prior = merged.get(directory_path)
+            if prior is not None and prior.get("type") != "directory":
+                raise ValueError("sealed runtime path has a file/directory collision")
+            merged.setdefault(
+                directory_path,
+                {"path": directory_path, "type": "directory", "mode": 0o555},
+            )
+            parent = parent.parent
+    merged["bin/hermes-python"] = {
+        "path": "bin/hermes-python",
+        "type": "file",
+        "mode": 0o555,
+        "size": len(RUNTIME_ENTRYPOINT_CONTENT.encode("utf-8")),
+        "sha256": hashlib.sha256(RUNTIME_ENTRYPOINT_CONTENT.encode("utf-8")).hexdigest(),
+    }
+    merged["runtime-probe.py"] = {
+        "path": "runtime-probe.py",
+        "type": "file",
+        "mode": 0o555,
+        "size": len(RUNTIME_DIRECT_PROBE_CONTENT.encode("utf-8")),
+        "sha256": hashlib.sha256(RUNTIME_DIRECT_PROBE_CONTENT.encode("utf-8")).hexdigest(),
+    }
+    python_entry = merged.get("bin/python3.11")
+    if not isinstance(python_entry, dict) or python_entry.get("type") != "file":
+        raise ValueError("sealed runtime Python executable is not a regular file")
+    hermes_package_prefix = package_prefix + "hermes_cli/"
+    # ``package_manifest_sha256`` is the worker's fast startup binding for
+    # the exact package root passed in its plist.  Keep it scoped to that
+    # root; the complete CPython + dependency closure remains covered by the
+    # recursive runtime manifest above.
+    package_entries = [
+        {
+            **item,
+            "path": str(item["path"])[len(hermes_package_prefix):],
+        }
+        for item in sorted(merged.values(), key=lambda entry: str(entry["path"]))
+        if str(item["path"]).startswith(hermes_package_prefix)
+        and str(item["path"]) != hermes_package_prefix
+        and "__pycache__" not in PurePosixPath(str(item["path"])).parts
+        and not str(item["path"]).endswith((".pyc", ".pyo"))
+    ]
+    package_manifest_sha = hashlib.sha256(
+        _canonical_json_bytes(package_entries)
+    ).hexdigest()
+    runtime_manifest_sha = hashlib.sha256(
+        _canonical_json_bytes([merged[path] for path in sorted(merged)])
+    ).hexdigest()
+    return {
+        "contract": SEALED_RUNTIME_CONTRACT,
+        "schema_version": 1,
+        "runtime_root": str(root),
+        "entrypoint_path": str(entrypoint),
+        "direct_probe_path": str(root / "runtime-probe.py"),
+        "direct_probe_sha256": str(merged["runtime-probe.py"]["sha256"]),
+        "python_executable_path": str(root / "bin/python3.11"),
+        "python_sha256": str(python_entry["sha256"]),
+        "package_root": str(root / "lib/python3.11/site-packages/hermes_cli"),
+        "package_manifest_sha256": package_manifest_sha,
+        "runtime_manifest_sha256": runtime_manifest_sha,
+        "python_version": OFFICIAL_RUNTIME_VERSION,
+        "official_release": OFFICIAL_RUNTIME_RELEASE,
+        "official_asset_id": OFFICIAL_RUNTIME_ASSET_ID,
+        "archives": [python, hermes],
+        "entries": [merged[path] for path in sorted(merged)],
+    }
+
+
 def validate_runtime_identity(
     config: dict,
     *,
@@ -441,16 +958,17 @@ def validate_runtime_identity(
     for name in ("python", "git"):
         path = Path(config[f"{name}_executable"])
         info = path.lstat()
+        git_system_binary = name == "git" and path == Path("/usr/bin/git")
         if (
             stat.S_ISLNK(info.st_mode)
             or not stat.S_ISREG(info.st_mode)
             or info.st_uid != 0
-            or info.st_nlink != 1
+            or (not git_system_binary and info.st_nlink != 1)
             or stat.S_IMODE(info.st_mode) & 0o022
             or not stat.S_IMODE(info.st_mode) & 0o111
         ):
             raise ValueError(f"{name} runtime is mutable or unsafe")
-        digest = _safe_file_sha256(path)
+        digest = _apple_system_binary_sha256(path) if git_system_binary else _safe_file_sha256(path)
         if digest != config.get(f"{name}_sha256"):
             raise ValueError(f"{name} runtime digest changed")
         identities[f"{name}_executable"] = str(path)
@@ -458,6 +976,7 @@ def validate_runtime_identity(
     package_root = Path(config["package_root"])
     required_modules = {
         "__init__.py",
+        "main.py",
         "kanban_broker_canary.py",
         "kanban_broker_client.py",
         "kanban_broker_install.py",
@@ -471,6 +990,7 @@ def validate_runtime_identity(
     package = runtime_package_manifest(
         package_root,
         expected_owner_uid=expected_package_owner_uid,
+        expected_owner_gid=0,
     )
     if package["sha256"] != config.get("package_manifest_sha256"):
         raise ValueError("runtime package manifest changed")
@@ -479,6 +999,9 @@ def validate_runtime_identity(
     entrypoint_value = config.get("runtime_entrypoint_path")
     if entrypoint_value is not None:
         entrypoint = Path(entrypoint_value)
+        runtime_root = Path(config["python_executable"]).parent.parent
+        if entrypoint != runtime_root / "bin/hermes-python":
+            raise ValueError("runtime entrypoint is outside the sealed runtime")
         try:
             entrypoint_info = entrypoint.lstat()
         except OSError as exc:
@@ -496,6 +1019,34 @@ def validate_runtime_identity(
             raise ValueError("runtime entrypoint digest changed")
         identities["runtime_entrypoint_path"] = str(entrypoint)
         identities["runtime_entrypoint_sha256"] = digest
+    manifest_value = config.get("runtime_manifest_path")
+    if manifest_value is not None:
+        if config.get("python_version") != OFFICIAL_RUNTIME_VERSION:
+            raise ValueError("Python runtime version is unsupported")
+        _validated_hex_sha(
+            config.get("hermes_source_sha"), field="Hermes source SHA", length=40
+        )
+        _validated_hex_sha(
+            config.get("hermes_install_archive_sha256"),
+            field="Hermes install archive SHA256",
+            length=64,
+        )
+        manifest_path = Path(str(manifest_value))
+        manifest_sha = _validated_hex_sha(
+            config.get("runtime_manifest_sha256"),
+            field="runtime manifest SHA256",
+            length=64,
+        )
+        runtime_root = Path(config["python_executable"]).parent.parent
+        manifest = _read_runtime_manifest_file(
+            manifest_path,
+            expected_sha256=manifest_sha,
+            expected_runtime_root=runtime_root,
+            expected_python_executable=Path(config["python_executable"]),
+            expected_python_version=str(config.get("python_version") or ""),
+        )
+        identities["runtime_manifest_path"] = str(manifest_path)
+        identities["runtime_manifest_sha256"] = str(manifest["runtime_manifest_sha256"])
     return identities
 
 
@@ -590,8 +1141,8 @@ def _inventory_records(value: object, *, kind: str) -> list[dict[str, object]]:
     return result
 
 
-def _validate_host_identity_inventory(value: object) -> dict[str, list[dict[str, object]]]:
-    if not isinstance(value, dict) or set(value) != {"contract", "accounts", "groups"}:
+def _validate_host_identity_inventory(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"contract", "accounts", "groups", "memberships"}:
         raise ValueError("host identity inventory fields are not exact")
     if value.get("contract") != HOST_IDENTITY_INVENTORY_CONTRACT:
         raise ValueError("unsupported host identity inventory contract")
@@ -605,7 +1156,24 @@ def _validate_host_identity_inventory(value: object) -> dict[str, list[dict[str,
     wheel = group_by_name.get("wheel")
     if wheel != {"name": "wheel", "gid": 0}:
         raise ValueError("host identity inventory must contain exact wheel group")
-    return {"accounts": accounts, "groups": groups}
+    memberships_value = value.get("memberships")
+    if not isinstance(memberships_value, list):
+        raise ValueError("host identity memberships inventory must be a list")
+    memberships: list[dict[str, str]] = []
+    known_users = set(by_name)
+    known_groups = set(group_by_name)
+    for item in memberships_value:
+        if not isinstance(item, dict) or set(item) != {"user", "group"}:
+            raise ValueError("host identity membership fields are not exact")
+        user = _validated_account_name(item["user"])
+        group = _validated_account_name(item["group"])
+        if user not in known_users or group not in known_groups:
+            raise ValueError("host identity membership references an unknown identity")
+        memberships.append({"user": user, "group": group})
+    memberships.sort(key=lambda item: (item["user"], item["group"]))
+    if len({(item["user"], item["group"]) for item in memberships}) != len(memberships):
+        raise ValueError("host identity memberships contain duplicates")
+    return {"accounts": accounts, "groups": groups, "memberships": memberships}
 
 
 def _desired_identity_specs(value: object) -> dict[str, dict[str, object]]:
@@ -688,10 +1256,10 @@ def _desired_identity_specs(value: object) -> dict[str, dict[str, object]]:
 
 
 def _validate_inventory_against_desired(
-    inventory: dict[str, list[dict[str, object]]], desired: dict[str, dict[str, object]]
+    inventory: dict[str, object], desired: dict[str, dict[str, object]]
 ) -> None:
-    accounts = inventory["accounts"]
-    groups = inventory["groups"]
+    accounts = cast(list[dict[str, object]], inventory["accounts"])
+    groups = cast(list[dict[str, object]], inventory["groups"])
     account_by_name = {str(row["name"]): row for row in accounts}
     account_by_uid = {int(row["uid"]): row for row in accounts}
     group_by_name = {str(row["name"]): row for row in groups}
@@ -719,6 +1287,93 @@ def _validate_inventory_against_desired(
         existing_gid = group_by_gid.get(gid)
         if existing_gid is not None and str(existing_gid["name"]) != name:
             raise ValueError(f"host group ID {gid} is occupied by another name")
+    expected_memberships = {
+        (str(desired["broker"]["user"]), str(desired["controller"]["group"])),
+        (str(desired["broker"]["user"]), str(desired["publisher"]["group"])),
+        (str(desired["broker"]["user"]), "wheel"),
+        (str(desired["broker"]["user"]), str(desired["workspace"]["group"])),
+        (str(desired["controller"]["user"]), str(desired["controller"]["group"])),
+        (str(desired["publisher"]["user"]), str(desired["publisher"]["group"])),
+        ("root", "wheel"),
+        (str(desired["model"]["user"]), str(desired["workspace"]["group"])),
+    }
+    relevant_users = {
+        str(desired[role]["user"])
+        for role in ("broker", "controller", "publisher", "model", "operator")
+    }
+    observed_memberships = {
+        (str(item["user"]), str(item["group"]))
+        for item in cast(list[dict[str, str]], inventory["memberships"])
+        if str(item["user"]) in relevant_users
+    }
+    # A host inventory may intentionally omit the new service identities: the
+    # following root-only apply step creates those records.  Existing service
+    # identities, however, must have an exact supplementary-group set before
+    # any directory-service mutation is authorized.
+    existing_expected_memberships = {
+        pair for pair in expected_memberships
+        if pair[0] in account_by_name
+    }
+    if observed_memberships != existing_expected_memberships:
+        unexpected = sorted(observed_memberships - expected_memberships)
+        missing = sorted(existing_expected_memberships - observed_memberships)
+        raise ValueError(f"host identity memberships differ (unexpected={unexpected}, missing={missing})")
+
+
+def allocate_desired_identities(
+    host_inventory: object,
+    *,
+    broker_user: str = "_hermesbroker",
+    controller_user: str = "_hermescontroller",
+    publisher_user: str = "_hermespublisher",
+    model_user: str = "_hermesmodel",
+    broker_group: str = "_hermesbroker",
+    controller_group: str = "_hermescontroller",
+    publisher_group: str = "_hermespublisher",
+    workspace_group: str = "_hermesworkspace",
+) -> dict[str, object]:
+    """Allocate the reviewed 450-453 UID/GID block from an explicit inventory."""
+    inventory = _validate_host_identity_inventory(host_inventory)
+    names = [broker_user, controller_user, publisher_user, model_user,
+             broker_group, controller_group, publisher_group, workspace_group]
+    for name in names:
+        _validated_account_name(name)
+    ids = {"broker": 450, "controller": 451, "publisher": 452, "model": 453}
+    accounts = cast(list[dict[str, object]], inventory["accounts"])
+    groups = cast(list[dict[str, object]], inventory["groups"])
+    by_uid = {int(item["uid"]): str(item["name"]) for item in accounts}
+    by_gid = {int(item["gid"]): str(item["name"]) for item in groups}
+    by_name_account = {str(item["name"]): (int(item["uid"]), int(item["gid"])) for item in accounts}
+    by_name_group = {str(item["name"]): int(item["gid"]) for item in groups}
+    for role, ident in ids.items():
+        user = {"broker": broker_user, "controller": controller_user,
+                "publisher": publisher_user, "model": model_user}[role]
+        group = {"broker": broker_group, "controller": controller_group,
+                 "publisher": publisher_group, "model": workspace_group}[role]
+        if ident in by_uid and by_uid[ident] != user:
+            raise ValueError(f"allocated UID {ident} is occupied by another name")
+        if ident in by_gid and by_gid[ident] != group:
+            raise ValueError(f"allocated GID {ident} is occupied by another name")
+        if user in by_name_account and by_name_account[user] != (ident, ident):
+            raise ValueError(f"existing account {user} has the wrong allocated IDs")
+        if group in by_name_group and by_name_group[group] != ident:
+            raise ValueError(f"existing group {group} has the wrong allocated ID")
+    desired = {
+        "contract": DESIRED_IDENTITIES_CONTRACT,
+        "broker": {"user": broker_user, "uid": 450, "gid": 450},
+        "controller": {"user": controller_user, "uid": 451, "gid": 451,
+                       "group": controller_group, "group_gid": 451},
+        "publisher": {"user": publisher_user, "uid": 452, "gid": 452,
+                      "group": publisher_group, "group_gid": 452},
+        "operator": {"user": "root", "uid": 0, "gid": 0,
+                     "group": "wheel", "group_gid": 0},
+        "model": {"user": model_user, "uid": 453, "gid": 453},
+        "workspace": {"group": workspace_group, "gid": 453},
+    }
+    # Re-run the exact identity validator so custom names cannot introduce a
+    # cross-role name collision after the fixed reviewed allocation is chosen.
+    _desired_identity_specs(desired)
+    return desired
 
 
 def render_radulator_remote_policy(*, source_sha: str) -> dict[str, object]:
@@ -798,6 +1453,16 @@ def render_identity_provision_plan(
         controller_uid=controller_uid,
         publisher_uid=publisher_uid,
     )
+    broker_uid = _validated_positive_id(broker_uid, field="broker uid")
+    broker_gid = _validated_positive_id(broker_gid, field="broker gid")
+    controller_uid = _validated_positive_id(controller_uid, field="controller uid")
+    controller_gid = _validated_positive_id(controller_gid, field="controller gid")
+    publisher_uid = _validated_positive_id(publisher_uid, field="publisher uid")
+    publisher_gid = _validated_positive_id(publisher_gid, field="publisher gid")
+    model_uid = _validated_positive_id(model_uid, field="model uid")
+    workspace_gid = _validated_positive_id(workspace_gid, field="workspace gid")
+    operator_uid = _validated_nonnegative_id(operator_uid, field="operator uid")
+    operator_gid = _validated_nonnegative_id(operator_gid, field="operator gid")
     positive_ids = (
         broker_uid,
         broker_gid,
@@ -812,18 +1477,45 @@ def render_identity_provision_plan(
         raise ValueError("broker service identity IDs must be positive")
     if int(operator_uid) < 0 or int(operator_gid) < 0:
         raise ValueError("operator identity IDs must be non-negative")
+    if (
+        names["operator_user"] != "root"
+        or int(operator_uid) != 0
+        or int(operator_gid) != 0
+        or names["operator_group"] != "wheel"
+    ):
+        raise ValueError("operator identity must be root with the wheel group")
     groups = [
         [names["broker_user"], int(broker_gid)],
         [names["controller_group"], int(controller_gid)],
         [names["publisher_group"], int(publisher_gid)],
         [names["workspace_group"], int(workspace_gid)],
     ]
+    group_ids = [int(gid) for _name, gid in groups] + [int(operator_gid)]
+    if len(group_ids) != len(set(group_ids)):
+        raise ValueError("broker, controller, publisher, operator, and workspace groups must be distinct")
     users = [
         [names["broker_user"], int(broker_uid), int(broker_gid)],
         [names["controller_user"], int(controller_uid), int(controller_gid)],
         [names["publisher_user"], int(publisher_uid), int(publisher_gid)],
         [names["model_user"], int(model_uid), int(workspace_gid)],
     ]
+    user_names = [str(item[0]) for item in users]
+    group_names = [str(item[0]) for item in groups] + [names["operator_group"]]
+    if len(user_names) != len(set(user_names)) or len(group_names) != len(set(group_names)):
+        raise ValueError("broker service account and group names must be distinct")
+    allowed_same_names = {
+        (names["broker_user"], names["broker_user"]),
+        (names["controller_user"], names["controller_group"]),
+        (names["publisher_user"], names["publisher_group"]),
+        (names["operator_user"], names["operator_group"]),
+    }
+    if any(
+        (user_name, group_name) not in allowed_same_names
+        for user_name in user_names
+        for group_name in group_names
+        if user_name == group_name
+    ):
+        raise ValueError("service account and group names collide")
     memberships = [
         [names["broker_user"], names["controller_group"]],
         [names["broker_user"], names["publisher_group"]],
@@ -957,6 +1649,52 @@ def provision_identity_plan(
         else:
             if (int(existing.pw_uid), int(existing.pw_gid)) != (int(uid), int(gid)):
                 raise ValueError(f"existing account {name} has the wrong IDs")
+    # Read every existing account's supplementary memberships before running
+    # any dscl command.  This closes the partial-mutation window when a host
+    # has an unexpected group (for example gid 80) on one of the service
+    # identities.
+    membership_policy = plan.get("membership_policy")
+    if membership_policy is not None:
+        if not isinstance(membership_policy, list):
+            raise ValueError("identity membership policy is malformed")
+        actual_pairs = {
+            (str(item[0]), str(item[1])) for item in plan.get("memberships", [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
+        policy_pairs = {
+            (str(item.get("user")), str(item.get("group")))
+            for item in membership_policy
+            if isinstance(item, dict)
+        }
+        if actual_pairs != policy_pairs or len(actual_pairs) != len(plan.get("memberships", [])):
+            raise ValueError("identity membership policy does not bind the plan")
+        group_gids = {str(name): int(gid) for name, gid in plan.get("groups", [])}
+        expected_primary = {
+            str(name): int(gid) for name, _uid, gid in plan.get("users", [])
+        }
+        expected_memberships: dict[str, set[int]] = {
+            name: {gid} for name, gid in expected_primary.items()
+        }
+        for item in membership_policy:
+            if not isinstance(item, dict) or set(item) != {"user", "group"}:
+                raise ValueError("identity membership policy fields are not exact")
+            user = _validated_account_name(item["user"])
+            group = _validated_account_name(item["group"])
+            if group not in group_gids:
+                try:
+                    group_gids[group] = int(grp.getgrnam(group).gr_gid)
+                except KeyError as exc:
+                    raise ValueError("identity membership policy references unknown group") from exc
+            expected_memberships.setdefault(user, set()).add(group_gids[group])
+        for name in sorted(expected_memberships):
+            if name in user_missing:
+                continue
+            account = pwd.getpwnam(name)
+            observed = set(os.getgrouplist(account.pw_name, int(account.pw_gid)))
+            if observed != expected_memberships[name]:
+                raise ValueError(
+                    f"existing account {name} has unexpected supplementary groups"
+                )
     commands = render_identity_provision_commands(plan)
     for command in commands:
         if command[0] != "/usr/bin/dscl":
@@ -993,7 +1731,7 @@ def provision_identity_plan(
     for role in ("broker", "controller", "publisher", "operator", "model"):
         name, uid, _gid = expected[role]
         account = pwd.getpwnam(name)
-        if int(account.pw_uid) != int(uid):
+        if (int(account.pw_uid), int(account.pw_gid)) != (int(uid), int(_gid)):
             raise ValueError(f"{role} identity readback failed")
     for name, gid in plan.get("groups", []):
         if int(grp.getgrnam(name).gr_gid) != int(gid):
@@ -1001,6 +1739,15 @@ def provision_identity_plan(
     memberships = system_group_memberships({
         int(value[1]) for value in expected.values()
     })
+    if membership_policy is not None:
+        by_uid = {int(value[1]): str(role) for role, value in expected.items()}
+        expected_by_uid = {
+            int(expected[role][1]): set(expected_memberships[str(expected[role][0])])
+            for role in by_uid.values()
+        }
+        for uid, expected_groups in expected_by_uid.items():
+            if memberships.get(uid, set()) != expected_groups:
+                raise ValueError("identity membership readback contains unexpected groups")
     validate_group_separation(
         broker_uid=int(expected["broker"][1]),
         model_uid=int(expected["model"][1]),
@@ -1025,6 +1772,7 @@ def render_filesystem_provision_plan(
     client_config_paths: dict[str, Path],
     sequence_paths: dict[str, Path],
     runtime_assets: dict[str, object],
+    sealed_runtime_plan: dict[str, object] | None = None,
     worker_client_config_path: Path | None = None,
     worker_sequence_path: Path | None = None,
     additional_files: list[dict[str, Any]] | None = None,
@@ -1295,11 +2043,39 @@ def render_filesystem_provision_plan(
             },
         ])
     files.extend(additional_files or [])
-    return {
+    result = {
         "contract": "hermes.kanban_broker_filesystem_plan.v1",
+        "schema_version": 1,
         "directories": sorted(deduplicated.values(), key=lambda item: item["path"]),
         "files": sorted(files, key=lambda item: item["path"]),
     }
+    if sealed_runtime_plan is not None:
+        if not isinstance(sealed_runtime_plan, dict) or sealed_runtime_plan.get("contract") != SEALED_RUNTIME_CONTRACT:
+            raise ValueError("sealed runtime filesystem binding is malformed")
+        result["sealed_runtime"] = {
+            "contract": SEALED_RUNTIME_CONTRACT,
+            "runtime_root": str(sealed_runtime_plan["runtime_root"]),
+            "entrypoint_path": str(sealed_runtime_plan["entrypoint_path"]),
+            "direct_probe_path": str(sealed_runtime_plan["direct_probe_path"]),
+            "direct_probe_sha256": str(sealed_runtime_plan["direct_probe_sha256"]),
+            "python_executable_path": str(sealed_runtime_plan["python_executable_path"]),
+            "python_sha256": str(sealed_runtime_plan["python_sha256"]),
+            "package_root": str(sealed_runtime_plan["package_root"]),
+            "package_manifest_sha256": str(sealed_runtime_plan["package_manifest_sha256"]),
+            "runtime_manifest_sha256": str(sealed_runtime_plan["runtime_manifest_sha256"]),
+            "official_release": str(sealed_runtime_plan["official_release"]),
+            "official_asset_id": int(sealed_runtime_plan["official_asset_id"]),
+            "archives": [
+                {
+                    "role": str(archive["role"]),
+                    "path": str(archive["source_path"]),
+                    "sha256": str(archive["sha256"]),
+                    "size": int(archive["size"]),
+                }
+                for archive in sealed_runtime_plan["archives"]
+            ],
+        }
+    return result
 
 
 def render_broker_client_config(
@@ -1356,6 +2132,7 @@ def _open_directory_fd(path: Path) -> int:
 def _provision_directory_asset(item: dict) -> None:
     path = Path(item["path"])
     parent_fd = _open_directory_fd(path.parent)
+    parent_before = os.fstat(parent_fd)
     name = path.name
     created = False
     try:
@@ -1395,6 +2172,9 @@ def _provision_directory_asset(item: dict) -> None:
                 raise ValueError("broker directory asset ownership or mode mismatches")
         finally:
             os.close(fd)
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError("broker directory parent changed during provisioning")
     finally:
         os.close(parent_fd)
 
@@ -1402,6 +2182,7 @@ def _provision_directory_asset(item: dict) -> None:
 def _provision_file_asset(item: dict, payload: bytes | None) -> None:
     path = Path(item["path"])
     parent_fd = _open_directory_fd(path.parent)
+    parent_before = os.fstat(parent_fd)
     name = path.name
     try:
         try:
@@ -1431,7 +2212,10 @@ def _provision_file_asset(item: dict, payload: bytes | None) -> None:
             try:
                 os.fchown(fd, int(item["uid"]), int(item["gid"]))
                 os.fchmod(fd, int(item["mode"]))
-                os.write(fd, payload)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -1454,7 +2238,16 @@ def _provision_file_asset(item: dict, payload: bytes | None) -> None:
                 or stat.S_IMODE(info.st_mode) != int(item["mode"])
             ):
                 raise ValueError("broker file asset ownership or mode mismatches")
-            existing = os.read(fd, 1024 * 1024 + 1)
+            read_limit = _MAX_RUNTIME_ARCHIVE_BYTES if str(item.get("kind")) == "runtime_archive" else 1024 * 1024
+            chunks: list[bytes] = []
+            remaining = read_limit + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            existing = b"".join(chunks)
             expected_sha = item.get("sha256")
             if (
                 expected_sha is not None
@@ -1466,16 +2259,365 @@ def _provision_file_asset(item: dict, payload: bytes | None) -> None:
                     raise ValueError("broker surface key has invalid length")
             elif payload is None or existing != payload:
                 raise ValueError("existing broker file asset differs from install plan")
+            after = os.fstat(fd)
+            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+            ):
+                raise ValueError("broker file asset changed during provisioning")
+            parent_after = os.fstat(parent_fd)
+            if (parent_before.st_dev, parent_before.st_ino) != (parent_after.st_dev, parent_after.st_ino):
+                raise ValueError("broker file parent changed during provisioning")
         finally:
             os.close(fd)
     finally:
         os.close(parent_fd)
 
 
+def _ensure_directory_tree(
+    path: Path, *, mode: int, uid: int, gid: int, apply_final: bool = True
+) -> None:
+    """Create a directory path using only descriptor-relative no-follow opens."""
+    parts = _absolute_parts(Path(path))
+    fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        for index, part in enumerate(parts):
+            created = False
+            parent_before = os.fstat(fd)
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o711, dir_fd=fd)
+                created = True
+                child = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=fd,
+                )
+            try:
+                before = os.fstat(child)
+                if not stat.S_ISDIR(before.st_mode):
+                    raise ValueError("runtime extraction encountered a non-directory")
+                if created or (apply_final and index == len(parts) - 1):
+                    os.fchown(child, int(uid), int(gid))
+                    os.fchmod(child, int(mode) if apply_final and index == len(parts) - 1 else 0o711)
+                after = os.fstat(child)
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise ValueError("runtime extraction directory changed during provisioning")
+                parent_after = os.fstat(fd)
+                if (parent_before.st_dev, parent_before.st_ino) != (
+                    parent_after.st_dev, parent_after.st_ino
+                ):
+                    raise ValueError("runtime extraction parent changed during provisioning")
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+
+
+def _runtime_extract_file(path: Path, content: bytes, *, mode: int, uid: int, gid: int) -> None:
+    parent_fd = _open_directory_fd(Path(path).parent)
+    parent_before = os.fstat(parent_fd)
+    name = Path(path).name
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        except FileNotFoundError:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                int(mode),
+                dir_fd=parent_fd,
+            )
+            try:
+                os.fchown(fd, int(uid), int(gid))
+                os.fchmod(fd, int(mode))
+                view = memoryview(content)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        try:
+            before = os.fstat(fd)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != int(uid)
+                    or before.st_gid != int(gid) or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != int(mode)):
+                raise ValueError("runtime file ownership or mode is unsafe")
+            chunks: list[bytes] = []
+            remaining = len(content) + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            existing = b"".join(chunks)
+            after = os.fstat(fd)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+            ):
+                raise ValueError("runtime file changed during provisioning")
+            if existing != content:
+                raise ValueError("runtime file differs from sealed archive")
+            parent_after = os.fstat(parent_fd)
+            if (parent_before.st_dev, parent_before.st_ino) != (
+                parent_after.st_dev, parent_after.st_ino
+            ):
+                raise ValueError("runtime file parent changed during provisioning")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _runtime_extract_symlink(path: Path, target: str) -> None:
+    parent_fd = _open_directory_fd(Path(path).parent)
+    parent_before = os.fstat(parent_fd)
+    name = Path(path).name
+    try:
+        try:
+            info = os.lstat(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.symlink(target, name, dir_fd=parent_fd)
+            created_info = os.lstat(name, dir_fd=parent_fd)
+            if not stat.S_ISLNK(created_info.st_mode) or os.readlink(
+                name, dir_fd=parent_fd
+            ) != target:
+                raise ValueError("runtime symlink changed during provisioning")
+            parent_after = os.fstat(parent_fd)
+            if (parent_before.st_dev, parent_before.st_ino) != (
+                parent_after.st_dev, parent_after.st_ino
+            ):
+                raise ValueError("runtime symlink parent changed during provisioning")
+            return
+        observed_target = os.readlink(name, dir_fd=parent_fd)
+        after = os.lstat(name, dir_fd=parent_fd)
+        if (info.st_dev, info.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("runtime symlink changed during provisioning")
+        if not stat.S_ISLNK(info.st_mode) or observed_target != target:
+            raise ValueError("runtime symlink differs from sealed archive")
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (
+            parent_after.st_dev, parent_after.st_ino
+        ):
+            raise ValueError("runtime symlink parent changed during provisioning")
+    finally:
+        os.close(parent_fd)
+
+
+def _read_runtime_manifest_file(
+    path: Path, *, expected_sha256: str, expected_runtime_root: Path,
+    expected_python_executable: Path, expected_python_version: str,
+) -> dict[str, object]:
+    _validated_install_path(path, field="runtime manifest")
+    raw, info = _read_sealed_file_bytes(
+        path, max_bytes=4 * 1024 * 1024, expected_sha256=None
+    )
+    if (info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o644):
+        raise ValueError("runtime manifest ownership or mode is unsafe")
+    try:
+        manifest = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime manifest is invalid JSON") from exc
+    required = {
+        "contract", "schema_version", "runtime_root", "python_executable",
+        "python_version", "runtime_manifest_sha256", "entries",
+    }
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != required
+        or manifest.get("contract") != RUNTIME_MANIFEST_CONTRACT
+        or manifest.get("schema_version") != 1
+        or manifest.get("runtime_root") != str(expected_runtime_root)
+        or manifest.get("python_executable") != str(expected_python_executable)
+        or manifest.get("python_version") != expected_python_version
+        or manifest.get("runtime_manifest_sha256") != expected_sha256
+        or not isinstance(manifest.get("entries"), list)
+    ):
+        raise ValueError("runtime manifest fields are not exact")
+    if hashlib.sha256(_canonical_json_bytes(manifest["entries"])).hexdigest() != expected_sha256:
+        raise ValueError("runtime manifest digest does not match the sealed plan")
+    return manifest
+
+
+def _materialize_sealed_runtime(
+    filesystem_plan: dict[str, object], *, runtime_probe=None
+) -> None:
+    descriptor = filesystem_plan.get("sealed_runtime")
+    if not isinstance(descriptor, dict) or descriptor.get("contract") != SEALED_RUNTIME_CONTRACT:
+        raise ValueError("filesystem plan has no sealed runtime binding")
+    destinations = descriptor.get("archive_destinations")
+    if not isinstance(destinations, list) or len(destinations) != 2:
+        raise ValueError("sealed runtime archive destinations are incomplete")
+    for destination in destinations:
+        if not isinstance(destination, dict) or set(destination) != {"path", "sha256", "size"}:
+            raise ValueError("sealed runtime archive destination fields are not exact")
+        archive_path = destination.get("path")
+        if not isinstance(archive_path, str) or not Path(archive_path).is_absolute() or ".." in Path(archive_path).parts:
+            raise ValueError("sealed runtime archive destination is invalid")
+        _validated_hex_sha(destination.get("sha256"), field="sealed runtime archive SHA256", length=64)
+        size = destination.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > _MAX_RUNTIME_ARCHIVE_BYTES:
+            raise ValueError("sealed runtime archive destination size is invalid")
+    runtime_root = Path(str(descriptor["runtime_root"]))
+    entrypoint = Path(str(descriptor["entrypoint_path"]))
+    direct_probe = Path(str(descriptor.get("direct_probe_path") or ""))
+    bound = render_sealed_runtime_plan(
+        runtime_archive_path=Path(str(destinations[0]["path"])),
+        runtime_archive_sha256=str(destinations[0]["sha256"]),
+        hermes_install_archive_path=Path(str(destinations[1]["path"])),
+        hermes_install_archive_sha256=str(destinations[1]["sha256"]),
+        runtime_root=runtime_root,
+        entrypoint_path=entrypoint,
+    )
+    for field in ("python_sha256", "package_manifest_sha256", "runtime_manifest_sha256"):
+        if str(descriptor.get(field)) != str(bound[field]):
+            raise ValueError("sealed runtime manifest binding differs from archives")
+    if (
+        direct_probe != Path(str(bound["direct_probe_path"]))
+        or str(descriptor.get("direct_probe_sha256")) != str(bound["direct_probe_sha256"])
+    ):
+        raise ValueError("sealed runtime direct probe binding differs from archives")
+    if descriptor.get("official_release") != OFFICIAL_RUNTIME_RELEASE or int(descriptor.get("official_asset_id", -1)) != OFFICIAL_RUNTIME_ASSET_ID:
+        raise ValueError("sealed runtime official artifact binding is invalid")
+    manifest_path = Path(str(descriptor.get("runtime_manifest_path") or ""))
+    manifest = _read_runtime_manifest_file(
+        manifest_path,
+        expected_sha256=str(bound["runtime_manifest_sha256"]),
+        expected_runtime_root=runtime_root,
+        expected_python_executable=Path(str(bound["python_executable_path"])),
+        expected_python_version=str(bound["python_version"]),
+    )
+    if manifest["entries"] != bound["entries"]:
+        raise ValueError("runtime manifest entries differ from the sealed plan")
+    archives = [
+        _read_runtime_archive_manifest(
+            Path(str(destinations[0]["path"])),
+            expected_sha256=str(destinations[0]["sha256"]),
+            strip_prefix="python",
+            required_paths={"bin/python3.11", "bin/python3", "lib/python3.11"},
+            role="CPython",
+        ),
+        _read_runtime_archive_manifest(
+            Path(str(destinations[1]["path"])),
+            expected_sha256=str(destinations[1]["sha256"]),
+            strip_prefix="hermes-install",
+            required_paths={
+                "hermes_cli/__init__.py",
+                "hermes_cli/main.py",
+                "hermes_cli/kanban_broker_canary.py",
+                "hermes_cli/kanban_broker_client.py",
+                "hermes_cli/kanban_broker_install.py",
+                "hermes_cli/kanban_broker_protocol.py",
+                "hermes_cli/kanban_broker_service.py",
+                "hermes_cli/kanban_broker_worker.py",
+                "hermes_cli/kanban_dedicated_broker.py",
+            },
+            role="Hermes install",
+        ),
+    ]
+    if str(archives[0]["sha256"]) != OFFICIAL_RUNTIME_ARCHIVE_SHA256:
+        raise ValueError("sealed runtime CPython archive is not the reviewed artifact")
+    _ensure_directory_tree(runtime_root, mode=0o711, uid=0, gid=0)
+    package_prefix = PurePosixPath("lib/python3.11/site-packages")
+    archive_contents: list[dict[str, bytes]] = []
+    for index, archive in enumerate(archives):
+        contents: dict[str, bytes] = {}
+        archive_data, _archive_info = _read_sealed_file_bytes(
+            Path(str(destinations[index]["path"])),
+            max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+            expected_size=int(destinations[index].get("size", 0))
+            if destinations[index].get("size") is not None else None,
+            expected_sha256=str(destinations[index]["sha256"]),
+        )
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as stream:
+            for member in stream.getmembers():
+                raw_name = member.name.rstrip("/") if member.isdir() else member.name
+                if not raw_name.startswith("python/" if index == 0 else "hermes-install/"):
+                    continue
+                source = raw_name.split("/", 1)[1]
+                if member.isfile():
+                    handle = stream.extractfile(member)
+                    if handle is None:
+                        raise ValueError("sealed runtime archive file cannot be read")
+                    contents[source] = handle.read(_MAX_RUNTIME_ARCHIVE_FILE_BYTES + 1)
+        archive_contents.append(contents)
+    for index, archive in enumerate(archives):
+        for item in cast(list[dict[str, object]], archive["entries"]):
+            source = str(item["path"]).rstrip("/")
+            destination_rel = PurePosixPath(source)
+            if index == 1:
+                destination_rel = package_prefix / source
+            destination = runtime_root / destination_rel.as_posix()
+            if item["type"] == "directory":
+                _ensure_directory_tree(destination, mode=0o555, uid=0, gid=0)
+            elif item["type"] == "file":
+                parent = destination.parent
+                _ensure_directory_tree(parent, mode=0o555, uid=0, gid=0)
+                content = archive_contents[index].get(source)
+                if content is None:
+                    raise ValueError("sealed runtime archive file cannot be read")
+                if hashlib.sha256(content).hexdigest() != str(item["sha256"]):
+                    raise ValueError("sealed runtime archive changed during extraction")
+                _runtime_extract_file(destination, content, mode=int(item["mode"]), uid=0, gid=0)
+            elif item["type"] == "symlink":
+                source_target = str(item["target"])
+                # Manifest targets are normalized relative to the archive
+                # root, so resolve them directly under the destination root.
+                target_rel = PurePosixPath(source_target)
+                if index == 1:
+                    target_rel = package_prefix / target_rel
+                target_rel = PurePosixPath(posixpath.normpath(target_rel.as_posix()))
+                link_target = posixpath.relpath(target_rel.as_posix(), start=PurePosixPath(source).parent.as_posix() if index == 0 else (package_prefix / PurePosixPath(source).parent).as_posix())
+                _runtime_extract_symlink(destination, link_target)
+            else:
+                raise ValueError("sealed runtime manifest contains an unsupported entry")
+    _runtime_extract_file(entrypoint, RUNTIME_ENTRYPOINT_CONTENT.encode("utf-8"), mode=0o555, uid=0, gid=0)
+    _runtime_extract_file(direct_probe, RUNTIME_DIRECT_PROBE_CONTENT.encode("utf-8"), mode=0o555, uid=0, gid=0)
+    # The immutable root and every directory in the recursive closure become
+    # non-writable only after all files and the wrapper have been materialized.
+    # This also tightens implicit parent directories for archives that omit
+    # explicit tar directory members.
+    runtime_directories: set[Path] = {runtime_root}
+    for item in cast(list[dict[str, object]], bound["entries"]):
+        relative = PurePosixPath(str(item["path"]).rstrip("/"))
+        destination = runtime_root / relative
+        directory = destination if item["type"] == "directory" else destination.parent
+        while directory != runtime_root and runtime_root in directory.parents:
+            runtime_directories.add(directory)
+            directory = directory.parent
+        runtime_directories.add(runtime_root)
+    for directory in sorted(runtime_directories, key=lambda value: len(value.parts)):
+        _ensure_directory_tree(directory, mode=0o555, uid=0, gid=0)
+    probe = runtime_probe or verify_isolated_runtime_import
+    try:
+        probe(
+            python_executable=Path(str(bound["python_executable_path"])),
+            entrypoint_path=entrypoint,
+            direct_probe_path=direct_probe,
+            module="hermes_cli.kanban_broker_client",
+        )
+    except Exception as exc:
+        raise ValueError("sealed runtime isolated import probe failed") from exc
+
+
 def provision_filesystem_plan(
     plan: dict,
     *,
     payloads: dict[str, bytes],
+    runtime_probe=None,
 ) -> None:
     """Materialize one exact disabled plan without following symlinks."""
 
@@ -1490,13 +2632,26 @@ def provision_filesystem_plan(
     files = plan.get("files")
     if not isinstance(directories, list) or not isinstance(files, list):
         raise ValueError("broker filesystem plan is malformed")
+    strict_records = all(
+        isinstance(item, dict) and {"sha256", "size", "secret"}.issubset(item)
+        for item in files
+    )
+    if strict_records:
+        for item in directories:
+            _validate_plan_artifact_record(item, directory=True)
+        for item in files:
+            _validate_plan_artifact_record(item, directory=False)
     paths = [str(item.get("path")) for item in [*directories, *files]]
     if len(paths) != len(set(paths)):
         raise ValueError("broker filesystem plan contains duplicate paths")
+    if any(not Path(path).is_absolute() or ".." in Path(path).parts for path in paths):
+        raise ValueError("broker filesystem plan contains an unsafe path")
     for item in sorted(directories, key=lambda value: len(Path(value["path"]).parts)):
         _provision_directory_asset(item)
     for item in files:
         _provision_file_asset(item, payloads.get(str(item["path"])))
+    if "sealed_runtime" in plan:
+        _materialize_sealed_runtime(plan, runtime_probe=runtime_probe)
 
 
 def provision_disabled_install(
@@ -1579,42 +2734,21 @@ def _read_service_config_file(
     path: Path, *, expected_owner_uid: int
 ) -> tuple[dict, os.stat_result]:
     path = Path(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    _validated_install_path(path, field="broker service config")
+    # Give callers a stable diagnostic for an explicitly supplied symlink;
+    # the descriptor-relative O_NOFOLLOW read below remains authoritative for
+    # races between this advisory check and opening the file.
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise ValueError("broker service config must be a real file") from exc
-    try:
-        before = os.fstat(fd)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != int(expected_owner_uid)
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != 0o600
-        ):
+        if stat.S_ISLNK(path.lstat().st_mode):
             raise ValueError("broker service config must be a real file mode 0600")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > 1024 * 1024:
-                raise ValueError("broker service config exceeds the size limit")
-            chunks.append(chunk)
-        after = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise ValueError("broker service config changed during read")
-    finally:
-        os.close(fd)
+    except FileNotFoundError as exc:
+        raise ValueError("broker service config must be a real file mode 0600") from exc
+    raw, before = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if (before.st_uid != int(expected_owner_uid)
+            or stat.S_IMODE(before.st_mode) != 0o600):
+        raise ValueError("broker service config must be a real file mode 0600")
     try:
-        config = json.loads(b"".join(chunks))
+        config = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("broker service config is invalid JSON") from exc
     if (
@@ -1633,12 +2767,8 @@ def service_config_sha256(path: Path, *, expected_owner_uid: int) -> str:
     _config, _info = _read_service_config_file(
         Path(path), expected_owner_uid=expected_owner_uid
     )
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(Path(path), flags)
-    try:
-        return hashlib.sha256(os.read(fd, 1024 * 1024 + 1)).hexdigest()
-    finally:
-        os.close(fd)
+    raw, _info = _read_sealed_file_bytes(Path(path), max_bytes=1024 * 1024)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _read_canary_key(path: Path) -> bytes:
@@ -1732,45 +2862,60 @@ def _replace_service_config(
 ) -> dict:
     path = Path(path)
     parent = path.parent
-    parent_before = parent.lstat()
+    parent_fd = _open_directory_fd(parent)
+    parent_before = os.fstat(parent_fd)
     if (
-        stat.S_ISLNK(parent_before.st_mode)
-        or not stat.S_ISDIR(parent_before.st_mode)
+        not stat.S_ISDIR(parent_before.st_mode)
         or stat.S_IMODE(parent_before.st_mode) & 0o022
     ):
+        os.close(parent_fd)
         raise ValueError("broker config parent must not be group/world writable")
     encoded = (
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         + b"\n"
     )
-    temporary = parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(temporary, flags, 0o600)
+    name = path.name
+    temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     try:
-        os.write(fd, encoded)
-        os.fchown(fd, int(original.st_uid), int(original.st_gid))
-        os.fchmod(fd, 0o600)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        parent_after = parent.lstat()
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fchown(fd, int(original.st_uid), int(original.st_gid))
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent_after = os.fstat(parent_fd)
         if (parent_after.st_dev, parent_after.st_ino) != (
             parent_before.st_dev,
             parent_before.st_ino,
         ):
             raise ValueError("broker config parent changed during update")
-        current = path.lstat()
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
             raise ValueError("broker service config changed during update")
-        os.replace(temporary, path)
-        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
     reread, _info = _read_service_config_file(
         path, expected_owner_uid=int(original.st_uid)
     )
@@ -1906,6 +3051,9 @@ def activate_service_config(
         or reread.get("trusted_publisher_enabled") is not True
     ):
         raise ValueError("broker activation readback failed")
+    _update_runtime_attestation(
+        reread, service_config_path=Path(path), active=True, revoked=False
+    )
     return reread
 
 
@@ -1931,6 +3079,9 @@ def stage_service_config(path: Path, *, expected_owner_uid: int) -> dict:
         or reread.get("trusted_publisher_enabled") is not False
     ):
         raise ValueError("broker staging readback failed")
+    _update_runtime_attestation(
+        reread, service_config_path=Path(path), active=True, revoked=False
+    )
     return reread
 
 
@@ -2239,6 +3390,9 @@ def disable_service_config(path: Path, *, expected_owner_uid: int) -> dict:
         or reread.get("trusted_publisher_enabled") is not False
     ):
         raise ValueError("broker service config disable readback failed")
+    _update_runtime_attestation(
+        reread, service_config_path=path, active=False, revoked=True
+    )
     return reread
 
 
@@ -2252,29 +3406,14 @@ def verify_service_disabled(path: Path, *, expected_owner_uid: int) -> bool:
     )
 
 
-def _read_root_json(path: Path, *, contract: str) -> dict:
+def _read_root_json(path: Path, *, contract: str, allow_current_owner: bool = False) -> dict:
     path = Path(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise ValueError(
-            "broker installer input must be a real root-owned file"
-        ) from exc
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != 0
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise ValueError("broker installer input must be root-owned mode 0600")
-        raw = os.read(fd, 4 * 1024 * 1024 + 1)
-        if len(raw) > 4 * 1024 * 1024:
-            raise ValueError("broker installer input exceeds size limit")
-    finally:
-        os.close(fd)
+    _validated_install_path(path, field="broker installer input")
+    raw, info = _read_sealed_file_bytes(path, max_bytes=4 * 1024 * 1024)
+    if info.st_uid not in ({0, os.geteuid()} if allow_current_owner else {0}):
+        raise ValueError("broker installer input must be root-owned mode 0600")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("broker installer input must be root-owned mode 0600")
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2299,12 +3438,25 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--desired-identities", "--identities", type=Path, required=True)
     render.add_argument("--install-root", type=Path, required=True)
     render.add_argument("--output-root", type=Path)
-    render.add_argument("--runtime-source-root", type=Path, default=Path(__file__).resolve().parent)
+    render.add_argument("--runtime-archive", type=Path, required=True)
+    render.add_argument("--runtime-archive-sha256", required=True)
+    render.add_argument("--hermes-install-archive", type=Path, required=True)
+    render.add_argument("--hermes-install-archive-sha256", required=True)
+    render.add_argument("--hermes-source-sha", required=True)
+    render.add_argument("--radulator-source-path", type=Path, required=True)
     render.add_argument("--source-sha", "--radulator-source-sha", required=True)
     render.add_argument("--dispatcher-profile", required=True)
-    render.add_argument("--python", type=Path, default=Path("/usr/bin/python3"))
     render.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
     render.add_argument("--install-nonce")
+    inventory_check = subparsers.add_parser(
+        "validate-inventory", help="validate a complete explicit host identity inventory"
+    )
+    inventory_check.add_argument("--inventory", type=Path, required=True)
+    allocator = subparsers.add_parser(
+        "allocate-identities", help="render the reviewed deterministic 450-453 identity allocation"
+    )
+    allocator.add_argument("--inventory", type=Path, required=True)
+    allocator.add_argument("--output", type=Path, required=True)
     identities = subparsers.add_parser("provision-identities")
     identities.add_argument("--plan", type=Path, required=True)
     assets = subparsers.add_parser("provision-assets")
@@ -2323,49 +3475,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command in {"render-plan", "plan"}:
         def read_input(path: Path, expected: str) -> dict:
-            path = Path(path)
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-            try:
-                fd = os.open(path, flags)
-            except OSError as exc:
-                raise ValueError("broker plan input is unavailable") from exc
-            try:
-                info = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid not in {0, os.geteuid()}
-                    or info.st_nlink != 1
-                    or stat.S_IMODE(info.st_mode) != 0o600
-                ):
-                    raise ValueError("broker plan input must be owner-only mode 0600")
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > 4 * 1024 * 1024:
-                        raise ValueError("broker plan input exceeds size limit")
-                    chunks.append(chunk)
-            finally:
-                os.close(fd)
-            raw = b"".join(chunks)
-            try:
-                value = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError("broker plan input is invalid JSON") from exc
-            if not isinstance(value, dict) or value.get("contract") != expected:
-                raise ValueError("broker plan input contract is unsupported")
+            value = _read_root_json(Path(path), contract=expected, allow_current_owner=True)
             return value
         plan = render_broker_installation_plan(
             host_inventory=read_input(args.inventory, HOST_IDENTITY_INVENTORY_CONTRACT),
             desired_identities=read_input(args.desired_identities, DESIRED_IDENTITIES_CONTRACT),
             install_root=args.install_root,
-            runtime_source_root=args.runtime_source_root,
+            runtime_archive_path=args.runtime_archive,
+            runtime_archive_sha256=args.runtime_archive_sha256,
+            hermes_install_archive_path=args.hermes_install_archive,
+            hermes_install_archive_sha256=args.hermes_install_archive_sha256,
+            hermes_source_sha=args.hermes_source_sha,
+            radulator_source_path=args.radulator_source_path,
             radulator_source_sha=args.source_sha,
             dispatcher_profile=args.dispatcher_profile,
-            python_executable=args.python,
             git_executable=args.git,
             install_nonce=args.install_nonce,
         )
@@ -2373,6 +3496,18 @@ def main(argv: list[str] | None = None) -> int:
             plan,
             output_root=args.output_root if args.output_root is not None else args.install_root,
         )
+        return 0
+    if args.command == "validate-inventory":
+        _validate_host_identity_inventory(
+            _read_root_json(args.inventory, contract=HOST_IDENTITY_INVENTORY_CONTRACT, allow_current_owner=True)
+        )
+        return 0
+    if args.command == "allocate-identities":
+        desired = allocate_desired_identities(
+            _read_root_json(args.inventory, contract=HOST_IDENTITY_INVENTORY_CONTRACT, allow_current_owner=True)
+        )
+        output = _validated_install_path(args.output, field="identity allocation output", allow_root=False)
+        _atomic_artifact_write(output, _json_artifact_bytes(desired), mode=0o600, uid=os.geteuid(), gid=os.getegid())
         return 0
     if os.geteuid() != 0:  # windows-footgun: ok - macOS launchd installer only
         raise PermissionError("broker install/rollback commands require root")
@@ -2389,7 +3524,8 @@ def main(argv: list[str] | None = None) -> int:
             args.payloads, contract="hermes.kanban_broker_asset_payloads.v1"
         )
         raw_payloads = encoded.get("payloads")
-        if not isinstance(raw_payloads, dict):
+        external = encoded.get("external_payloads", [])
+        if not isinstance(raw_payloads, dict) or not isinstance(external, list):
             raise ValueError("broker asset payload manifest is malformed")
         payloads: dict[str, bytes] = {}
         for path, value in raw_payloads.items():
@@ -2399,6 +3535,30 @@ def main(argv: list[str] | None = None) -> int:
                 payloads[path] = base64.b64decode(value, validate=True)
             except ValueError as exc:
                 raise ValueError("broker asset payload is not valid base64") from exc
+        seen_external: set[str] = set()
+        for item in external:
+            if not isinstance(item, dict) or set(item) != {"path", "source_path", "sha256", "size"}:
+                raise ValueError("broker external payload fields are not exact")
+            destination = item["path"]
+            source = item["source_path"]
+            if (not isinstance(destination, str) or not isinstance(source, str)
+                    or destination in seen_external or not Path(destination).is_absolute()
+                    or not Path(source).is_absolute()):
+                raise ValueError("broker external payload path is invalid")
+            _validated_install_path(destination, field="broker external destination")
+            source_path = _validated_install_path(source, field="broker external source")
+            seen_external.add(destination)
+            size = item["size"]
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > _MAX_RUNTIME_ARCHIVE_BYTES:
+                raise ValueError("broker external payload size is invalid")
+            digest = _validated_hex_sha(item["sha256"], field="external payload SHA256", length=64)
+            data, _source_info = _read_sealed_file_bytes(
+                source_path,
+                max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+                expected_size=size,
+                expected_sha256=digest,
+            )
+            payloads[destination] = data
         provision_disabled_install(
             plan,
             payloads=payloads,
@@ -2560,6 +3720,7 @@ def render_launchd_plist(
     sandbox_profile: Path | None = None,
     package_root: Path | None = None,
     runtime_entrypoint_path: Path | None = None,
+    runtime_manifest_path: Path | None = None,
 ) -> str:
     """Return a launchd plist with no credentials and no activation flag."""
     profile_path = (
@@ -2569,6 +3730,8 @@ def render_launchd_plist(
         raise ValueError("broker launchd package root must be absolute")
     if runtime_entrypoint_path is not None and not Path(runtime_entrypoint_path).is_absolute():
         raise ValueError("broker runtime entrypoint must be absolute")
+    if runtime_manifest_path is not None and not Path(runtime_manifest_path).is_absolute():
+        raise ValueError("broker runtime manifest must be absolute")
     program = [
         str(Path(python_executable)),
         "-m",
@@ -2610,6 +3773,10 @@ def render_launchd_plist(
             "GIT_TERMINAL_PROMPT": "0",
         },
     }
+    if runtime_manifest_path is not None:
+        payload["EnvironmentVariables"]["HERMES_KANBAN_RUNTIME_MANIFEST"] = str(
+            Path(runtime_manifest_path)
+        )
     if runtime_entrypoint_path is None:
         payload["EnvironmentVariables"]["PYTHONPATH"] = str(Path(package_root).parent)
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True).decode("utf-8")
@@ -2628,6 +3795,9 @@ def render_worker_launchd_plist(
     model_user: str,
     worker_hermes_root: Path,
     runtime_entrypoint_path: Path | None = None,
+    runtime_entrypoint_sha256: str | None = None,
+    runtime_manifest_path: Path | None = None,
+    runtime_manifest_sha256: str | None = None,
 ) -> str:
     """Render the persistent unprivileged reverse-worker listener."""
 
@@ -2644,6 +3814,16 @@ def render_worker_launchd_plist(
         raise ValueError("worker launchd paths must be absolute")
     if runtime_entrypoint_path is not None and not Path(runtime_entrypoint_path).is_absolute():
         raise ValueError("worker runtime entrypoint must be absolute")
+    if runtime_entrypoint_path is not None:
+        _validated_hex_sha(runtime_entrypoint_sha256, field="worker runtime entrypoint SHA256", length=64)
+    elif runtime_entrypoint_sha256 is not None:
+        raise ValueError("worker runtime entrypoint SHA requires an entrypoint path")
+    if runtime_manifest_path is not None and not Path(runtime_manifest_path).is_absolute():
+        raise ValueError("worker runtime manifest must be absolute")
+    if runtime_manifest_path is not None:
+        _validated_hex_sha(runtime_manifest_sha256, field="worker runtime manifest SHA256", length=64)
+    elif runtime_manifest_sha256 is not None:
+        raise ValueError("worker runtime manifest SHA requires a manifest path")
     if not re.fullmatch(r"[0-9a-f]{64}", str(python_sha256)) or not re.fullmatch(
         r"[0-9a-f]{64}", str(package_manifest_sha256)
     ):
@@ -2674,6 +3854,13 @@ def render_worker_launchd_plist(
             str(package_manifest_sha256),
             "--worker-hermes-root",
             str(Path(worker_hermes_root)),
+            *( ["--runtime-entrypoint", str(Path(runtime_entrypoint_path))]
+               if runtime_entrypoint_path is not None else []),
+            *( ["--runtime-entrypoint-sha256", str(runtime_entrypoint_sha256)]
+               if runtime_entrypoint_path is not None else []),
+            *( ["--runtime-manifest-path", str(Path(runtime_manifest_path)),
+                "--runtime-manifest-sha256", str(runtime_manifest_sha256)]
+               if runtime_manifest_path is not None else []),
         ],
         "UserName": _validated_account_name(model_user),
         "ProcessType": "Background",
@@ -2700,6 +3887,10 @@ def render_worker_launchd_plist(
     }
     if runtime_entrypoint_path is None:
         payload["EnvironmentVariables"]["PYTHONPATH"] = str(Path(package_root).parent)
+    if runtime_manifest_path is not None:
+        payload["EnvironmentVariables"]["HERMES_KANBAN_RUNTIME_MANIFEST"] = str(
+            Path(runtime_manifest_path)
+        )
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True).decode("utf-8")
 
 
@@ -2709,8 +3900,9 @@ def render_runtime_entrypoint_asset(*, entrypoint_path: Path, package_root: Path
     package = Path(package_root)
     if not entrypoint.is_absolute() or not package.is_absolute():
         raise ValueError("runtime entrypoint and package paths must be absolute")
-    if entrypoint.parent.parent != package.parent:
-        raise ValueError("runtime entrypoint must be next to the installed package")
+    runtime_root = entrypoint.parent.parent
+    if package != runtime_root / "lib/python3.11/site-packages/hermes_cli":
+        raise ValueError("runtime entrypoint must bind the interpreter site-packages")
     content = RUNTIME_ENTRYPOINT_CONTENT.encode("utf-8")
     return {
         "path": str(entrypoint),
@@ -2728,14 +3920,25 @@ def verify_isolated_runtime_import(
     *,
     python_executable: Path,
     entrypoint_path: Path,
+    direct_probe_path: Path | None = None,
     module: str = "hermes_cli.kanban_broker_client",
     runner=subprocess.run,
 ) -> None:
     """Prove an installed runtime imports without PYTHONPATH or a checkout."""
     if not module or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", module) is None:
         raise ValueError("runtime import module is invalid")
+    if direct_probe_path is not None:
+        probe = Path(direct_probe_path)
+        if not probe.is_absolute() or ".." in probe.parts:
+            raise ValueError("runtime direct probe path is invalid")
+        command = [str(Path(python_executable)), "-I", str(probe)]
+    else:
+        command = [
+            str(Path(python_executable)), "-I", str(Path(entrypoint_path)),
+            "--verify-import", module,
+        ]
     result = runner(
-        [str(Path(python_executable)), "-I", str(Path(entrypoint_path)), "--verify-import", module],
+        command,
         check=False,
         capture_output=True,
         text=True,
@@ -2754,10 +3957,14 @@ def render_broker_installation_plan(
     host_inventory: dict,
     desired_identities: dict,
     install_root: Path,
-    runtime_source_root: Path,
+    runtime_archive_path: Path,
+    runtime_archive_sha256: str,
+    hermes_install_archive_path: Path,
+    hermes_install_archive_sha256: str,
+    hermes_source_sha: str | None,
+    radulator_source_path: Path,
     radulator_source_sha: str | None,
     dispatcher_profile: str,
-    python_executable: Path = Path("/usr/bin/python3"),
     git_executable: Path = Path("/usr/bin/git"),
     install_nonce: str | None = None,
 ) -> dict[str, object]:
@@ -2778,6 +3985,19 @@ def render_broker_installation_plan(
     source_sha = _validated_hex_sha(
         radulator_source_sha, field="Radulator source SHA", length=40
     )
+    hermes_commit_sha = _validated_hex_sha(
+        hermes_source_sha, field="Hermes source SHA", length=40
+    )
+    radulator_checkout = _validated_install_path(
+        radulator_source_path, field="Radulator source checkout"
+    )
+    if radulator_checkout == Path(radulator_checkout.anchor):
+        raise ValueError("Radulator source checkout must be a bounded path")
+    try:
+        if radulator_checkout.is_symlink():
+            raise ValueError("Radulator source checkout must not be a symlink")
+    except OSError as exc:
+        raise ValueError("Radulator source checkout cannot be inspected") from exc
     remote_policy = render_radulator_remote_policy(source_sha=source_sha)
     root = _validated_install_path(install_root, field="install root", allow_root=True)
     if root == Path(root.anchor):
@@ -2788,21 +4008,12 @@ def render_broker_installation_plan(
         root_info = None
     if root_info is not None and (stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode)):
         raise ValueError("install root must be a real directory")
-    runtime_source = Path(runtime_source_root)
-    if not runtime_source.is_absolute():
-        raise ValueError("runtime source root must be absolute")
-    _validated_install_path(runtime_source, field="runtime source root", allow_root=True)
-    if runtime_source.is_symlink():
-        raise ValueError("runtime source root must not be a symlink")
-    runtime_source = runtime_source.resolve(strict=True)
-    if not runtime_source.is_dir() or runtime_source.is_symlink():
-        raise ValueError("runtime source root must be a real directory")
-    python = Path(python_executable)
+    python_archive = Path(runtime_archive_path)
+    hermes_archive = Path(hermes_install_archive_path)
     git = Path(git_executable)
-    for executable, field in ((python, "Python executable"), (git, "Git executable")):
-        if not executable.is_absolute() or ".." in executable.parts:
-            raise ValueError(f"{field} path is invalid")
-        _safe_file_sha256(executable)
+    if not git.is_absolute() or ".." in git.parts:
+        raise ValueError("Git executable path is invalid")
+    git_digest = _apple_system_binary_sha256(git)
 
     state_dir = root / "state"
     workspace_root = root / "workspaces"
@@ -2812,8 +4023,10 @@ def render_broker_installation_plan(
     key_root = root / "keys"
     client_root = root / "clients"
     sequence_root = root / "sequences"
-    package_root = root / "runtime" / "hermes_cli"
-    entrypoint_path = root / "runtime" / "bin" / "hermes-python"
+    sealed_runtime_root = root / "runtime" / "sealed"
+    package_root = sealed_runtime_root / "hermes_cli"
+    entrypoint_path = sealed_runtime_root / "bin" / "hermes-python"
+    python = sealed_runtime_root / "bin" / "python3.11"
     service_config_path = root / "config" / "service.json"
     seatbelt_path = state_dir / "broker.sb"
     launchd_root = root / "launchd"
@@ -2840,9 +4053,13 @@ def render_broker_installation_plan(
         surface: sequence_root / surface / "client.sequence"
         for surface in ("controller", "publisher", "operator")
     }
-    worker_client_path = client_root / "worker" / "client.json"
-    worker_sequence_path = sequence_root / "worker" / "client.sequence"
     worker_socket = socket_root / "worker" / "worker.sock"
+    runtime_input_root = root / "install" / "runtime-inputs"
+    runtime_python_archive_path = runtime_input_root / "cpython-runtime.tar.gz"
+    runtime_hermes_archive_path = runtime_input_root / "hermes-install.tar.gz"
+    registration_path = root / "install" / "broker-register.json"
+    runtime_manifest_path = root / "install" / "runtime-manifest.json"
+    runtime_attestation_path = root / "install" / "runtime-attestation.json"
 
     if install_nonce is None:
         install_nonce = hashlib.sha256(
@@ -2850,26 +4067,42 @@ def render_broker_installation_plan(
                 "inventory": inventory,
                 "desired": desired,
                 "install_root": str(root),
+                "hermes_source_sha": hermes_commit_sha,
+                "runtime_archive_sha256": runtime_archive_sha256,
+                "hermes_install_archive_sha256": hermes_install_archive_sha256,
                 "source_sha": source_sha,
+                "radulator_source_path": str(radulator_checkout),
                 "dispatcher_profile": dispatcher_profile,
             })
         ).hexdigest()
     if not isinstance(install_nonce, str) or re.fullmatch(r"[0-9a-f]{64}", install_nonce) is None:
         raise ValueError("install nonce must be 64 lowercase hexadecimal characters")
 
-    runtime_assets = render_runtime_package_assets(
-        source_root=runtime_source,
-        destination_root=package_root,
+    sealed_runtime = render_sealed_runtime_plan(
+        runtime_archive_path=python_archive,
+        runtime_archive_sha256=runtime_archive_sha256,
+        hermes_install_archive_path=hermes_archive,
+        hermes_install_archive_sha256=hermes_install_archive_sha256,
+        runtime_root=sealed_runtime_root,
+        entrypoint_path=entrypoint_path,
     )
+    package_root = Path(str(sealed_runtime["package_root"]))
+    python = Path(str(sealed_runtime["python_executable_path"]))
+    # The legacy runtime-assets renderer remains available for existing pure
+    # renderer callers, but this installation plan never embeds a mutable
+    # checkout or package-file tree.  The two reviewed archive inputs are
+    # copied as external payloads and expanded only by the root apply edge.
+    runtime_assets = {
+        "contract": "hermes.kanban_broker_runtime_assets.v1",
+        "destination_root": str(package_root),
+        "package_manifest_sha256": str(sealed_runtime["package_manifest_sha256"]),
+        "directories": [],
+        "files": [],
+    }
     runtime_entrypoint = render_runtime_entrypoint_asset(
         entrypoint_path=entrypoint_path,
         package_root=package_root,
     )
-    runtime_payloads = cast(dict[str, bytes], runtime_assets["payloads"])
-    runtime_files = cast(list[dict[str, object]], runtime_assets["files"])
-    runtime_files.append({key: value for key, value in runtime_entrypoint.items() if key != "content"})
-    runtime_payloads[str(entrypoint_path)] = cast(bytes, runtime_entrypoint["content"])
-    runtime_assets["files"] = runtime_files
 
     ids = {
         role: desired[role]
@@ -2910,8 +4143,12 @@ def render_broker_installation_plan(
     }
     identity_plan.update({
         "schema_version": 1,
-        "host_inventory_sha256": hashlib.sha256(_canonical_json_bytes(host_inventory)).hexdigest(),
+        "host_inventory_sha256": hashlib.sha256(_canonical_json_bytes(inventory)).hexdigest(),
         "desired_identities_sha256": hashlib.sha256(_canonical_json_bytes(desired_identities)).hexdigest(),
+        "membership_policy": [
+            {"user": user, "group": group}
+            for user, group in identity_plan["memberships"]
+        ],
     })
     config = json.loads(render_broker_service_config(
         install_root=root,
@@ -2938,6 +4175,7 @@ def render_broker_installation_plan(
         workspace_gid=int(desired["workspace"]["gid"]),
         trusted_publisher_enabled=False,
         python_executable=python,
+        python_sha256=str(sealed_runtime["python_sha256"]),
         git_executable=git,
         package_root=package_root,
         package_manifest_sha256=str(runtime_assets["package_manifest_sha256"]),
@@ -2947,11 +4185,15 @@ def render_broker_installation_plan(
         worker_launchd_plist_path=worker_launchd_path,
         runtime_entrypoint_path=entrypoint_path,
         runtime_entrypoint_sha256=str(runtime_entrypoint["sha256"]),
+        runtime_attestation_path=runtime_attestation_path,
+        runtime_manifest_path=runtime_manifest_path,
+        runtime_manifest_sha256=str(sealed_runtime["runtime_manifest_sha256"]),
+        hermes_source_sha=hermes_commit_sha,
+        hermes_install_archive_sha256=str(sealed_runtime["archives"][1]["sha256"]),
+        python_version=OFFICIAL_RUNTIME_VERSION,
         remote_policy_path=remote_policy_path,
         remote_policy_source_sha=source_sha,
         dispatcher_profile=dispatcher_profile,
-        worker_client_config_path=worker_client_path,
-        worker_sequence_path=worker_sequence_path,
         install_nonce=install_nonce,
     ))
     clients: dict[str, bytes] = {}
@@ -2963,13 +4205,6 @@ def render_broker_installation_plan(
             key_path=surface_keys[surface],
             sequence_path=sequence_paths[surface],
         ).encode("utf-8")
-    clients[str(worker_client_path)] = _json_artifact_bytes({
-        "contract": "hermes.kanban_worker_client_config.v1",
-        "surface": "worker",
-        "socket_path": str(worker_socket),
-        "sequence_path": str(worker_sequence_path),
-        "expected_broker_uid": int(ids["broker"]["uid"]),
-    })
     seatbelt = render_broker_seatbelt_profile(
         state_dir=state_dir,
         workspace_root=workspace_root,
@@ -2983,6 +4218,7 @@ def render_broker_installation_plan(
         sandbox_profile=seatbelt_path,
         package_root=package_root,
         runtime_entrypoint_path=entrypoint_path,
+        runtime_manifest_path=runtime_manifest_path,
     ).encode("utf-8")
     worker_plist = render_worker_launchd_plist(
         python_executable=python,
@@ -2996,22 +4232,75 @@ def render_broker_installation_plan(
         model_user=str(ids["model"]["user"]),
         worker_hermes_root=worker_home,
         runtime_entrypoint_path=entrypoint_path,
+        runtime_entrypoint_sha256=str(runtime_entrypoint["sha256"]),
+        runtime_manifest_path=runtime_manifest_path,
+        runtime_manifest_sha256=str(sealed_runtime["runtime_manifest_sha256"]),
     ).encode("utf-8")
+    registration = {
+        "contract": "hermes.kanban_broker_register_request.v1",
+        "repository_id": "radulator",
+        "source_path": str(radulator_checkout),
+        "default_branch": "develop",
+        "project_id": None,
+        "remote_repository": remote_policy,
+        "expected_source_sha": source_sha,
+    }
+    runtime_manifest = {
+        "contract": RUNTIME_MANIFEST_CONTRACT,
+        "schema_version": 1,
+        "runtime_root": str(sealed_runtime_root),
+        "python_executable": str(python),
+        "python_version": OFFICIAL_RUNTIME_VERSION,
+        "runtime_manifest_sha256": str(sealed_runtime["runtime_manifest_sha256"]),
+        "entries": sealed_runtime["entries"],
+    }
+    runtime_manifest_bytes = _json_artifact_bytes(runtime_manifest)
+    if len(runtime_manifest_bytes) > 4 * 1024 * 1024:
+        raise ValueError("sealed runtime manifest exceeds the plan size limit")
+    runtime_attestation = {
+        "contract": "hermes.kanban_broker_runtime_attestation.v1",
+        "schema_version": 1,
+        "active": False,
+        "revoked": True,
+        "service_config_sha256": hashlib.sha256(_json_artifact_bytes(config)).hexdigest(),
+        "hermes_source_sha": hermes_commit_sha,
+        "hermes_install_archive_sha256": str(hermes_install_archive_sha256),
+        "radulator_source_sha": source_sha,
+        "runtime_root": str(sealed_runtime_root),
+        "runtime_manifest_path": str(runtime_manifest_path),
+        "python_executable": str(python),
+        "python_version": OFFICIAL_RUNTIME_VERSION,
+        "python_sha256": str(sealed_runtime["python_sha256"]),
+        "runtime_manifest_sha256": str(sealed_runtime["runtime_manifest_sha256"]),
+        "archive_digests": {
+            "cpython": str(runtime_archive_sha256),
+            "hermes_install": str(hermes_install_archive_sha256),
+        },
+        "isolated_probe": {
+            "command": [str(python), "-I", str(sealed_runtime["direct_probe_path"])],
+            "outcome": "PASS",
+        },
+    }
+    runtime_attestation_bytes = _json_artifact_bytes(runtime_attestation)
     # Keys are generated once during rendering and carried only by the
     # root-owned payload manifest.  They are never printed by the CLI.
-    payload_bytes: dict[str, bytes] = dict(runtime_payloads)
+    payload_bytes: dict[str, bytes] = {}
     payload_bytes.update(clients)
     payload_bytes.update({
         str(service_config_path): _json_artifact_bytes(config),
         str(seatbelt_path): seatbelt,
         str(launchd_path): broker_plist,
         str(worker_launchd_path): worker_plist,
+        str(entrypoint_path): RUNTIME_ENTRYPOINT_CONTENT.encode("utf-8"),
+        str(sealed_runtime["direct_probe_path"]): RUNTIME_DIRECT_PROBE_CONTENT.encode("utf-8"),
         str(remote_policy_path): _json_artifact_bytes(remote_policy),
+        str(registration_path): _json_artifact_bytes(registration),
+        str(runtime_manifest_path): runtime_manifest_bytes,
+        str(runtime_attestation_path): runtime_attestation_bytes,
     })
     for surface in ("controller", "publisher", "operator"):
         payload_bytes[str(surface_keys[surface])] = secrets.token_bytes(32)
         payload_bytes[str(sequence_paths[surface])] = b""
-    payload_bytes[str(worker_sequence_path)] = b""
     payload_bytes[str(canary_key_path)] = secrets.token_bytes(32)
     additional_files = [
         {
@@ -3020,6 +4309,55 @@ def render_broker_installation_plan(
             "gid": 0,
             "mode": 0o600,
             "kind": "remote_policy",
+        },
+        {
+            "path": str(registration_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "kind": "broker_register_request",
+        },
+        {
+            "path": str(runtime_attestation_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "kind": "runtime_attestation",
+        },
+        {
+            "path": str(runtime_manifest_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "kind": "runtime_manifest",
+        },
+        {
+            "path": str(entrypoint_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o555,
+            "kind": "runtime_entrypoint",
+        },
+        {
+            "path": str(sealed_runtime["direct_probe_path"]),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o555,
+            "kind": "runtime_direct_probe",
+        },
+        {
+            "path": str(runtime_python_archive_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o444,
+            "kind": "runtime_archive",
+        },
+        {
+            "path": str(runtime_hermes_archive_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o444,
+            "kind": "runtime_archive",
         },
     ]
     filesystem_plan = render_filesystem_provision_plan(
@@ -3031,22 +4369,53 @@ def render_broker_installation_plan(
         client_config_paths=client_paths,
         sequence_paths=sequence_paths,
         runtime_assets=runtime_assets,
-        worker_client_config_path=worker_client_path,
-        worker_sequence_path=worker_sequence_path,
+        sealed_runtime_plan=sealed_runtime,
         additional_files=additional_files,
         additional_directories=[
-            {"path": str(entrypoint_path.parent), "uid": 0, "gid": 0, "mode": 0o555},
+            {"path": str(runtime_input_root), "uid": 0, "gid": 0, "mode": 0o700},
+            {"path": str(sealed_runtime_root), "uid": 0, "gid": 0, "mode": 0o711},
+            {"path": str(entrypoint_path.parent), "uid": 0, "gid": 0, "mode": 0o711},
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles"), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles" / dispatcher_profile), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
         ],
     )
+    filesystem_plan["sealed_runtime"]["archive_destinations"] = [
+        {"path": str(runtime_python_archive_path), "sha256": str(runtime_archive_sha256),
+         "size": int(python_archive.stat().st_size)},
+        {"path": str(runtime_hermes_archive_path), "sha256": str(hermes_install_archive_sha256),
+         "size": int(hermes_archive.stat().st_size)},
+    ]
+    filesystem_plan["sealed_runtime"]["runtime_manifest_path"] = str(runtime_manifest_path)
     # Bind every non-directory payload to the exact filesystem plan digest.
     for item in filesystem_plan["files"]:
         path = str(item["path"])
         content = payload_bytes.get(path)
+        if content is None and str(item.get("kind")) == "runtime_archive":
+            content = b""
         if content is None:
             raise ValueError(f"filesystem plan payload is missing for {path}")
         item["sha256"] = hashlib.sha256(content).hexdigest()
         item["size"] = len(content)
         item["secret"] = str(item.get("kind", "")).endswith("_key") or item.get("kind") == "canary_key"
+    external_payloads = [
+        {
+            "path": str(runtime_python_archive_path),
+            "source_path": str(python_archive),
+            "sha256": str(runtime_archive_sha256),
+            "size": int(sealed_runtime["archives"][0]["size"]),
+        },
+        {
+            "path": str(runtime_hermes_archive_path),
+            "source_path": str(hermes_archive),
+            "sha256": str(hermes_install_archive_sha256),
+            "size": int(sealed_runtime["archives"][1]["size"]),
+        },
+    ]
+    for item in filesystem_plan["files"]:
+        if item.get("kind") == "runtime_archive":
+            external = next(ref for ref in external_payloads if ref["path"] == item["path"])
+            item["sha256"] = str(external["sha256"])
+            item["size"] = int(external["size"])
     payload_manifest = {
         "contract": ASSET_PAYLOAD_CONTRACT,
         "schema_version": 1,
@@ -3062,9 +4431,13 @@ def render_broker_installation_plan(
         "payloads": {
             path: base64.b64encode(payload_bytes[path]).decode("ascii")
             for path in sorted(payload_bytes)
-            if any(str(item["path"]) == path for item in filesystem_plan["files"])
+            if any(str(item["path"]) == path and item.get("kind") != "runtime_archive"
+                   for item in filesystem_plan["files"])
         },
+        "external_payloads": external_payloads,
     }
+    if len(_json_artifact_bytes(payload_manifest)) > 4 * 1024 * 1024:
+        raise ValueError("asset payload manifest exceeds the plan size limit")
     artifacts: list[dict[str, object]] = []
     for path, uid, gid, mode, kind, content in (
         (identity_path, 0, 0, 0o600, "identity_plan", _json_artifact_bytes(identity_plan)),
@@ -3084,6 +4457,8 @@ def render_broker_installation_plan(
         "schema_version": 1,
         "install_root": str(root),
         "dispatcher_profile": dispatcher_profile,
+        "hermes_source_sha": hermes_commit_sha,
+        "radulator_source_path": str(radulator_checkout),
         "radulator_source_sha": source_sha,
         "identity_plan_path": str(identity_path),
         "filesystem_plan_path": str(filesystem_path),
@@ -3094,6 +4469,7 @@ def render_broker_installation_plan(
         "asset_payload_manifest": payload_manifest,
         "service_config": config,
         "remote_policy": remote_policy,
+        "broker_register_request": registration,
         "runtime": {
             "python_executable": str(python),
             "python_sha256": config["python_sha256"],
@@ -3101,10 +4477,16 @@ def render_broker_installation_plan(
             "git_sha256": config["git_sha256"],
             "package_root": str(package_root),
             "package_manifest_sha256": runtime_assets["package_manifest_sha256"],
+            "runtime_manifest_sha256": sealed_runtime["runtime_manifest_sha256"],
+            "python_version": OFFICIAL_RUNTIME_VERSION,
             "entrypoint_path": str(entrypoint_path),
             "entrypoint_mode": 0o555,
             "package_root_mode": 0o555,
             "package_file_mode": 0o444,
+            "sealed_runtime": sealed_runtime,
+            "archive_destinations": [str(runtime_python_archive_path), str(runtime_hermes_archive_path)],
+            "attestation_path": str(runtime_attestation_path),
+            "runtime_manifest_path": str(runtime_manifest_path),
         },
         "artifacts": artifacts,
     }
@@ -3122,63 +4504,181 @@ def _assert_safe_output_parent(path: Path) -> None:
 
 
 def _atomic_artifact_write(path: Path, content: bytes, *, mode: int, uid: int, gid: int) -> None:
-    _assert_safe_output_parent(path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("broker plan artifact path is unsafe")
+    _ensure_directory_tree(
+        path.parent, mode=0o711, uid=os.geteuid(), gid=os.getegid(), apply_final=False
+    )
+    parent_fd = _open_directory_fd(path.parent)
+    parent_before = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or parent_before.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_before.st_mode) & 0o022
+    ):
+        os.close(parent_fd)
+        raise ValueError("broker plan output parent owner or mode is unsafe")
+    name = path.name
     try:
-        existing_info = path.lstat()
-    except FileNotFoundError:
-        existing_info = None
-    if existing_info is not None:
-        if (
-            stat.S_ISLNK(existing_info.st_mode)
-            or not stat.S_ISREG(existing_info.st_mode)
-            or existing_info.st_nlink != 1
-            or stat.S_IMODE(existing_info.st_mode) != int(mode)
-        ):
-            raise ValueError("broker plan output target is unsafe")
-        if os.geteuid() == 0 and (
-            existing_info.st_uid != int(uid) or existing_info.st_gid != int(gid)
-        ):
-            raise ValueError("broker plan output target owner is unsafe")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        fd = os.open(path, flags)
         try:
-            existing = os.read(fd, len(content) + 1)
+            existing_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing_info = None
+        if existing_info is not None:
+            if (not stat.S_ISREG(existing_info.st_mode) or existing_info.st_nlink != 1
+                    or stat.S_IMODE(existing_info.st_mode) != int(mode)):
+                raise ValueError("broker plan output target is unsafe")
+            if existing_info.st_uid != int(uid) or existing_info.st_gid != int(gid):
+                raise ValueError("broker plan output target owner is unsafe")
+            fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+            try:
+                opened_info = os.fstat(fd)
+                if (opened_info.st_dev, opened_info.st_ino) != (
+                    existing_info.st_dev, existing_info.st_ino
+                ):
+                    raise ValueError("broker plan output target changed during read")
+                chunks: list[bytes] = []
+                remaining = len(content) + 1
+                while remaining > 0:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                existing = b"".join(chunks)
+                closed_info = os.fstat(fd)
+                if (opened_info.st_dev, opened_info.st_ino, opened_info.st_size,
+                        opened_info.st_mtime_ns) != (
+                    closed_info.st_dev, closed_info.st_ino, closed_info.st_size,
+                    closed_info.st_mtime_ns
+                ):
+                    raise ValueError("broker plan output target changed during read")
+            finally:
+                os.close(fd)
+            if existing != content:
+                raise ValueError("existing broker plan artifact differs from plan")
+            parent_after = os.fstat(parent_fd)
+            if (parent_before.st_dev, parent_before.st_ino) != (
+                parent_after.st_dev, parent_after.st_ino
+            ):
+                raise ValueError("broker plan output parent changed during read")
+            return
+        temporary_name = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            int(mode),
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchown(fd, int(uid), int(gid))
+            os.fchmod(fd, int(mode))
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
         finally:
             os.close(fd)
-        if existing != content:
-            raise ValueError("existing broker plan artifact differs from plan")
-        return
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    temporary_path = Path(temporary)
-    try:
-        os.fchmod(fd, int(mode))
-        if os.geteuid() == 0:
-            os.fchown(fd, int(uid), int(gid))
-        view = memoryview(content)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-        os.close(fd)
-        os.replace(temporary_path, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError("broker plan output parent changed during write")
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
         try:
-            os.fsync(directory_fd)
+            info = os.fstat(fd)
+            written = os.read(fd, len(content) + 1)
         finally:
-            os.close(directory_fd)
+            os.close(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != int(mode)
+                or info.st_uid != int(uid) or info.st_gid != int(gid)
+                or written != content):
+            raise ValueError("broker plan artifact ownership, mode, or digest is unsafe")
     except BaseException:
         try:
-            os.close(fd)
-        except OSError:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except (NameError, FileNotFoundError, OSError):
             pass
-        temporary_path.unlink(missing_ok=True)
         raise
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != int(mode) or info.st_nlink != 1:
-        raise ValueError("broker plan artifact ownership or mode is unsafe")
-    if os.geteuid() == 0 and (info.st_uid != int(uid) or info.st_gid != int(gid)):
-        raise ValueError("broker plan artifact owner is unsafe")
+    finally:
+        os.close(parent_fd)
+
+
+def _update_runtime_attestation(
+    config: dict[str, object], *, service_config_path: Path, active: bool, revoked: bool
+) -> None:
+    """Publish only sanitized runtime state; never include keys or credentials."""
+    raw_path = config.get("runtime_attestation_path")
+    if raw_path is None:
+        return
+    path = Path(str(raw_path))
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o644):
+            raise ValueError("runtime attestation ownership or mode is unsafe")
+        raw = os.read(fd, 1024 * 1024 + 1)
+    finally:
+        os.close(fd)
+    try:
+        attestation = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime attestation is invalid JSON") from exc
+    required = {
+        "contract", "schema_version", "active", "revoked", "service_config_sha256",
+        "hermes_source_sha", "hermes_install_archive_sha256", "radulator_source_sha",
+        "runtime_root", "runtime_manifest_path", "python_executable", "python_version", "python_sha256",
+        "runtime_manifest_sha256", "archive_digests", "isolated_probe",
+    }
+    if not isinstance(attestation, dict) or set(attestation) != required:
+        raise ValueError("runtime attestation fields are not exact")
+    if (
+        not isinstance(attestation["active"], bool)
+        or not isinstance(attestation["revoked"], bool)
+        or attestation["active"] == attestation["revoked"]
+        or not isinstance(attestation["archive_digests"], dict)
+        or set(attestation["archive_digests"]) != {"cpython", "hermes_install"}
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+            for value in attestation["archive_digests"].values()
+        )
+        or attestation["archive_digests"]["cpython"] != OFFICIAL_RUNTIME_ARCHIVE_SHA256
+        or not isinstance(attestation["isolated_probe"], dict)
+        or set(attestation["isolated_probe"]) != {"command", "outcome"}
+        or attestation["isolated_probe"]["outcome"] != "PASS"
+        or not isinstance(attestation["isolated_probe"]["command"], list)
+    ):
+        raise ValueError("runtime attestation evidence is not exact")
+    updated = dict(attestation)
+    updated["active"] = bool(active)
+    updated["revoked"] = bool(revoked)
+    _validated_hex_sha(updated["hermes_source_sha"], field="Hermes source SHA", length=40)
+    _validated_hex_sha(
+        updated["hermes_install_archive_sha256"],
+        field="Hermes install archive SHA256",
+        length=64,
+    )
+    _validated_hex_sha(updated["radulator_source_sha"], field="Radulator source SHA", length=40)
+    _validated_hex_sha(updated["python_sha256"], field="Python SHA256", length=64)
+    _validated_hex_sha(
+        updated["runtime_manifest_sha256"], field="runtime manifest SHA256", length=64
+    )
+    if updated["python_version"] != OFFICIAL_RUNTIME_VERSION:
+        raise ValueError("runtime attestation Python version is unsupported")
+    _read_runtime_manifest_file(
+        Path(str(updated["runtime_manifest_path"])),
+        expected_sha256=str(updated["runtime_manifest_sha256"]),
+        expected_runtime_root=Path(str(updated["runtime_root"])),
+        expected_python_executable=Path(str(updated["python_executable"])),
+        expected_python_version=OFFICIAL_RUNTIME_VERSION,
+    )
+    updated["service_config_sha256"] = _safe_file_sha256(Path(service_config_path))
+    _atomic_artifact_write(path, _json_artifact_bytes(updated), mode=0o644, uid=0, gid=0)
 
 
 def _rebase_path_string(value: object, *, source_root: Path, output_root: Path) -> object:
@@ -3191,7 +4691,16 @@ def _rebase_path_string(value: object, *, source_root: Path, output_root: Path) 
     if isinstance(value, list):
         return [_rebase_path_string(item, source_root=source_root, output_root=output_root) for item in value]
     if isinstance(value, dict):
-        return {key: _rebase_path_string(item, source_root=source_root, output_root=output_root) for key, item in value.items()}
+        rebased: dict[object, object] = {}
+        for key, item in value.items():
+            rebased_key = (
+                _rebase_path_string(key, source_root=source_root, output_root=output_root)
+                if isinstance(key, str) else key
+            )
+            rebased[rebased_key] = _rebase_path_string(
+                item, source_root=source_root, output_root=output_root
+            )
+        return rebased
     return value
 
 
@@ -3226,7 +4735,7 @@ def _validate_plan_artifact_record(item: object, *, directory: bool) -> dict[str
 
 
 def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path) -> dict[str, str]:
-    """Atomically write one rendered plan and its root-owned apply inputs."""
+    """Write only offline plan documents; final service assets belong to apply."""
     if not isinstance(plan, dict) or plan.get("contract") != BROKER_INSTALL_PLAN_CONTRACT:
         raise ValueError("unsupported broker installation plan")
     source_root = _validated_install_path(
@@ -3257,11 +4766,13 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
     raw_files = filesystem.get("files")
     raw_manifest_files = manifest.get("files")
     raw_payloads = manifest.get("payloads")
+    raw_external = manifest.get("external_payloads", [])
     if (
         not isinstance(raw_directories, list)
         or not isinstance(raw_files, list)
         or not isinstance(raw_manifest_files, list)
         or not isinstance(raw_payloads, dict)
+        or not isinstance(raw_external, list)
     ):
         raise ValueError("broker asset payload manifest is malformed")
     directories = [_validate_plan_artifact_record(item, directory=True) for item in raw_directories]
@@ -3284,7 +4795,30 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
         if not isinstance(item.get("secret"), bool):
             raise ValueError("broker asset payload manifest secret marker is invalid")
         manifest_paths.add(path)
-    if manifest_paths != file_paths or set(raw_payloads) != file_paths:
+    external_paths: set[str] = set()
+    for item in raw_external:
+        if not isinstance(item, dict) or set(item) != {"path", "source_path", "sha256", "size"}:
+            raise ValueError("broker external payload fields are not exact")
+        path = item.get("path")
+        source = item.get("source_path")
+        if (not isinstance(path, str) or not isinstance(source, str)
+                or path in external_paths or not Path(path).is_absolute()
+                or not Path(source).is_absolute()):
+            raise ValueError("broker external payload path is invalid")
+        _validated_install_path(path, field="broker external destination")
+        source_path = _validated_install_path(source, field="broker external source")
+        digest = _validated_hex_sha(item.get("sha256"), field="external payload SHA256", length=64)
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > _MAX_RUNTIME_ARCHIVE_BYTES:
+            raise ValueError("broker external payload size is invalid")
+        _read_sealed_file_bytes(
+            source_path,
+            max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+            expected_size=size,
+            expected_sha256=digest,
+        )
+        external_paths.add(path)
+    if manifest_paths != file_paths or set(raw_payloads) | external_paths != file_paths or set(raw_payloads) & external_paths:
         raise ValueError("broker asset payload manifest does not match filesystem plan")
     file_by_path = {str(item["path"]): item for item in files}
     for item in raw_manifest_files:
@@ -3305,9 +4839,147 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
             raise ValueError("broker asset payload is not valid base64") from exc
     for item in files:
         raw_path = str(item["path"])
-        content = payloads[raw_path]
-        if len(content) != int(item["size"]) or hashlib.sha256(content).hexdigest() != str(item["sha256"]):
-            raise ValueError("broker asset payload metadata does not match filesystem plan")
+        if raw_path in external_paths:
+            ext = next(ref for ref in raw_external if ref["path"] == raw_path)
+            if int(item["size"]) != int(ext["size"]) or str(item["sha256"]) != str(ext["sha256"]):
+                raise ValueError("broker external payload metadata does not match filesystem plan")
+        else:
+            content = payloads[raw_path]
+            if len(content) != int(item["size"]) or hashlib.sha256(content).hexdigest() != str(item["sha256"]):
+                raise ValueError("broker asset payload metadata does not match filesystem plan")
+    rebased_filesystem = cast(
+        dict[str, object],
+        _rebase_path_string(filesystem, source_root=source_root, output_root=destination_root),
+    )
+    rebased_manifest = cast(
+        dict[str, object],
+        _rebase_path_string(manifest, source_root=source_root, output_root=destination_root),
+    )
+    rebased_payloads = rebased_manifest["payloads"]
+    if not isinstance(rebased_payloads, dict):
+        raise ValueError("rebased broker asset payload manifest is malformed")
+    original_external_sources = {
+        str(item["path"]): str(item["source_path"])
+        for item in raw_external
+    }
+    original_registration_sources: dict[str, str] = {}
+    for raw_path, encoded in raw_payloads.items():
+        if not isinstance(raw_path, str) or not raw_path.endswith("/broker-register.json"):
+            continue
+        try:
+            registration = json.loads(base64.b64decode(encoded, validate=True))
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("broker registration payload is invalid JSON") from exc
+        if not isinstance(registration, dict) or not isinstance(
+            registration.get("source_path"), str
+        ):
+            raise ValueError("broker registration payload has no source checkout")
+        original_registration_sources[raw_path] = registration["source_path"]
+    source_prefix = str(source_root).encode("utf-8")
+    destination_prefix = str(destination_root).encode("utf-8")
+    for raw_path, encoded in list(rebased_payloads.items()):
+        if not isinstance(raw_path, str) or not isinstance(encoded, str):
+            raise ValueError("rebased broker asset payload entry is malformed")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("rebased broker asset payload is not valid base64") from exc
+        # Service/config/plist/manifest payloads are embedded bytes in the
+        # manifest.  Rebase those bytes too, then refresh every bound digest;
+        # otherwise output-root plans would name one tree while carrying bytes
+        # for another.
+        content = content.replace(source_prefix, destination_prefix)
+        rebased_payloads[raw_path] = base64.b64encode(content).decode("ascii")
+    # External inputs are intentionally not copied into the offline output
+    # tree.  Restore their original source paths after generic path rebasing;
+    # only their destination keys are rooted at the requested output root.
+    for original_path, source_path in original_external_sources.items():
+        rebased_path = _rebase_path_string(
+            original_path, source_root=source_root, output_root=destination_root
+        )
+        for item in cast(list[dict[str, object]], rebased_manifest["external_payloads"]):
+            if item.get("path") == rebased_path:
+                item["source_path"] = source_path
+                break
+        else:
+            raise ValueError("rebased external payload metadata is incomplete")
+    for original_path, source_path in original_registration_sources.items():
+        rebased_path = _rebase_path_string(
+            original_path, source_root=source_root, output_root=destination_root
+        )
+        encoded = rebased_payloads.get(rebased_path)
+        if not isinstance(encoded, str):
+            raise ValueError("rebased broker registration payload is missing")
+        registration = json.loads(base64.b64decode(encoded, validate=True))
+        if not isinstance(registration, dict):
+            raise ValueError("rebased broker registration payload is malformed")
+        registration["source_path"] = source_path
+        rebased_payloads[rebased_path] = base64.b64encode(
+            _json_artifact_bytes(registration)
+        ).decode("ascii")
+    rebased_sealed = rebased_filesystem.get("sealed_runtime")
+    original_sealed = filesystem.get("sealed_runtime")
+    if isinstance(rebased_sealed, dict) and isinstance(original_sealed, dict):
+        original_archives = original_sealed.get("archives")
+        rebased_archives = rebased_sealed.get("archives")
+        if isinstance(original_archives, list) and isinstance(rebased_archives, list):
+            if len(original_archives) != len(rebased_archives):
+                raise ValueError("rebased sealed runtime archive metadata is incomplete")
+            for original_archive, rebased_archive in zip(original_archives, rebased_archives):
+                if isinstance(original_archive, dict) and isinstance(rebased_archive, dict):
+                    rebased_archive["path"] = original_archive.get("path")
+    # The attestation binds the exact service bytes.  Rebasing changes those
+    # bytes, so refresh that binding before the payload/filesystem digests are
+    # finalized; otherwise an output-root plan would carry a stale attestation
+    # and fail closed at activation.
+    service_paths = [
+        path for path in rebased_payloads
+        if path.endswith("/config/service.json")
+    ]
+    attestation_paths = [
+        path for path in rebased_payloads
+        if path.endswith("/runtime-attestation.json")
+    ]
+    if service_paths and attestation_paths:
+        if len(service_paths) != 1 or len(attestation_paths) != 1:
+            raise ValueError("rebased broker service attestation paths are ambiguous")
+        service_path = service_paths[0]
+        attestation_path = attestation_paths[0]
+        try:
+            attestation = json.loads(
+                base64.b64decode(rebased_payloads[attestation_path], validate=True)
+            )
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("rebased runtime attestation is invalid JSON") from exc
+        if not isinstance(attestation, dict) or "service_config_sha256" not in attestation:
+            raise ValueError("rebased runtime attestation is missing its service binding")
+        service_bytes = base64.b64decode(rebased_payloads[service_path], validate=True)
+        attestation["service_config_sha256"] = hashlib.sha256(service_bytes).hexdigest()
+        rebased_payloads[attestation_path] = base64.b64encode(
+            _json_artifact_bytes(attestation)
+        ).decode("ascii")
+    rebased_files = rebased_filesystem.get("files")
+    rebased_manifest_files = rebased_manifest.get("files")
+    if not isinstance(rebased_files, list) or not isinstance(rebased_manifest_files, list):
+        raise ValueError("rebased broker asset metadata is malformed")
+    rebased_payload_map = cast(dict[str, str], rebased_payloads)
+    manifest_by_path = {
+        str(item["path"]): item for item in rebased_manifest_files
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    for item in rebased_files:
+        if not isinstance(item, dict):
+            raise ValueError("rebased broker filesystem artifact is malformed")
+        path = str(item["path"])
+        if path in rebased_payload_map:
+            content = base64.b64decode(rebased_payload_map[path], validate=True)
+            item["sha256"] = hashlib.sha256(content).hexdigest()
+            item["size"] = len(content)
+            manifest_item = manifest_by_path.get(path)
+            if manifest_item is None:
+                raise ValueError("rebased broker payload metadata is incomplete")
+            manifest_item["sha256"] = item["sha256"]
+            manifest_item["size"] = item["size"]
     def target(raw_path: str) -> Path:
         original = _validated_install_path(
             raw_path,
@@ -3316,35 +4988,9 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
             allow_root=True,
         )
         return destination_root / original.relative_to(source_root)
-    # Build the complete directory tree before applying immutable modes.  A
-    # package directory is intentionally 0555 in the final tree, but applying
-    # that mode before creating its children would make a fresh staging tree
-    # unwritable even for a later child creation step.
-    directory_items = sorted(directories, key=lambda row: len(Path(str(row["path"])).parts))
-    for item in directory_items:
-        if not isinstance(item, dict):
-            raise ValueError("filesystem directory entry is malformed")
-        directory = target(str(item["path"]))
-        try:
-            info = directory.lstat()
-        except FileNotFoundError:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            info = directory.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ValueError("broker plan directory is not a safe directory")
-        # Keep the staging tree writable until every file has been atomically
-        # replaced.  This is only an intermediate staging mode; the reviewed
-        # immutable modes are applied in the final pass below.
-        os.chmod(directory, 0o700)
-    for item in files:
-        raw_path = str(item["path"])
-        content = payloads.get(raw_path)
-        if content is None:
-            raise ValueError(f"broker asset payload is missing for {raw_path}")
-        expected = str(item.get("sha256") or "")
-        if not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(content).hexdigest() != expected:
-            raise ValueError("broker asset payload digest does not match plan")
-        _atomic_artifact_write(target(raw_path), content, mode=int(item["mode"]), uid=int(item["uid"]), gid=int(item["gid"]))
+    # Rendering is an offline action.  In particular it must never materialize
+    # service JSON, launchd plists, keys, or a runtime archive into the target
+    # install root.  The root-only provision-assets edge consumes these plans.
     plan_files = (
         ("identity_plan_path", "identity_plan"),
         ("filesystem_plan_path", "filesystem_plan"),
@@ -3352,21 +4998,18 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
     )
     for path_key, value_key in plan_files:
         raw_path = str(plan[path_key])
-        value = _rebase_path_string(plan[value_key], source_root=source_root, output_root=destination_root)
+        if value_key == "filesystem_plan":
+            value = rebased_filesystem
+        elif value_key == "asset_payload_manifest":
+            value = rebased_manifest
+        else:
+            value = _rebase_path_string(
+                plan[value_key], source_root=source_root, output_root=destination_root
+            )
         content = _json_artifact_bytes(value)
-        _atomic_artifact_write(target(raw_path), content, mode=0o600, uid=0, gid=0)
-    for item in directory_items:
-        directory = target(str(item["path"]))
-        os.chmod(directory, int(item["mode"]))
-        if os.geteuid() == 0:
-            os.chown(directory, int(item["uid"]), int(item["gid"]))
-    runtime = plan.get("runtime")
-    if isinstance(runtime, dict) and runtime.get("entrypoint_path"):
-        entrypoint = target(str(runtime["entrypoint_path"]))
-        verify_isolated_runtime_import(
-            python_executable=Path(str(runtime["python_executable"])),
-            entrypoint_path=entrypoint,
-        )
+        owner_uid = os.geteuid()
+        owner_gid = os.getegid()
+        _atomic_artifact_write(target(raw_path), content, mode=0o600, uid=owner_uid, gid=owner_gid)
     return {"contract": BROKER_INSTALL_PLAN_CONTRACT, "output_root": str(destination_root)}
 
 
