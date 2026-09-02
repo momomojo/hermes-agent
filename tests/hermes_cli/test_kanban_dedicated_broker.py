@@ -4966,6 +4966,7 @@ def test_operator_rpc_is_separate_from_controller_surface(tmp_path):
         "default_branch": "main",
         "project_id": None,
         "remote_repository": _remote_repository(),
+        "expected_source_sha": _git("rev-parse", "HEAD", cwd=source),
     }
     request = signed_request(
         key,

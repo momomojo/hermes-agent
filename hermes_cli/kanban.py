@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import sys
@@ -495,11 +496,12 @@ def build_parser(
             "broker-register",
             help="Register a trusted checkout and exact GitHub publication policy",
         )
-        p_broker_register.add_argument("--repository-id", required=True)
-        p_broker_register.add_argument("--source-path", type=Path, required=True)
-        p_broker_register.add_argument("--default-branch", required=True)
+        p_broker_register.add_argument("--registration-file", type=Path, default=None)
+        p_broker_register.add_argument("--repository-id", required=False)
+        p_broker_register.add_argument("--source-path", type=Path, required=False)
+        p_broker_register.add_argument("--default-branch", required=False)
         p_broker_register.add_argument("--project-id", default=None)
-        p_broker_register.add_argument("--remote-repository-json", type=Path, required=True)
+        p_broker_register.add_argument("--remote-repository-json", type=Path, required=False)
         p_broker_register.add_argument("--expected-source-sha", default=None)
         p_broker_register.add_argument("--json", action="store_true")
 
@@ -1914,17 +1916,44 @@ def _cmd_broker_refresh(args: argparse.Namespace) -> int:
 def _cmd_broker_register(args: argparse.Namespace) -> int:
     from hermes_cli.kanban_broker_routing import register_repository
 
-    result = register_repository(
-        {
+    registration_file = getattr(args, "registration_file", None)
+    if registration_file is not None:
+        registration = _read_broker_json(registration_file)
+        required = {
+            "contract", "repository_id", "source_path", "default_branch", "project_id",
+            "remote_repository", "expected_source_sha",
+        }
+        if set(registration) != required or registration.get(
+            "contract"
+        ) != "hermes.kanban_broker_register_request.v1":
+            raise ValueError("broker registration file fields are not exact")
+        expected_source_sha = registration.get("expected_source_sha")
+        if not isinstance(expected_source_sha, str) or re.fullmatch(
+            r"[0-9a-f]{40}", expected_source_sha
+        ) is None:
+            raise ValueError("broker registration expected source SHA is required")
+        request = dict(registration)
+        request.pop("contract", None)
+    else:
+        expected_source_sha = getattr(args, "expected_source_sha", None)
+        if not isinstance(expected_source_sha, str) or re.fullmatch(
+            r"[0-9a-f]{40}", expected_source_sha
+        ) is None:
+            raise ValueError("broker registration expected source SHA is required")
+        if any(
+            getattr(args, name, None) is None
+            for name in ("repository_id", "source_path", "default_branch", "remote_repository_json")
+        ):
+            raise ValueError("broker registration inputs are incomplete")
+        request = {
             "repository_id": args.repository_id,
             "source_path": str(args.source_path),
             "default_branch": args.default_branch,
             "project_id": args.project_id,
             "remote_repository": _read_broker_json(args.remote_repository_json),
-            **({"expected_source_sha": args.expected_source_sha}
-               if args.expected_source_sha is not None else {}),
+            "expected_source_sha": expected_source_sha,
         }
-    )
+    result = register_repository(request)
     _emit_broker_result(result, as_json=bool(args.json))
     return 0
 

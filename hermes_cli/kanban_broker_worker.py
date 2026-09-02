@@ -200,6 +200,10 @@ def validate_worker_runtime(
 
     from hermes_cli.kanban_broker_install import _read_sealed_file_bytes
     from hermes_cli.kanban_broker_install import _safe_file_sha256
+    from hermes_cli.kanban_broker_install import _official_runtime_provenance
+    from hermes_cli.kanban_broker_install import OFFICIAL_RUNTIME_ARCHIVE_SHA256
+    from hermes_cli.kanban_broker_install import OFFICIAL_RUNTIME_VERSION
+    from hermes_cli.kanban_broker_install import _verify_runtime_tree_against_manifest
     from hermes_cli.kanban_broker_install import runtime_package_manifest
 
     python = Path(python_executable)
@@ -287,9 +291,15 @@ def validate_worker_runtime(
             not isinstance(runtime_manifest, dict)
             or set(runtime_manifest)
             != {"contract", "schema_version", "runtime_root", "python_executable",
-                "python_version", "runtime_manifest_sha256", "entries"}
+                "python_version", "provenance", "runtime_manifest_sha256", "entries"}
             or runtime_manifest.get("contract") != "hermes.kanban_broker_runtime_manifest.v1"
+            or runtime_manifest.get("runtime_root") != str(python.parent.parent)
+            or runtime_manifest.get("python_executable") != str(python)
+            or runtime_manifest.get("python_version") != OFFICIAL_RUNTIME_VERSION
             or runtime_manifest.get("runtime_manifest_sha256") != runtime_manifest_sha256
+            or runtime_manifest.get("provenance") != _official_runtime_provenance(
+                sha256=OFFICIAL_RUNTIME_ARCHIVE_SHA256
+            )
             or not isinstance(runtime_manifest.get("entries"), list)
         ):
             raise WorkerServiceError("worker runtime manifest fields are not exact")
@@ -298,6 +308,12 @@ def validate_worker_runtime(
         ).encode("utf-8")
         if hashlib.sha256(encoded).hexdigest() != runtime_manifest_sha256:
             raise WorkerServiceError("worker runtime manifest digest changed")
+        _verify_runtime_tree_against_manifest(
+            python.parent.parent,
+            runtime_manifest["entries"],
+            expected_owner_uid=expected_package_owner_uid,
+            expected_owner_gid=0,
+        )
     return {
         "python_executable": str(python),
         "python_sha256": digest,
@@ -445,7 +461,7 @@ def run_hermes_worker(
         entrypoint = Path(runtime_entrypoint)
         if not entrypoint.is_absolute() or ".." in entrypoint.parts:
             raise WorkerServiceError("sealed worker runtime entrypoint is invalid")
-        command.extend(["-I", str(entrypoint)])
+        command.extend(["-B", "-I", str(entrypoint)])
     command.extend([
         "-m",
         "hermes_cli.main",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import grp
 import hashlib
@@ -43,6 +44,9 @@ ACTIVATION_CANARY_CHECKS = (
     "worker_socket_matrix",
     "network_denied",
     "credential_env_scrubbed",
+    "routing_profile_binding",
+    "publisher_runtime_preflight",
+    "isolated_runtime_import",
     "model_terminal_denied",
     "computer_use_denied_by_uid",
 )
@@ -61,6 +65,20 @@ OFFICIAL_RUNTIME_VERSION = "3.11.15"
 OFFICIAL_RUNTIME_ARCHIVE_SHA256 = "01f0de017aacd7528084dbacd46c66cfe9a0b0cd1255be0c24854b7985dd130e"
 SEALED_RUNTIME_CONTRACT = "hermes.kanban_broker_sealed_runtime.v1"
 RUNTIME_MANIFEST_CONTRACT = "hermes.kanban_broker_runtime_manifest.v1"
+HERMES_INSTALL_PROVENANCE_CONTRACT = "hermes.kanban_broker_hermes_install_provenance.v1"
+PUBLISHER_PROBE_CONTRACT = "radulator.publisher_runtime_preflight.v1"
+OFFICIAL_RUNTIME_SOURCE_REPOSITORY = "indygreg/python-build-standalone"
+OFFICIAL_RUNTIME_RELEASE_TAG = "20260602"
+OFFICIAL_RUNTIME_ASSET_NAME = (
+    "cpython-3.11.15+20260602-aarch64-apple-darwin-install_only.tar.gz"
+)
+OFFICIAL_RUNTIME_RELEASE_URL = (
+    "https://github.com/indygreg/python-build-standalone/releases/download/"
+    f"{OFFICIAL_RUNTIME_RELEASE_TAG}/{OFFICIAL_RUNTIME_ASSET_NAME}"
+)
+OFFICIAL_RUNTIME_VERIFICATION_STATUS = "external-sha256-bound"
+OFFICIAL_RUNTIME_ATTESTATION_IDENTITY = "operator-supplied-sha256"
+OFFICIAL_RUNTIME_ATTESTATION_STATUS = "bound-no-signature"
 
 # These contracts describe the reviewed, data-only provisioning edge.  The
 # existing v1 identity/filesystem/service contracts remain the apply boundary;
@@ -196,8 +214,10 @@ def render_broker_service_config(
     remote_policy_path: Path | None = None,
     remote_policy_source_sha: str | None = None,
     dispatcher_profile: str | None = None,
-    worker_client_config_path: Path | None = None,
-    worker_sequence_path: Path | None = None,
+    dispatcher_routing_config_path: Path | None = None,
+    publisher_probe_path: Path | None = None,
+    publisher_probe_sha256: str | None = None,
+    registration_file_path: Path | None = None,
     runtime_attestation_path: Path | None = None,
     runtime_manifest_path: Path | None = None,
     runtime_manifest_sha256: str | None = None,
@@ -259,10 +279,6 @@ def render_broker_service_config(
             raise ValueError("remote policy source SHA is invalid")
     elif remote_policy_source_sha is not None:
         raise ValueError("remote policy source SHA requires a policy path")
-    if worker_client_config_path is not None:
-        worker_client_config_path = Path(worker_client_config_path)
-    if worker_sequence_path is not None:
-        worker_sequence_path = Path(worker_sequence_path)
     if runtime_attestation_path is not None:
         runtime_attestation_path = Path(runtime_attestation_path)
     if runtime_manifest_path is not None:
@@ -278,10 +294,10 @@ def render_broker_service_config(
         worker_launchd_plist_path,
         *([runtime_entrypoint_path] if runtime_entrypoint_path is not None else []),
         *([remote_policy_path] if remote_policy_path is not None else []),
-        *([worker_client_config_path] if worker_client_config_path is not None else []),
-        *([worker_sequence_path] if worker_sequence_path is not None else []),
         *([runtime_attestation_path] if runtime_attestation_path is not None else []),
         *([runtime_manifest_path] if runtime_manifest_path is not None else []),
+        *([publisher_probe_path] if publisher_probe_path is not None else []),
+        *([registration_file_path] if registration_file_path is not None else []),
     ):
         if not runtime_path.is_absolute():
             raise ValueError("broker runtime identity paths must be absolute")
@@ -302,10 +318,10 @@ def render_broker_service_config(
         seatbelt_profile_path,
         *([runtime_entrypoint_path] if runtime_entrypoint_path is not None else []),
         *([remote_policy_path] if remote_policy_path is not None else []),
-        *([worker_client_config_path] if worker_client_config_path is not None else []),
-        *([worker_sequence_path] if worker_sequence_path is not None else []),
         *([runtime_attestation_path] if runtime_attestation_path is not None else []),
         *([runtime_manifest_path] if runtime_manifest_path is not None else []),
+        *([publisher_probe_path] if publisher_probe_path is not None else []),
+        *([registration_file_path] if registration_file_path is not None else []),
     ):
         if private_path == install_root or install_root not in private_path.parents:
             raise ValueError("broker private assets must be below the install root")
@@ -363,10 +379,29 @@ def render_broker_service_config(
         if not isinstance(dispatcher_profile, str) or not dispatcher_profile:
             raise ValueError("dispatcher profile is required when provided")
         payload["dispatcher_profile"] = dispatcher_profile
-    if worker_client_config_path is not None:
-        payload["worker_client_config_path"] = str(worker_client_config_path)
-    if worker_sequence_path is not None:
-        payload["worker_sequence_path"] = str(worker_sequence_path)
+    if dispatcher_routing_config_path is not None:
+        routing_path = Path(dispatcher_routing_config_path)
+        if not routing_path.is_absolute() or ".." in routing_path.parts:
+            raise ValueError("dispatcher routing config path is invalid")
+        payload["dispatcher_routing_config_path"] = str(routing_path)
+    if publisher_probe_path is not None:
+        publisher_probe_path = Path(publisher_probe_path)
+        if not publisher_probe_path.is_absolute() or ".." in publisher_probe_path.parts:
+            raise ValueError("publisher preflight script path is invalid")
+        if publisher_probe_sha256 is None:
+            raise ValueError("publisher preflight script digest is required")
+        payload["publisher_probe_path"] = str(publisher_probe_path)
+        payload["publisher_probe_sha256"] = _validated_hex_sha(
+            publisher_probe_sha256, field="publisher preflight script SHA256", length=64
+        )
+        payload["publisher_probe_contract"] = PUBLISHER_PROBE_CONTRACT
+    elif publisher_probe_sha256 is not None:
+        raise ValueError("publisher preflight script path is required for its digest")
+    if registration_file_path is not None:
+        registration_file_path = Path(registration_file_path)
+        if not registration_file_path.is_absolute() or ".." in registration_file_path.parts:
+            raise ValueError("broker registration file path is invalid")
+        payload["registration_file_path"] = str(registration_file_path)
     if runtime_attestation_path is not None:
         payload["runtime_attestation_path"] = str(runtime_attestation_path)
     if runtime_manifest_path is not None:
@@ -793,12 +828,264 @@ def _read_runtime_archive_manifest(
     }
 
 
+def _read_archive_file_contents(
+    archive_path: Path, *, strip_prefix: str
+) -> dict[str, bytes]:
+    """Read bounded regular members for provenance/content validation only."""
+    archive_data, _info = _read_sealed_file_bytes(
+        Path(archive_path), max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES
+    )
+    prefix = _archive_relative_name(strip_prefix.rstrip("/")) + "/"
+    contents: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as stream:
+            members = stream.getmembers()
+            if len(members) > _MAX_RUNTIME_ARCHIVE_ENTRIES:
+                raise ValueError("runtime archive contains too many entries")
+            for member in members:
+                raw_name = member.name.rstrip("/") if member.isdir() else member.name
+                name = _archive_relative_name(raw_name)
+                if not name.startswith(prefix) or name == prefix[:-1]:
+                    continue
+                relative = _archive_relative_name(name[len(prefix):])
+                if not member.isfile():
+                    continue
+                if member.size < 0 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                    raise ValueError("runtime archive file exceeds the size limit")
+                handle = stream.extractfile(member)
+                if handle is None:
+                    raise ValueError("runtime archive file cannot be read")
+                content = handle.read(_MAX_RUNTIME_ARCHIVE_FILE_BYTES + 1)
+                if len(content) != member.size or len(content) > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                    raise ValueError("runtime archive file changed or exceeds the size limit")
+                if relative in contents:
+                    raise ValueError("runtime archive contains duplicate paths")
+                contents[relative] = content
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError("runtime archive is not a valid bounded tar.gz") from exc
+    return contents
+
+
+def _read_hermes_install_provenance(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_archive_sha256: str,
+    expected_source_sha: str,
+) -> dict[str, object]:
+    """Read the externally-built, complete Hermes install provenance record."""
+    provenance_path = _validated_install_path(
+        path, field="Hermes install provenance manifest"
+    )
+    expected_digest = _validated_hex_sha(
+        expected_sha256, field="Hermes install provenance SHA256", length=64
+    )
+    try:
+        raw, info = _read_sealed_file_bytes(
+            provenance_path,
+            max_bytes=_MAX_RUNTIME_FILE_BYTES,
+            expected_sha256=expected_digest,
+        )
+    except ValueError as exc:
+        raise ValueError("Hermes install provenance manifest digest or file is invalid") from exc
+    if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) not in {0o444, 0o600, 0o644}:
+        raise ValueError("Hermes install provenance manifest ownership or mode is unsafe")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Hermes install provenance manifest is invalid JSON") from exc
+    required = {
+        "contract",
+        "schema_version",
+        "hermes_source_sha",
+        "pyproject_lock_sha256",
+        "install_archive_sha256",
+        "entries",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Hermes install provenance fields are not exact")
+    if value.get("contract") != HERMES_INSTALL_PROVENANCE_CONTRACT or value.get("schema_version") != 1:
+        raise ValueError("Hermes install provenance contract is unsupported")
+    if value.get("hermes_source_sha") != expected_source_sha:
+        raise ValueError("Hermes install provenance source SHA differs from the reviewed input")
+    _validated_hex_sha(
+        value.get("pyproject_lock_sha256"),
+        field="Hermes pyproject/lock SHA256",
+        length=64,
+    )
+    if value.get("install_archive_sha256") != expected_archive_sha256:
+        raise ValueError("Hermes install provenance archive SHA differs from the staged archive")
+    entries = value.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Hermes install provenance entry set is empty")
+    normalized: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Hermes install provenance entry is malformed")
+        entry_type = entry.get("type")
+        expected_fields = {
+            "path", "type", "mode", "origin",
+        }
+        if entry_type == "file":
+            expected_fields |= {"size", "sha256"}
+        elif entry_type == "symlink":
+            expected_fields |= {"target"}
+        elif entry_type != "directory":
+            raise ValueError("Hermes install provenance entry type is unsupported")
+        if set(entry) != expected_fields:
+            raise ValueError("Hermes install provenance entry fields are not exact")
+        path_value = entry.get("path")
+        if not isinstance(path_value, str) or path_value in seen:
+            raise ValueError("Hermes install provenance has duplicate or invalid paths")
+        relative = _archive_relative_name(path_value.rstrip("/") if entry_type == "directory" else path_value)
+        if entry_type == "directory":
+            relative += "/"
+        if relative != path_value:
+            raise ValueError("Hermes install provenance path is not normalized")
+        origin = entry.get("origin")
+        if origin not in {"first-party", "dependency"}:
+            raise ValueError("Hermes install provenance origin is invalid")
+        mode = entry.get("mode")
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in {0o444, 0o555}:
+            raise ValueError("Hermes install provenance mode is invalid")
+        normalized_entry = dict(entry)
+        if entry_type == "file":
+            if (
+                isinstance(entry.get("size"), bool)
+                or not isinstance(entry.get("size"), int)
+                or entry["size"] < 1
+            ):
+                raise ValueError("Hermes install provenance file size is invalid")
+            _validated_hex_sha(entry.get("sha256"), field="Hermes install file SHA256", length=64)
+        seen.add(relative)
+        normalized.append(normalized_entry)
+    normalized.sort(key=lambda item: str(item["path"]))
+    if normalized != entries:
+        raise ValueError("Hermes install provenance entries are not deterministically ordered")
+    all_names = {str(entry["path"]).rstrip("/") for entry in normalized}
+    for entry in normalized:
+        if entry["type"] == "symlink":
+            _archive_link_target(
+                str(entry["path"]), str(entry.get("target") or ""), all_names
+            )
+    if not any(
+        str(entry["path"]).startswith("hermes_cli/")
+        and entry["type"] == "file"
+        for entry in normalized
+    ):
+        raise ValueError("Hermes install provenance has no first-party Hermes package")
+    if not any(
+        not str(entry["path"]).startswith("hermes_cli/")
+        and entry["type"] in {"file", "directory"}
+        and entry["origin"] == "dependency"
+        for entry in normalized
+    ):
+        raise ValueError("Hermes install provenance has no dependency closure")
+    return {**value, "entries": normalized}
+
+
+def _validate_hermes_install_closure(
+    archive_path: Path,
+    *,
+    archive_sha256: str,
+    provenance_path: Path,
+    provenance_sha256: str,
+    hermes_source_sha: str,
+) -> dict[str, object]:
+    archive = _read_runtime_archive_manifest(
+        archive_path,
+        expected_sha256=archive_sha256,
+        strip_prefix="hermes-install",
+        required_paths={
+            "hermes_cli/__init__.py",
+            "hermes_cli/main.py",
+            "hermes_cli/kanban_broker_canary.py",
+            "hermes_cli/kanban_broker_client.py",
+            "hermes_cli/kanban_broker_install.py",
+            "hermes_cli/kanban_broker_protocol.py",
+            "hermes_cli/kanban_broker_service.py",
+            "hermes_cli/kanban_broker_worker.py",
+            "hermes_cli/kanban_dedicated_broker.py",
+        },
+        role="Hermes install",
+    )
+    provenance = _read_hermes_install_provenance(
+        provenance_path,
+        expected_sha256=provenance_sha256,
+        expected_archive_sha256=archive_sha256,
+        expected_source_sha=hermes_source_sha,
+    )
+    archive_entries = cast(list[dict[str, object]], archive["entries"])
+    provenance_entries = cast(list[dict[str, object]], provenance["entries"])
+    comparable_provenance = [
+        {key: value for key, value in entry.items() if key != "origin"}
+        for entry in provenance_entries
+    ]
+    if archive_entries != comparable_provenance:
+        raise ValueError("Hermes install archive does not match its complete provenance entry set")
+    contents = _read_archive_file_contents(archive_path, strip_prefix="hermes-install")
+    for entry in cast(list[dict[str, object]], provenance["entries"]):
+        if entry["type"] != "file":
+            continue
+        content = contents.get(str(entry["path"]))
+        if content is None or hashlib.sha256(content).hexdigest() != str(entry["sha256"]):
+            raise ValueError("Hermes install archive content differs from provenance")
+        if str(entry["path"]).startswith("hermes_cli/"):
+            try:
+                tree = ast.parse(content.decode("utf-8"), filename=str(entry["path"]))
+            except (UnicodeDecodeError, SyntaxError) as exc:
+                raise ValueError("Hermes install first-party module is not valid Python") from exc
+            executable_nodes = [node for node in tree.body if not isinstance(node, ast.Expr) or not isinstance(getattr(node, "value", None), ast.Constant) or not isinstance(node.value.value, str)]
+            if not executable_nodes:
+                raise ValueError("Hermes install first-party module is a placeholder")
+    main_content = contents.get("hermes_cli/main.py", b"")
+    if b"hermes_cli.kanban_broker_client" not in main_content or b"def main" not in main_content:
+        raise ValueError("Hermes install main module does not execute the broker client closure")
+    return {"archive": archive, "provenance": provenance}
+
+
+def _read_publisher_probe(path: Path, *, expected_sha256: str) -> dict[str, object]:
+    """Bind the exact external Radulator preflight script without executing it."""
+    probe = _validated_install_path(path, field="publisher preflight script")
+    expected = _validated_hex_sha(
+        expected_sha256, field="publisher preflight script SHA256", length=64
+    )
+    try:
+        raw, info = _read_sealed_file_bytes(
+            probe, max_bytes=_MAX_RUNTIME_FILE_BYTES, expected_sha256=expected
+        )
+    except ValueError as exc:
+        raise ValueError("publisher preflight script digest or file is invalid") from exc
+    if (
+        info.st_uid not in {0, os.geteuid()}
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) not in {0o444, 0o555, 0o644}
+    ):
+        raise ValueError("publisher preflight script ownership or mode is unsafe")
+    try:
+        ast.parse(raw.decode("utf-8"), filename=str(probe))
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise ValueError("publisher preflight script is not valid Python") from exc
+    if b"kanban_broker_client" not in raw or b"runtime-preflight" not in raw:
+        raise ValueError("publisher preflight script does not implement the reviewed contract")
+    return {
+        "source_path": str(probe),
+        "sha256": expected,
+        "size": len(raw),
+        "contract": PUBLISHER_PROBE_CONTRACT,
+    }
+
+
 def render_sealed_runtime_plan(
     *,
     runtime_archive_path: Path,
     runtime_archive_sha256: str,
     hermes_install_archive_path: Path,
     hermes_install_archive_sha256: str,
+    hermes_install_provenance_path: Path,
+    hermes_install_provenance_sha256: str,
+    hermes_source_sha: str,
     runtime_root: Path,
     entrypoint_path: Path,
 ) -> dict[str, object]:
@@ -816,26 +1103,15 @@ def render_sealed_runtime_plan(
     )
     if runtime_archive_sha256 != OFFICIAL_RUNTIME_ARCHIVE_SHA256:
         raise ValueError("CPython archive is not the reviewed official runtime artifact")
-    hermes = _read_runtime_archive_manifest(
+    closure = _validate_hermes_install_closure(
         hermes_install_archive_path,
-        expected_sha256=hermes_install_archive_sha256,
-        strip_prefix="hermes-install",
-        required_paths={
-            "hermes_cli/__init__.py",
-            # The worker launches ``hermes_cli.main`` through the sealed
-            # interpreter.  A broker-client-only snapshot would pass the
-            # import canary but fail at the first real worker turn.
-            "hermes_cli/main.py",
-            "hermes_cli/kanban_broker_canary.py",
-            "hermes_cli/kanban_broker_client.py",
-            "hermes_cli/kanban_broker_install.py",
-            "hermes_cli/kanban_broker_protocol.py",
-            "hermes_cli/kanban_broker_service.py",
-            "hermes_cli/kanban_broker_worker.py",
-            "hermes_cli/kanban_dedicated_broker.py",
-        },
-        role="Hermes install",
+        archive_sha256=hermes_install_archive_sha256,
+        provenance_path=hermes_install_provenance_path,
+        provenance_sha256=hermes_install_provenance_sha256,
+        hermes_source_sha=hermes_source_sha,
     )
+    hermes = cast(dict[str, object], closure["archive"])
+    provenance = cast(dict[str, object], closure["provenance"])
     merged: dict[str, dict[str, object]] = {}
     for item in python["entries"]:
         path = str(item["path"])
@@ -942,6 +1218,15 @@ def render_sealed_runtime_plan(
         "python_version": OFFICIAL_RUNTIME_VERSION,
         "official_release": OFFICIAL_RUNTIME_RELEASE,
         "official_asset_id": OFFICIAL_RUNTIME_ASSET_ID,
+        "official_source_repository": OFFICIAL_RUNTIME_SOURCE_REPOSITORY,
+        "official_release_tag": OFFICIAL_RUNTIME_RELEASE_TAG,
+        "official_asset_name": OFFICIAL_RUNTIME_ASSET_NAME,
+        "official_release_url": OFFICIAL_RUNTIME_RELEASE_URL,
+        "verification_status": OFFICIAL_RUNTIME_VERIFICATION_STATUS,
+        "hermes_source_sha": hermes_source_sha,
+        "hermes_pyproject_lock_sha256": str(provenance["pyproject_lock_sha256"]),
+        "hermes_provenance_path": str(Path(hermes_install_provenance_path)),
+        "hermes_provenance_sha256": str(hermes_install_provenance_sha256),
         "archives": [python, hermes],
         "entries": [merged[path] for path in sorted(merged)],
     }
@@ -1019,6 +1304,29 @@ def validate_runtime_identity(
             raise ValueError("runtime entrypoint digest changed")
         identities["runtime_entrypoint_path"] = str(entrypoint)
         identities["runtime_entrypoint_sha256"] = digest
+    publisher_probe_value = config.get("publisher_probe_path")
+    if publisher_probe_value is not None:
+        publisher_probe = Path(str(publisher_probe_value))
+        if config.get("publisher_probe_contract") != PUBLISHER_PROBE_CONTRACT:
+            raise ValueError("publisher preflight contract is unsupported")
+        try:
+            probe_info = publisher_probe.lstat()
+        except OSError as exc:
+            raise ValueError("publisher preflight script is unavailable") from exc
+        if (
+            stat.S_ISLNK(probe_info.st_mode)
+            or not stat.S_ISREG(probe_info.st_mode)
+            or probe_info.st_uid != 0
+            or probe_info.st_gid != 0
+            or probe_info.st_nlink != 1
+            or stat.S_IMODE(probe_info.st_mode) != 0o555
+        ):
+            raise ValueError("publisher preflight script is mutable or unsafe")
+        probe_digest = _safe_file_sha256(publisher_probe)
+        if probe_digest != config.get("publisher_probe_sha256"):
+            raise ValueError("publisher preflight script digest changed")
+        identities["publisher_probe_path"] = str(publisher_probe)
+        identities["publisher_probe_sha256"] = probe_digest
     manifest_value = config.get("runtime_manifest_path")
     if manifest_value is not None:
         if config.get("python_version") != OFFICIAL_RUNTIME_VERSION:
@@ -1044,6 +1352,12 @@ def validate_runtime_identity(
             expected_runtime_root=runtime_root,
             expected_python_executable=Path(config["python_executable"]),
             expected_python_version=str(config.get("python_version") or ""),
+        )
+        _verify_runtime_tree_against_manifest(
+            runtime_root,
+            cast(list[dict[str, object]], manifest["entries"]),
+            expected_owner_uid=expected_package_owner_uid,
+            expected_owner_gid=0,
         )
         identities["runtime_manifest_path"] = str(manifest_path)
         identities["runtime_manifest_sha256"] = str(manifest["runtime_manifest_sha256"])
@@ -1081,6 +1395,23 @@ def _validated_hex_sha(value: object, *, field: str, length: int) -> str:
     if not isinstance(value, str) or re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None:
         raise ValueError(f"{field} must be an exact lowercase SHA-{length * 4}")
     return value
+
+
+def _official_runtime_provenance(*, sha256: str) -> dict[str, object]:
+    """Return the non-secret identity of the externally verified runtime."""
+    return {
+        "source_repository": OFFICIAL_RUNTIME_SOURCE_REPOSITORY,
+        "release_tag": OFFICIAL_RUNTIME_RELEASE_TAG,
+        "asset_id": OFFICIAL_RUNTIME_ASSET_ID,
+        "asset_name": OFFICIAL_RUNTIME_ASSET_NAME,
+        "release_url": OFFICIAL_RUNTIME_RELEASE_URL,
+        "sha256": _validated_hex_sha(
+            sha256, field="CPython runtime archive SHA256", length=64
+        ),
+        "verification_status": OFFICIAL_RUNTIME_VERIFICATION_STATUS,
+        "attestation_identity": OFFICIAL_RUNTIME_ATTESTATION_IDENTITY,
+        "attestation_status": OFFICIAL_RUNTIME_ATTESTATION_STATUS,
+    }
 
 
 def _validated_install_path(
@@ -1773,8 +2104,6 @@ def render_filesystem_provision_plan(
     sequence_paths: dict[str, Path],
     runtime_assets: dict[str, object],
     sealed_runtime_plan: dict[str, object] | None = None,
-    worker_client_config_path: Path | None = None,
-    worker_sequence_path: Path | None = None,
     additional_files: list[dict[str, Any]] | None = None,
     additional_directories: list[dict[str, Any]] | None = None,
 ) -> dict:
@@ -1822,8 +2151,6 @@ def render_filesystem_provision_plan(
         Path(seatbelt_profile_path),
         *[Path(value) for value in client_config_paths.values()],
         *[Path(value) for value in sequence_paths.values()],
-        *([Path(worker_client_config_path)] if worker_client_config_path is not None else []),
-        *([Path(worker_sequence_path)] if worker_sequence_path is not None else []),
         *([Path(item["path"]) for item in additional_files or []]),
         *([Path(item["path"]) for item in additional_directories or []]),
     ])
@@ -1925,25 +2252,6 @@ def render_filesystem_provision_plan(
                 "mode": 0o700,
             },
         ])
-    if worker_client_config_path is not None or worker_sequence_path is not None:
-        if worker_client_config_path is None or worker_sequence_path is None:
-            raise ValueError("worker client config and sequence must be paired")
-        worker_uid = int(config["model_uid"])
-        worker_gid = workspace_gid
-        directories.extend([
-            {
-                "path": str(Path(worker_client_config_path).parent),
-                "uid": worker_uid,
-                "gid": worker_gid,
-                "mode": 0o700,
-            },
-            {
-                "path": str(Path(worker_sequence_path).parent),
-                "uid": worker_uid,
-                "gid": worker_gid,
-                "mode": 0o700,
-            },
-        ])
     directories.extend(additional_directories or [])
     deduplicated: dict[str, dict] = {}
     for item in directories:
@@ -2025,23 +2333,6 @@ def render_filesystem_provision_plan(
                 "kind": f"{surface}_sequence",
             },
         ])
-    if worker_client_config_path is not None and worker_sequence_path is not None:
-        files.extend([
-            {
-                "path": str(Path(worker_client_config_path)),
-                "uid": int(config["model_uid"]),
-                "gid": workspace_gid,
-                "mode": 0o600,
-                "kind": "worker_client_config",
-            },
-            {
-                "path": str(Path(worker_sequence_path)),
-                "uid": int(config["model_uid"]),
-                "gid": workspace_gid,
-                "mode": 0o600,
-                "kind": "worker_sequence",
-            },
-        ])
     files.extend(additional_files or [])
     result = {
         "contract": "hermes.kanban_broker_filesystem_plan.v1",
@@ -2062,6 +2353,10 @@ def render_filesystem_provision_plan(
             "python_sha256": str(sealed_runtime_plan["python_sha256"]),
             "package_root": str(sealed_runtime_plan["package_root"]),
             "package_manifest_sha256": str(sealed_runtime_plan["package_manifest_sha256"]),
+            "hermes_source_sha": str(sealed_runtime_plan["hermes_source_sha"]),
+            "hermes_pyproject_lock_sha256": str(sealed_runtime_plan["hermes_pyproject_lock_sha256"]),
+            "hermes_provenance_path": str(sealed_runtime_plan["hermes_provenance_path"]),
+            "hermes_provenance_sha256": str(sealed_runtime_plan["hermes_provenance_sha256"]),
             "runtime_manifest_sha256": str(sealed_runtime_plan["runtime_manifest_sha256"]),
             "official_release": str(sealed_runtime_plan["official_release"]),
             "official_asset_id": int(sealed_runtime_plan["official_asset_id"]),
@@ -2099,6 +2394,44 @@ def render_broker_client_config(
         "sequence_path": str(Path(sequence_path)),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def render_dispatcher_routing_config(
+    *,
+    profile: str,
+    controller_client_config: Path,
+    publisher_client_config: Path,
+    operator_client_config: Path,
+    registration_file: Path,
+    expected_source_sha: str,
+) -> str:
+    """Render the named profile's non-secret routing handoff."""
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile) is None:
+        raise ValueError("dispatcher profile is invalid")
+    source_sha = _validated_hex_sha(
+        expected_source_sha, field="Radulator source SHA", length=40
+    )
+    paths = {
+        "controller_client_config": Path(controller_client_config),
+        "publisher_client_config": Path(publisher_client_config),
+        "operator_client_config": Path(operator_client_config),
+        "registration_file": Path(registration_file),
+    }
+    if any(not path.is_absolute() or ".." in path.parts for path in paths.values()):
+        raise ValueError("dispatcher routing config paths are invalid")
+    payload = {
+        "contract": "hermes.kanban_broker_routing.v1",
+        "schema_version": 1,
+        "profile": profile,
+        "dedicated_broker_enabled": False,
+        "trusted_publisher_enabled": False,
+        "controller_client_config": str(paths["controller_client_config"]),
+        "publisher_client_config": str(paths["publisher_client_config"]),
+        "operator_client_config": str(paths["operator_client_config"]),
+        "registration_file": str(paths["registration_file"]),
+        "expected_source_sha": source_sha,
+    }
+    return _json_artifact_bytes(payload).decode("utf-8")
 
 
 def _absolute_parts(path: Path) -> tuple[str, ...]:
@@ -2433,7 +2766,7 @@ def _read_runtime_manifest_file(
         raise ValueError("runtime manifest is invalid JSON") from exc
     required = {
         "contract", "schema_version", "runtime_root", "python_executable",
-        "python_version", "runtime_manifest_sha256", "entries",
+        "python_version", "provenance", "runtime_manifest_sha256", "entries",
     }
     if (
         not isinstance(manifest, dict)
@@ -2443,6 +2776,9 @@ def _read_runtime_manifest_file(
         or manifest.get("runtime_root") != str(expected_runtime_root)
         or manifest.get("python_executable") != str(expected_python_executable)
         or manifest.get("python_version") != expected_python_version
+        or manifest.get("provenance") != _official_runtime_provenance(
+            sha256=OFFICIAL_RUNTIME_ARCHIVE_SHA256
+        )
         or manifest.get("runtime_manifest_sha256") != expected_sha256
         or not isinstance(manifest.get("entries"), list)
     ):
@@ -2450,6 +2786,166 @@ def _read_runtime_manifest_file(
     if hashlib.sha256(_canonical_json_bytes(manifest["entries"])).hexdigest() != expected_sha256:
         raise ValueError("runtime manifest digest does not match the sealed plan")
     return manifest
+
+
+def _verify_runtime_tree_against_manifest(
+    runtime_root: Path,
+    expected_entries: list[dict[str, object]],
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+) -> None:
+    """Compare every installed runtime node with the sealed recursive manifest."""
+    root = Path(runtime_root)
+    root_fd = _open_directory_fd(root)
+    try:
+        root_info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != int(expected_owner_uid)
+            or root_info.st_gid != int(expected_owner_gid)
+            or stat.S_IMODE(root_info.st_mode) & 0o022
+        ):
+            raise ValueError("sealed runtime root ownership or mode is unsafe")
+        observed: list[dict[str, object]] = []
+
+        def visit(directory_fd: int, prefix: PurePosixPath) -> None:
+            parent_before = os.fstat(directory_fd)
+            try:
+                with os.scandir(directory_fd) as stream:
+                    children = sorted(stream, key=lambda item: item.name)
+                    for child in children:
+                        name = child.name
+                        if (
+                            not isinstance(name, str)
+                            or name in {"", ".", ".."}
+                            or "/" in name
+                            or "\\" in name
+                        ):
+                            raise ValueError("sealed runtime contains an unsafe path")
+                        relative = prefix / name
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if stat.S_ISLNK(info.st_mode):
+                            target = os.readlink(name, dir_fd=directory_fd)
+                            if (
+                                not target
+                                or target.startswith("/")
+                                or "\\" in target
+                                or "\x00" in target
+                            ):
+                                raise ValueError("sealed runtime symlink target is unsafe")
+                            resolved = PurePosixPath(
+                                posixpath.normpath((relative.parent / target).as_posix())
+                            )
+                            if resolved.is_absolute() or any(
+                                part in {"", ".", ".."} for part in resolved.parts
+                            ):
+                                raise ValueError("sealed runtime symlink escapes its root")
+                            observed.append({
+                                "path": relative.as_posix(),
+                                "type": "symlink",
+                                "target": resolved.as_posix(),
+                                "mode": 0o555,
+                            })
+                        elif stat.S_ISDIR(info.st_mode):
+                            if (
+                                info.st_uid != int(expected_owner_uid)
+                                or info.st_gid != int(expected_owner_gid)
+                            ):
+                                raise ValueError("sealed runtime directory ownership changed")
+                            observed.append({
+                                "path": relative.as_posix() + "/",
+                                "type": "directory",
+                                "mode": stat.S_IMODE(info.st_mode),
+                            })
+                            child_fd = os.open(
+                                name,
+                                os.O_RDONLY
+                                | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0),
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                visit(child_fd, relative)
+                            finally:
+                                os.close(child_fd)
+                        elif stat.S_ISREG(info.st_mode):
+                            if (
+                                info.st_uid != int(expected_owner_uid)
+                                or info.st_gid != int(expected_owner_gid)
+                                or info.st_nlink != 1
+                            ):
+                                raise ValueError("sealed runtime file ownership changed")
+                            child_fd = os.open(
+                                name,
+                                os.O_RDONLY
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0),
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                opened = os.fstat(child_fd)
+                                if (
+                                    opened.st_dev != info.st_dev
+                                    or opened.st_ino != info.st_ino
+                                    or opened.st_size != info.st_size
+                                ):
+                                    raise ValueError("sealed runtime file changed during verification")
+                                digest = hashlib.sha256()
+                                total = 0
+                                while True:
+                                    chunk = os.read(child_fd, 1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    total += len(chunk)
+                                    if total > _MAX_RUNTIME_PACKAGE_BYTES:
+                                        raise ValueError("sealed runtime file exceeds the size limit")
+                                    digest.update(chunk)
+                                closed = os.fstat(child_fd)
+                                if (
+                                    opened.st_dev,
+                                    opened.st_ino,
+                                    opened.st_size,
+                                    opened.st_mtime_ns,
+                                ) != (
+                                    closed.st_dev,
+                                    closed.st_ino,
+                                    closed.st_size,
+                                    closed.st_mtime_ns,
+                                ):
+                                    raise ValueError("sealed runtime file changed during verification")
+                            finally:
+                                os.close(child_fd)
+                            observed.append({
+                                "path": relative.as_posix(),
+                                "type": "file",
+                                "mode": 0o555 if stat.S_IMODE(info.st_mode) & 0o111 else 0o444,
+                                "size": int(info.st_size),
+                                "sha256": digest.hexdigest(),
+                            })
+                        else:
+                            raise ValueError("sealed runtime contains an unsupported special file")
+            finally:
+                parent_after = os.fstat(directory_fd)
+                if (parent_before.st_dev, parent_before.st_ino) != (
+                    parent_after.st_dev, parent_after.st_ino
+                ):
+                    raise ValueError("sealed runtime directory changed during verification")
+
+        visit(root_fd, PurePosixPath())
+    finally:
+        os.close(root_fd)
+    if observed != expected_entries:
+        expected_paths = {str(item.get("path")) for item in expected_entries}
+        observed_paths = {str(item.get("path")) for item in observed}
+        unexpected = sorted(observed_paths - expected_paths)
+        missing = sorted(expected_paths - observed_paths)
+        if unexpected:
+            raise ValueError(f"sealed runtime contains unexpected entries: {unexpected[:8]}")
+        if missing:
+            raise ValueError(f"sealed runtime is missing manifest entries: {missing[:8]}")
+        raise ValueError("sealed runtime entry metadata differs from its manifest")
 
 
 def _materialize_sealed_runtime(
@@ -2479,6 +2975,9 @@ def _materialize_sealed_runtime(
         runtime_archive_sha256=str(destinations[0]["sha256"]),
         hermes_install_archive_path=Path(str(destinations[1]["path"])),
         hermes_install_archive_sha256=str(destinations[1]["sha256"]),
+        hermes_install_provenance_path=Path(str(descriptor.get("hermes_provenance_path") or "")),
+        hermes_install_provenance_sha256=str(descriptor.get("hermes_provenance_sha256") or ""),
+        hermes_source_sha=str(descriptor.get("hermes_source_sha") or ""),
         runtime_root=runtime_root,
         entrypoint_path=entrypoint,
     )
@@ -2510,22 +3009,15 @@ def _materialize_sealed_runtime(
             required_paths={"bin/python3.11", "bin/python3", "lib/python3.11"},
             role="CPython",
         ),
-        _read_runtime_archive_manifest(
-            Path(str(destinations[1]["path"])),
-            expected_sha256=str(destinations[1]["sha256"]),
-            strip_prefix="hermes-install",
-            required_paths={
-                "hermes_cli/__init__.py",
-                "hermes_cli/main.py",
-                "hermes_cli/kanban_broker_canary.py",
-                "hermes_cli/kanban_broker_client.py",
-                "hermes_cli/kanban_broker_install.py",
-                "hermes_cli/kanban_broker_protocol.py",
-                "hermes_cli/kanban_broker_service.py",
-                "hermes_cli/kanban_broker_worker.py",
-                "hermes_cli/kanban_dedicated_broker.py",
-            },
-            role="Hermes install",
+        cast(
+            dict[str, object],
+            _validate_hermes_install_closure(
+                Path(str(destinations[1]["path"])),
+                archive_sha256=str(destinations[1]["sha256"]),
+                provenance_path=Path(str(descriptor.get("hermes_provenance_path") or "")),
+                provenance_sha256=str(descriptor.get("hermes_provenance_sha256") or ""),
+                hermes_source_sha=str(descriptor.get("hermes_source_sha") or ""),
+            )["archive"],
         ),
     ]
     if str(archives[0]["sha256"]) != OFFICIAL_RUNTIME_ARCHIVE_SHA256:
@@ -2601,6 +3093,12 @@ def _materialize_sealed_runtime(
         runtime_directories.add(runtime_root)
     for directory in sorted(runtime_directories, key=lambda value: len(value.parts)):
         _ensure_directory_tree(directory, mode=0o555, uid=0, gid=0)
+    _verify_runtime_tree_against_manifest(
+        runtime_root,
+        cast(list[dict[str, object]], manifest["entries"]),
+        expected_owner_uid=0,
+        expected_owner_gid=0,
+    )
     probe = runtime_probe or verify_isolated_runtime_import
     try:
         probe(
@@ -3051,9 +3549,23 @@ def activate_service_config(
         or reread.get("trusted_publisher_enabled") is not True
     ):
         raise ValueError("broker activation readback failed")
-    _update_runtime_attestation(
-        reread, service_config_path=Path(path), active=True, revoked=False
-    )
+    if reread.get("runtime_attestation_path") is not None:
+        _update_runtime_attestation(
+            reread,
+            service_config_path=Path(path),
+            active=True,
+            revoked=False,
+            isolated_probe={
+                "command": [
+                    str(reread["python_executable"]),
+                    "-I",
+                    "-B",
+                    str(Path(reread["python_executable"]).parent.parent / "runtime-probe.py"),
+                ],
+                "outcome": "PASS",
+            },
+            publisher_probe_status="PASS",
+        )
     return reread
 
 
@@ -3080,7 +3592,7 @@ def stage_service_config(path: Path, *, expected_owner_uid: int) -> dict:
     ):
         raise ValueError("broker staging readback failed")
     _update_runtime_attestation(
-        reread, service_config_path=Path(path), active=True, revoked=False
+        reread, service_config_path=Path(path), active=False, revoked=True
     )
     return reread
 
@@ -3406,11 +3918,22 @@ def verify_service_disabled(path: Path, *, expected_owner_uid: int) -> bool:
     )
 
 
-def _read_root_json(path: Path, *, contract: str, allow_current_owner: bool = False) -> dict:
+def _read_root_json(
+    path: Path,
+    *,
+    contract: str,
+    allow_current_owner: bool = False,
+    allow_unprivileged_owner: bool = False,
+) -> dict:
     path = Path(path)
     _validated_install_path(path, field="broker installer input")
     raw, info = _read_sealed_file_bytes(path, max_bytes=4 * 1024 * 1024)
-    if info.st_uid not in ({0, os.geteuid()} if allow_current_owner else {0}):
+    allowed_owners = (
+        None
+        if allow_unprivileged_owner
+        else ({0, os.geteuid()} if allow_current_owner else {0})
+    )
+    if allowed_owners is not None and info.st_uid not in allowed_owners:
         raise ValueError("broker installer input must be root-owned mode 0600")
     if stat.S_IMODE(info.st_mode) != 0o600:
         raise ValueError("broker installer input must be root-owned mode 0600")
@@ -3442,12 +3965,22 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--runtime-archive-sha256", required=True)
     render.add_argument("--hermes-install-archive", type=Path, required=True)
     render.add_argument("--hermes-install-archive-sha256", required=True)
+    render.add_argument("--hermes-install-provenance", type=Path, required=True)
+    render.add_argument("--hermes-install-provenance-sha256", required=True)
+    render.add_argument("--publisher-probe", type=Path, required=True)
+    render.add_argument("--publisher-probe-sha256", required=True)
     render.add_argument("--hermes-source-sha", required=True)
     render.add_argument("--radulator-source-path", type=Path, required=True)
     render.add_argument("--source-sha", "--radulator-source-sha", required=True)
     render.add_argument("--dispatcher-profile", required=True)
     render.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
     render.add_argument("--install-nonce")
+    seal = subparsers.add_parser(
+        "seal-plan",
+        help="seal offline plan inputs as root-owned apply documents",
+    )
+    seal.add_argument("--input-root", type=Path, required=True)
+    seal.add_argument("--output-root", type=Path, required=True)
     inventory_check = subparsers.add_parser(
         "validate-inventory", help="validate a complete explicit host identity inventory"
     )
@@ -3485,6 +4018,10 @@ def main(argv: list[str] | None = None) -> int:
             runtime_archive_sha256=args.runtime_archive_sha256,
             hermes_install_archive_path=args.hermes_install_archive,
             hermes_install_archive_sha256=args.hermes_install_archive_sha256,
+            hermes_install_provenance_path=args.hermes_install_provenance,
+            hermes_install_provenance_sha256=args.hermes_install_provenance_sha256,
+            publisher_probe_path=args.publisher_probe,
+            publisher_probe_sha256=args.publisher_probe_sha256,
             hermes_source_sha=args.hermes_source_sha,
             radulator_source_path=args.radulator_source_path,
             radulator_source_sha=args.source_sha,
@@ -3508,6 +4045,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         output = _validated_install_path(args.output, field="identity allocation output", allow_root=False)
         _atomic_artifact_write(output, _json_artifact_bytes(desired), mode=0o600, uid=os.geteuid(), gid=os.getegid())
+        return 0
+    if args.command == "seal-plan":
+        seal_broker_installation_plan(
+            input_root=args.input_root,
+            output_root=args.output_root,
+        )
         return 0
     if os.geteuid() != 0:  # windows-footgun: ok - macOS launchd installer only
         raise PermissionError("broker install/rollback commands require root")
@@ -3743,6 +4286,7 @@ def render_launchd_plist(
     if runtime_entrypoint_path is not None:
         program = [
             str(Path(python_executable)),
+            "-B",
             "-I",
             str(Path(runtime_entrypoint_path)),
             "-m",
@@ -3832,6 +4376,7 @@ def render_worker_launchd_plist(
         "Label": "ai.hermes.kanban-worker",
         "ProgramArguments": [
             str(Path(python_executable)),
+            "-B",
             *(["-I", str(Path(runtime_entrypoint_path))] if runtime_entrypoint_path is not None else []),
             "-m",
             "hermes_cli.kanban_broker_worker",
@@ -3931,7 +4476,7 @@ def verify_isolated_runtime_import(
         probe = Path(direct_probe_path)
         if not probe.is_absolute() or ".." in probe.parts:
             raise ValueError("runtime direct probe path is invalid")
-        command = [str(Path(python_executable)), "-I", str(probe)]
+        command = [str(Path(python_executable)), "-I", "-B", str(probe)]
     else:
         command = [
             str(Path(python_executable)), "-I", str(Path(entrypoint_path)),
@@ -3961,6 +4506,10 @@ def render_broker_installation_plan(
     runtime_archive_sha256: str,
     hermes_install_archive_path: Path,
     hermes_install_archive_sha256: str,
+    hermes_install_provenance_path: Path,
+    hermes_install_provenance_sha256: str,
+    publisher_probe_path: Path,
+    publisher_probe_sha256: str,
     hermes_source_sha: str | None,
     radulator_source_path: Path,
     radulator_source_sha: str | None,
@@ -4014,10 +4563,15 @@ def render_broker_installation_plan(
     if not git.is_absolute() or ".." in git.parts:
         raise ValueError("Git executable path is invalid")
     git_digest = _apple_system_binary_sha256(git)
+    publisher_probe = _read_publisher_probe(
+        Path(publisher_probe_path), expected_sha256=publisher_probe_sha256
+    )
 
     state_dir = root / "state"
     workspace_root = root / "workspaces"
     worker_home = root / "worker-home"
+    profile_root = worker_home / "profiles" / dispatcher_profile
+    dispatcher_routing_config_path = profile_root / "kanban-routing.json"
     handoff_root = root / "publisher-handoffs"
     socket_root = root / "sockets"
     key_root = root / "keys"
@@ -4057,6 +4611,8 @@ def render_broker_installation_plan(
     runtime_input_root = root / "install" / "runtime-inputs"
     runtime_python_archive_path = runtime_input_root / "cpython-runtime.tar.gz"
     runtime_hermes_archive_path = runtime_input_root / "hermes-install.tar.gz"
+    runtime_hermes_provenance_path = runtime_input_root / "hermes-install.provenance.json"
+    runtime_publisher_probe_path = runtime_input_root / "trusted_publisher.py"
     registration_path = root / "install" / "broker-register.json"
     runtime_manifest_path = root / "install" / "runtime-manifest.json"
     runtime_attestation_path = root / "install" / "runtime-attestation.json"
@@ -4083,9 +4639,16 @@ def render_broker_installation_plan(
         runtime_archive_sha256=runtime_archive_sha256,
         hermes_install_archive_path=hermes_archive,
         hermes_install_archive_sha256=hermes_install_archive_sha256,
+        hermes_install_provenance_path=hermes_install_provenance_path,
+        hermes_install_provenance_sha256=hermes_install_provenance_sha256,
+        hermes_source_sha=hermes_commit_sha,
         runtime_root=sealed_runtime_root,
         entrypoint_path=entrypoint_path,
     )
+    # The sidecar is copied into the root-owned staged input tree; keep the
+    # source path only in the offline external-input record, never in the
+    # apply descriptor consumed by the sealed runtime.
+    sealed_runtime["hermes_provenance_path"] = str(runtime_hermes_provenance_path)
     package_root = Path(str(sealed_runtime["package_root"]))
     python = Path(str(sealed_runtime["python_executable_path"]))
     # The legacy runtime-assets renderer remains available for existing pure
@@ -4096,6 +4659,8 @@ def render_broker_installation_plan(
         "contract": "hermes.kanban_broker_runtime_assets.v1",
         "destination_root": str(package_root),
         "package_manifest_sha256": str(sealed_runtime["package_manifest_sha256"]),
+        "provenance_sha256": str(sealed_runtime["hermes_provenance_sha256"]),
+        "hermes_pyproject_lock_sha256": str(sealed_runtime["hermes_pyproject_lock_sha256"]),
         "directories": [],
         "files": [],
     }
@@ -4194,6 +4759,10 @@ def render_broker_installation_plan(
         remote_policy_path=remote_policy_path,
         remote_policy_source_sha=source_sha,
         dispatcher_profile=dispatcher_profile,
+        dispatcher_routing_config_path=dispatcher_routing_config_path,
+        publisher_probe_path=runtime_publisher_probe_path,
+        publisher_probe_sha256=str(publisher_probe["sha256"]),
+        registration_file_path=registration_path,
         install_nonce=install_nonce,
     ))
     clients: dict[str, bytes] = {}
@@ -4205,6 +4774,14 @@ def render_broker_installation_plan(
             key_path=surface_keys[surface],
             sequence_path=sequence_paths[surface],
         ).encode("utf-8")
+    routing_config = render_dispatcher_routing_config(
+        profile=dispatcher_profile,
+        controller_client_config=client_paths["controller"],
+        publisher_client_config=client_paths["publisher"],
+        operator_client_config=client_paths["operator"],
+        registration_file=registration_path,
+        expected_source_sha=source_sha,
+    ).encode("utf-8")
     seatbelt = render_broker_seatbelt_profile(
         state_dir=state_dir,
         workspace_root=workspace_root,
@@ -4251,6 +4828,7 @@ def render_broker_installation_plan(
         "runtime_root": str(sealed_runtime_root),
         "python_executable": str(python),
         "python_version": OFFICIAL_RUNTIME_VERSION,
+        "provenance": _official_runtime_provenance(sha256=runtime_archive_sha256),
         "runtime_manifest_sha256": str(sealed_runtime["runtime_manifest_sha256"]),
         "entries": sealed_runtime["entries"],
     }
@@ -4265,6 +4843,8 @@ def render_broker_installation_plan(
         "service_config_sha256": hashlib.sha256(_json_artifact_bytes(config)).hexdigest(),
         "hermes_source_sha": hermes_commit_sha,
         "hermes_install_archive_sha256": str(hermes_install_archive_sha256),
+        "hermes_pyproject_lock_sha256": str(sealed_runtime["hermes_pyproject_lock_sha256"]),
+        "hermes_provenance_sha256": str(sealed_runtime["hermes_provenance_sha256"]),
         "radulator_source_sha": source_sha,
         "runtime_root": str(sealed_runtime_root),
         "runtime_manifest_path": str(runtime_manifest_path),
@@ -4272,16 +4852,28 @@ def render_broker_installation_plan(
         "python_version": OFFICIAL_RUNTIME_VERSION,
         "python_sha256": str(sealed_runtime["python_sha256"]),
         "runtime_manifest_sha256": str(sealed_runtime["runtime_manifest_sha256"]),
+        "runtime_provenance": _official_runtime_provenance(
+            sha256=runtime_archive_sha256
+        ),
+        "publisher_probe_path": str(runtime_publisher_probe_path),
+        "publisher_probe_sha256": str(publisher_probe["sha256"]),
+        "publisher_probe_contract": PUBLISHER_PROBE_CONTRACT,
+        "publisher_probe_status": "PENDING",
         "archive_digests": {
             "cpython": str(runtime_archive_sha256),
             "hermes_install": str(hermes_install_archive_sha256),
         },
         "isolated_probe": {
             "command": [str(python), "-I", str(sealed_runtime["direct_probe_path"])],
-            "outcome": "PASS",
+            "outcome": "PENDING",
         },
     }
     runtime_attestation_bytes = _json_artifact_bytes(runtime_attestation)
+    provenance_bytes, _provenance_info = _read_sealed_file_bytes(
+        Path(hermes_install_provenance_path),
+        max_bytes=_MAX_RUNTIME_FILE_BYTES,
+        expected_sha256=hermes_install_provenance_sha256,
+    )
     # Keys are generated once during rendering and carried only by the
     # root-owned payload manifest.  They are never printed by the CLI.
     payload_bytes: dict[str, bytes] = {}
@@ -4297,6 +4889,13 @@ def render_broker_installation_plan(
         str(registration_path): _json_artifact_bytes(registration),
         str(runtime_manifest_path): runtime_manifest_bytes,
         str(runtime_attestation_path): runtime_attestation_bytes,
+        str(runtime_hermes_provenance_path): provenance_bytes,
+        str(runtime_publisher_probe_path): _read_sealed_file_bytes(
+            Path(publisher_probe_path),
+            max_bytes=_MAX_RUNTIME_FILE_BYTES,
+            expected_sha256=str(publisher_probe["sha256"]),
+        )[0],
+        str(dispatcher_routing_config_path): routing_config,
     })
     for surface in ("controller", "publisher", "operator"):
         payload_bytes[str(surface_keys[surface])] = secrets.token_bytes(32)
@@ -4330,6 +4929,27 @@ def render_broker_installation_plan(
             "gid": 0,
             "mode": 0o644,
             "kind": "runtime_manifest",
+        },
+        {
+            "path": str(runtime_hermes_provenance_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "kind": "hermes_install_provenance",
+        },
+        {
+            "path": str(runtime_publisher_probe_path),
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o555,
+            "kind": "publisher_preflight_script",
+        },
+        {
+            "path": str(dispatcher_routing_config_path),
+            "uid": int(config["model_uid"]),
+            "gid": int(config["workspace_gid"]),
+            "mode": 0o600,
+            "kind": "dispatcher_routing_config",
         },
         {
             "path": str(entrypoint_path),
@@ -4487,6 +5107,13 @@ def render_broker_installation_plan(
             "archive_destinations": [str(runtime_python_archive_path), str(runtime_hermes_archive_path)],
             "attestation_path": str(runtime_attestation_path),
             "runtime_manifest_path": str(runtime_manifest_path),
+            "runtime_provenance": _official_runtime_provenance(
+                sha256=runtime_archive_sha256
+            ),
+            "hermes_pyproject_lock_sha256": str(sealed_runtime["hermes_pyproject_lock_sha256"]),
+            "hermes_provenance_sha256": str(sealed_runtime["hermes_provenance_sha256"]),
+            "publisher_probe_path": str(runtime_publisher_probe_path),
+            "publisher_probe_sha256": str(publisher_probe["sha256"]),
         },
         "artifacts": artifacts,
     }
@@ -4608,7 +5235,13 @@ def _atomic_artifact_write(path: Path, content: bytes, *, mode: int, uid: int, g
 
 
 def _update_runtime_attestation(
-    config: dict[str, object], *, service_config_path: Path, active: bool, revoked: bool
+    config: dict[str, object],
+    *,
+    service_config_path: Path,
+    active: bool,
+    revoked: bool,
+    isolated_probe: dict[str, object] | None = None,
+    publisher_probe_status: str | None = None,
 ) -> None:
     """Publish only sanitized runtime state; never include keys or credentials."""
     raw_path = config.get("runtime_attestation_path")
@@ -4631,9 +5264,12 @@ def _update_runtime_attestation(
         raise ValueError("runtime attestation is invalid JSON") from exc
     required = {
         "contract", "schema_version", "active", "revoked", "service_config_sha256",
-        "hermes_source_sha", "hermes_install_archive_sha256", "radulator_source_sha",
+        "hermes_source_sha", "hermes_install_archive_sha256", "hermes_pyproject_lock_sha256",
+        "hermes_provenance_sha256", "radulator_source_sha",
         "runtime_root", "runtime_manifest_path", "python_executable", "python_version", "python_sha256",
-        "runtime_manifest_sha256", "archive_digests", "isolated_probe",
+        "runtime_manifest_sha256", "runtime_provenance", "publisher_probe_path",
+        "publisher_probe_sha256", "publisher_probe_contract", "publisher_probe_status",
+        "archive_digests", "isolated_probe",
     }
     if not isinstance(attestation, dict) or set(attestation) != required:
         raise ValueError("runtime attestation fields are not exact")
@@ -4648,15 +5284,37 @@ def _update_runtime_attestation(
             for value in attestation["archive_digests"].values()
         )
         or attestation["archive_digests"]["cpython"] != OFFICIAL_RUNTIME_ARCHIVE_SHA256
+        or attestation.get("runtime_provenance") != _official_runtime_provenance(
+            sha256=attestation["archive_digests"]["cpython"]
+        )
+        or attestation.get("publisher_probe_contract") != PUBLISHER_PROBE_CONTRACT
+        or attestation.get("publisher_probe_status") not in {"PASS", "PENDING"}
         or not isinstance(attestation["isolated_probe"], dict)
         or set(attestation["isolated_probe"]) != {"command", "outcome"}
-        or attestation["isolated_probe"]["outcome"] != "PASS"
+        or attestation["isolated_probe"]["outcome"] not in {"PASS", "PENDING"}
         or not isinstance(attestation["isolated_probe"]["command"], list)
     ):
         raise ValueError("runtime attestation evidence is not exact")
     updated = dict(attestation)
     updated["active"] = bool(active)
     updated["revoked"] = bool(revoked)
+    if isolated_probe is not None:
+        updated["isolated_probe"] = dict(isolated_probe)
+    if publisher_probe_status is not None:
+        updated["publisher_probe_status"] = publisher_probe_status
+    if (
+        not isinstance(updated.get("isolated_probe"), dict)
+        or set(updated["isolated_probe"]) != {"command", "outcome"}
+        or not isinstance(updated["isolated_probe"].get("command"), list)
+        or updated["isolated_probe"].get("outcome") not in {"PASS", "PENDING"}
+    ):
+        raise ValueError("runtime attestation isolated probe evidence is invalid")
+    if bool(active) and updated["isolated_probe"].get("outcome") != "PASS":
+        raise ValueError("runtime attestation cannot activate before the isolated probe passes")
+    if updated.get("publisher_probe_status") not in {"PASS", "PENDING"}:
+        raise ValueError("runtime attestation publisher probe status is invalid")
+    if bool(active) and updated.get("publisher_probe_status") != "PASS":
+        raise ValueError("runtime attestation cannot activate before the publisher probe passes")
     _validated_hex_sha(updated["hermes_source_sha"], field="Hermes source SHA", length=40)
     _validated_hex_sha(
         updated["hermes_install_archive_sha256"],
@@ -4665,6 +5323,21 @@ def _update_runtime_attestation(
     )
     _validated_hex_sha(updated["radulator_source_sha"], field="Radulator source SHA", length=40)
     _validated_hex_sha(updated["python_sha256"], field="Python SHA256", length=64)
+    _validated_hex_sha(
+        updated["hermes_pyproject_lock_sha256"],
+        field="Hermes pyproject/lock SHA256",
+        length=64,
+    )
+    _validated_hex_sha(
+        updated["hermes_provenance_sha256"],
+        field="Hermes provenance SHA256",
+        length=64,
+    )
+    _validated_hex_sha(
+        updated["publisher_probe_sha256"],
+        field="publisher preflight script SHA256",
+        length=64,
+    )
     _validated_hex_sha(
         updated["runtime_manifest_sha256"], field="runtime manifest SHA256", length=64
     )
@@ -4677,6 +5350,25 @@ def _update_runtime_attestation(
         expected_python_executable=Path(str(updated["python_executable"])),
         expected_python_version=OFFICIAL_RUNTIME_VERSION,
     )
+    configured_probe = config.get("publisher_probe_path")
+    if configured_probe is not None and (
+        updated.get("publisher_probe_path") != configured_probe
+        or updated.get("publisher_probe_contract") != PUBLISHER_PROBE_CONTRACT
+    ):
+        raise ValueError("runtime attestation publisher binding differs from service config")
+    if configured_probe is not None:
+        probe = Path(str(configured_probe))
+        probe_info = probe.lstat()
+        if (
+            stat.S_ISLNK(probe_info.st_mode)
+            or not stat.S_ISREG(probe_info.st_mode)
+            or probe_info.st_uid != 0
+            or probe_info.st_gid != 0
+            or probe_info.st_nlink != 1
+            or stat.S_IMODE(probe_info.st_mode) != 0o555
+            or _safe_file_sha256(probe) != updated.get("publisher_probe_sha256")
+        ):
+            raise ValueError("runtime attestation publisher script binding is unsafe")
     updated["service_config_sha256"] = _safe_file_sha256(Path(service_config_path))
     _atomic_artifact_write(path, _json_artifact_bytes(updated), mode=0o644, uid=0, gid=0)
 
@@ -5011,6 +5703,83 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
         owner_gid = os.getegid()
         _atomic_artifact_write(target(raw_path), content, mode=0o600, uid=owner_uid, gid=owner_gid)
     return {"contract": BROKER_INSTALL_PLAN_CONTRACT, "output_root": str(destination_root)}
+
+
+def seal_broker_installation_plan(*, input_root: Path, output_root: Path) -> dict[str, str]:
+    """Re-emit an offline render as root-owned apply inputs.
+
+    Rendering intentionally remains usable by an unprivileged reviewer.  The
+    apply edge must consume a separate root seal so no undocumented chown or
+    ownership assumption can turn reviewer-controlled JSON into an installer
+    authority document.
+    """
+    if os.geteuid() != 0:
+        raise PermissionError("broker plan sealing requires root")
+    source_root = _validated_install_path(
+        input_root, field="offline plan input root", allow_root=True
+    )
+    if source_root == Path(source_root.anchor):
+        raise ValueError("offline plan input root must be bounded")
+    destination_root = _validated_install_path(
+        output_root, field="sealed plan output root", allow_root=True
+    )
+    if destination_root == Path(destination_root.anchor):
+        raise ValueError("sealed plan output root must be bounded")
+    try:
+        destination_info = destination_root.lstat()
+    except FileNotFoundError:
+        destination_info = None
+    if destination_info is not None and (
+        stat.S_ISLNK(destination_info.st_mode) or not stat.S_ISDIR(destination_info.st_mode)
+    ):
+        raise ValueError("sealed plan output root must be a real directory")
+    if destination_info is not None:
+        os.chown(destination_root, 0, 0)
+        os.chmod(destination_root, 0o700)
+    identity = _read_root_json(
+        source_root / "install/identities.json",
+        contract="hermes.kanban_broker_identity_plan.v1",
+        allow_unprivileged_owner=True,
+    )
+    filesystem = _read_root_json(
+        source_root / "install/filesystem.json",
+        contract="hermes.kanban_broker_filesystem_plan.v1",
+        allow_unprivileged_owner=True,
+    )
+    payloads = _read_root_json(
+        source_root / "install/payloads.json",
+        contract=ASSET_PAYLOAD_CONTRACT,
+        allow_unprivileged_owner=True,
+    )
+    outer = {
+        "contract": BROKER_INSTALL_PLAN_CONTRACT,
+        "schema_version": 1,
+        "install_root": str(source_root),
+        "identity_plan_path": str(source_root / "install/identities.json"),
+        "filesystem_plan_path": str(source_root / "install/filesystem.json"),
+        "payload_manifest_path": str(source_root / "install/payloads.json"),
+        "identity_plan": identity,
+        "filesystem_plan": filesystem,
+        "asset_payload_manifest": payloads,
+    }
+    result = write_broker_installation_plan(outer, output_root=output_root)
+    destination = Path(result["output_root"])
+    os.chown(destination, 0, 0)
+    os.chmod(destination, 0o700)
+    for path in (
+        destination / "install/identities.json",
+        destination / "install/filesystem.json",
+        destination / "install/payloads.json",
+    ):
+        info = path.lstat()
+        if (
+            info.st_uid != 0
+            or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise ValueError("sealed broker plan ownership readback failed")
+    return result
 
 
 if __name__ == "__main__":

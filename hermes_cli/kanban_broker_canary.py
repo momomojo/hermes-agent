@@ -346,6 +346,168 @@ def _credential_scrub_check(config: dict[str, Any]) -> bool:
                 os.environ[name] = value
 
 
+def _routing_profile_check(config: dict[str, Any]) -> bool:
+    """Load the named dispatcher profile and verify its real client routes."""
+    routing_path = Path(str(config.get("dispatcher_routing_config_path") or ""))
+    profile = str(config.get("dispatcher_profile") or "")
+    if not profile or routing_path.name != "kanban-routing.json":
+        return False
+    if routing_path.parent.name != profile:
+        return False
+    expected_profile_root = (
+        Path(str(config.get("worker_hermes_root") or ""))
+        / "profiles"
+        / profile
+    )
+    if routing_path.parent != expected_profile_root:
+        return False
+    profile_info = routing_path.parent.lstat()
+    if (
+        stat.S_ISLNK(profile_info.st_mode)
+        or not stat.S_ISDIR(profile_info.st_mode)
+        or profile_info.st_uid != int(config["model_uid"])
+        or profile_info.st_gid != int(config["workspace_gid"])
+        or stat.S_IMODE(profile_info.st_mode) != 0o700
+    ):
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(routing_path, flags)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != int(config["model_uid"])
+            or info.st_gid != int(config["workspace_gid"])
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return False
+        raw = os.read(fd, 1024 * 1024 + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > 1024 * 1024:
+        return False
+    try:
+        routing = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    required = {
+        "contract", "schema_version", "profile", "dedicated_broker_enabled",
+        "trusted_publisher_enabled", "controller_client_config",
+        "publisher_client_config", "operator_client_config", "registration_file",
+        "expected_source_sha",
+    }
+    if not isinstance(routing, dict) or set(routing) != required:
+        return False
+    if (
+        routing["contract"] != "hermes.kanban_broker_routing.v1"
+        or routing["schema_version"] != 1
+        or routing["profile"] != profile
+        or routing["dedicated_broker_enabled"] is not False
+        or routing["trusted_publisher_enabled"] is not False
+        or not isinstance(routing["expected_source_sha"], str)
+        or len(routing["expected_source_sha"]) != 40
+        or routing.get("registration_file") != config.get("registration_file_path")
+    ):
+        return False
+    for surface in ("controller", "publisher", "operator"):
+        client_path = Path(str(routing[f"{surface}_client_config"]))
+        if not client_path.is_absolute() or ".." in client_path.parts:
+            return False
+        try:
+            client_info = client_path.lstat()
+            if (
+                stat.S_ISLNK(client_info.st_mode)
+                or not stat.S_ISREG(client_info.st_mode)
+                or client_info.st_uid != int(config[f"{surface}_uid"])
+                or client_info.st_gid != int(config[f"{surface}_gid"])
+                or stat.S_IMODE(client_info.st_mode) != 0o600
+            ):
+                return False
+            client = json.loads(client_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(client, dict)
+            or client.get("surface") != surface
+            or client.get("socket_path") != config[f"{surface}_socket"]
+        ):
+            return False
+    registration = Path(str(routing["registration_file"]))
+    if not registration.is_file() or registration.is_symlink():
+        return False
+    try:
+        request = json.loads(registration.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(request, dict)
+        and request.get("expected_source_sha") == routing["expected_source_sha"]
+    )
+
+
+def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
+    """Run Radulator's exact direct isolated publisher preflight contract."""
+    probe = Path(str(config.get("publisher_probe_path") or ""))
+    python = Path(str(config.get("python_executable") or ""))
+    manifest = Path(str(config.get("runtime_manifest_path") or ""))
+    if not probe.is_absolute() or not python.is_absolute() or not manifest.is_absolute():
+        return False
+    command = [
+        str(python), "-I", "-B", str(probe),
+        "--runtime-root", str(python.parent.parent),
+        "--runtime-manifest", str(manifest),
+        "--runtime-manifest-sha256", str(config.get("runtime_manifest_sha256") or ""),
+        "--runtime-python-version", str(config.get("python_version") or ""),
+        "--runtime-python-sha256", str(config.get("python_sha256") or ""),
+        "--runtime-preflight",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        )
+        if result.returncode != 0:
+            return False
+        response = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    expected = {
+        "contract": "radulator.publisher_runtime_preflight.v1",
+        "status": "PASS",
+        "python_executable": str(python),
+        "python_version": str(config["python_version"]),
+        "runtime_root": str(python.parent.parent),
+        "runtime_manifest_sha256": str(config["runtime_manifest_sha256"]),
+        "broker_client_module": None,
+        "broker_rpc": "PASS",
+    }
+    if not isinstance(response, dict) or set(response) != set(expected):
+        return False
+    module_path = response.get("broker_client_module")
+    package_root = Path(str(config["package_root"])).resolve()
+    try:
+        module_resolved = Path(str(module_path)).resolve()
+    except (TypeError, ValueError):
+        return False
+    expected.update({"broker_client_module": str(module_resolved)})
+    return bool(
+        response.get("contract") == expected["contract"]
+        and response.get("status") == expected["status"]
+        and response.get("python_executable") == expected["python_executable"]
+        and response.get("python_version") == expected["python_version"]
+        and response.get("runtime_root") == expected["runtime_root"]
+        and response.get("runtime_manifest_sha256") == expected["runtime_manifest_sha256"]
+        and response.get("broker_rpc") == expected["broker_rpc"]
+        and module_resolved == package_root / "kanban_broker_client.py"
+        and module_resolved.is_file()
+    )
+
+
 def cross_uid_process_read_denied(
     path: Path,
     *,
@@ -530,6 +692,20 @@ def run_activation_canaries(config: dict[str, Any]) -> dict[str, dict[str, str]]
     )
     checks["network_denied"] = lambda: _network_denied(config)
     checks["credential_env_scrubbed"] = lambda: _credential_scrub_check(config)
+    checks["routing_profile_binding"] = lambda: _routing_profile_check(config)
+    checks["publisher_runtime_preflight"] = lambda: _publisher_runtime_preflight_check(config)
+    def isolated_runtime_check() -> bool:
+        from hermes_cli.kanban_broker_install import verify_isolated_runtime_import
+
+        verify_isolated_runtime_import(
+            python_executable=Path(config["python_executable"]),
+            entrypoint_path=Path(config["runtime_entrypoint_path"]),
+            direct_probe_path=Path(config["python_executable"]).parent.parent
+            / "runtime-probe.py",
+            module="hermes_cli.kanban_broker_client",
+        )
+        return True
+    checks["isolated_runtime_import"] = isolated_runtime_check
     checks["model_terminal_denied"] = lambda: cross_uid_process_read_denied(
         authority_key, **model, accessibility_driven=False
     )
@@ -551,6 +727,9 @@ def run_activation_canaries(config: dict[str, Any]) -> dict[str, dict[str, str]]
         "worker_socket_matrix",
         "network_denied",
         "credential_env_scrubbed",
+        "routing_profile_binding",
+        "publisher_runtime_preflight",
+        "isolated_runtime_import",
         "model_terminal_denied",
         "computer_use_denied_by_uid",
     }
