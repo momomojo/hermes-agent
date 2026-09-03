@@ -811,7 +811,7 @@ def test_official_runtime_provenance_binds_astral_origin():
     )
 
 
-def test_hermes_install_builder_binds_git_and_lock_inputs(tmp_path):
+def test_hermes_install_builder_rejects_arbitrary_toy_closure(tmp_path):
     from hermes_cli import kanban_broker_install as installer
 
     source = tmp_path / "hermes-source"
@@ -829,42 +829,37 @@ def test_hermes_install_builder_binds_git_and_lock_inputs(tmp_path):
     ).stdout.strip()
     install = tmp_path / "install-closure"
     (install / "hermes_cli").mkdir(parents=True)
-    (install / "hermes_dep").mkdir()
-    for path, content in {
-        install / "hermes_cli/main.py": "from hermes_cli.kanban_broker_client import X\ndef main(): return X\n",
-        install / "hermes_cli/kanban_broker_client.py": "X = 'ok'\n",
-        install / "hermes_dep/runtime.py": "VALUE = 1\n",
-    }.items():
-        path.write_text(content, encoding="utf-8")
-        path.chmod(0o444)
-    (install / "hermes_cli").chmod(0o555)
-    (install / "hermes_dep").chmod(0o555)
-    install.chmod(0o555)
-    archive = tmp_path / "closure.tar.gz"
-    provenance = tmp_path / "closure.provenance.json"
-    result = installer.build_hermes_install_archive(
-        source_root=source,
-        install_root=install,
-        source_sha=source_sha,
-        output_archive=archive,
-        output_provenance=provenance,
-    )
-    assert result["source_sha"] == source_sha
-    assert result["archive_sha256"] == __import__("hashlib").sha256(archive.read_bytes()).hexdigest()
-    parsed = installer._read_hermes_install_provenance(
-        provenance,
-        expected_sha256=result["provenance_sha256"],
-        expected_archive_sha256=result["archive_sha256"],
-        expected_source_sha=source_sha,
-    )
-    assert parsed["builder_contract"] == installer.HERMES_INSTALL_BUILDER_CONTRACT
-    with pytest.raises(ValueError, match="source SHA"):
+    (install / "hermes_cli/main.py").write_text("def main(): return 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="source-derived|lock|pyproject"):
         installer.build_hermes_install_archive(
             source_root=source,
             install_root=install,
-            source_sha="a" * 40,
-            output_archive=tmp_path / "bad.tar.gz",
-            output_provenance=tmp_path / "bad.provenance.json",
+            source_sha=source_sha,
+            output_archive=tmp_path / "closure.tar.gz",
+            output_provenance=tmp_path / "closure.provenance.json",
+        )
+
+
+def test_radulator_source_replacement_after_commit_is_rejected(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    kwargs = _runtime_kwargs(tmp_path)
+    probe = kwargs["publisher_probe_path"]
+    original = probe.read_bytes()
+    probe.write_bytes(original + b"\nprint('lookalike')\n")
+    kwargs["publisher_probe_sha256"] = __import__("hashlib").sha256(
+        probe.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="Git|reviewed|source"):
+        installer.render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
+            dispatcher_profile="radulator",
         )
 
 

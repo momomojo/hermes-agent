@@ -404,9 +404,9 @@ def _routing_profile_check(config: dict[str, Any]) -> bool:
     if (
         stat.S_ISLNK(profile_info.st_mode)
         or not stat.S_ISDIR(profile_info.st_mode)
-        or profile_info.st_uid != int(config["model_uid"])
-        or profile_info.st_gid != int(config["workspace_gid"])
-        or stat.S_IMODE(profile_info.st_mode) != 0o700
+        or profile_info.st_uid != 0
+        or profile_info.st_gid != 0
+        or stat.S_IMODE(profile_info.st_mode) != 0o555
     ):
         return False
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -502,6 +502,26 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
         or ".." in client_config.parts
     ):
         return False
+    # The subprocess result is not a trust boundary by itself.  Rebind the
+    # executable input to the root-owned immutable staged probe before
+    # accepting any PASS text; a replacement script cannot self-attest.
+    try:
+        probe_info = probe.lstat()
+        if (
+            stat.S_ISLNK(probe_info.st_mode)
+            or not stat.S_ISREG(probe_info.st_mode)
+            or probe_info.st_uid != 0
+            or probe_info.st_gid != 0
+            or probe_info.st_nlink != 1
+            or stat.S_IMODE(probe_info.st_mode) != 0o555
+        ):
+            return False
+        from hermes_cli.kanban_broker_install import _safe_file_sha256
+
+        if _safe_file_sha256(probe) != str(config.get("publisher_probe_sha256") or ""):
+            return False
+    except (OSError, ValueError):
+        return False
     command = [
         str(python), "-I", "-B", str(probe),
         "--runtime-preflight",
@@ -522,7 +542,7 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
             timeout=15,
             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         )
-        if result.returncode != 0:
+        if result.returncode != 0 or result.stderr:
             return False
         response = json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError, json.JSONDecodeError):

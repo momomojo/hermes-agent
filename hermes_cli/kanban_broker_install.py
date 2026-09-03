@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import csv
 import grp
 import gzip
 import hashlib
@@ -19,9 +20,11 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -939,7 +942,7 @@ def _read_hermes_install_provenance(
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Hermes install provenance manifest is invalid JSON") from exc
-    required = {
+    legacy_required = {
         "contract",
         "schema_version",
         "builder_contract",
@@ -951,7 +954,10 @@ def _read_hermes_install_provenance(
         "install_archive_sha256",
         "entries",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    modern_required = legacy_required | {
+        "first_party_git_archive_sha256", "locked_packages", "installed_distributions", "installer"
+    }
+    if not isinstance(value, dict) or (set(value) != legacy_required and set(value) != modern_required):
         raise ValueError("Hermes install provenance fields are not exact")
     if value.get("contract") != HERMES_INSTALL_PROVENANCE_CONTRACT or value.get("schema_version") != 1:
         raise ValueError("Hermes install provenance contract is unsupported")
@@ -969,6 +975,51 @@ def _read_hermes_install_provenance(
     _validated_hex_sha(value.get("uv_lock_sha256"), field="Hermes uv.lock SHA256", length=64)
     if value.get("install_archive_sha256") != expected_archive_sha256:
         raise ValueError("Hermes install provenance archive SHA differs from the staged archive")
+    if set(value) == modern_required:
+        _validated_hex_sha(
+            value.get("first_party_git_archive_sha256"),
+            field="Hermes first-party Git archive SHA256",
+            length=64,
+        )
+        locked = value.get("locked_packages")
+        if not isinstance(locked, list) or len(locked) < 2:
+            raise ValueError("Hermes install provenance lock closure is incomplete")
+        previous_lock_key: tuple[str, str] | None = None
+        for package in locked:
+            if not isinstance(package, dict) or set(package) != {"name", "version", "source", "artifacts"}:
+                raise ValueError("Hermes install provenance lock record is malformed")
+            name, version, source, artifacts = (
+                package.get("name"), package.get("version"), package.get("source"), package.get("artifacts")
+            )
+            if not isinstance(name, str) or not isinstance(version, str) or not isinstance(source, dict) or not isinstance(artifacts, list) or not artifacts:
+                raise ValueError("Hermes install provenance lock record is incomplete")
+            lock_key = (name.lower().replace("_", "-").replace(".", "-"), version)
+            if previous_lock_key is not None and lock_key < previous_lock_key:
+                raise ValueError("Hermes install provenance lock records are not ordered")
+            previous_lock_key = lock_key
+            previous_artifact: tuple[str, str] | None = None
+            for artifact in artifacts:
+                if not isinstance(artifact, dict) or set(artifact) != {"url", "sha256", "size"}:
+                    raise ValueError("Hermes install provenance artifact record is malformed")
+                if not isinstance(artifact.get("url"), str) or not isinstance(artifact.get("size"), int) or int(artifact["size"]) <= 0:
+                    raise ValueError("Hermes install provenance artifact record is incomplete")
+                digest = _validated_hex_sha(artifact.get("sha256"), field="Hermes locked artifact SHA256", length=64)
+                artifact_key = (str(artifact["url"]), digest)
+                if previous_artifact is not None and artifact_key < previous_artifact:
+                    raise ValueError("Hermes install provenance artifacts are not ordered")
+                previous_artifact = artifact_key
+        installed = value.get("installed_distributions")
+        if not isinstance(installed, list) or not installed:
+            raise ValueError("Hermes install provenance has no installed distributions")
+        for distribution in installed:
+            if not isinstance(distribution, dict) or set(distribution) != {"name", "version", "record"}:
+                raise ValueError("Hermes installed distribution record is malformed")
+            if not all(isinstance(distribution.get(key), str) and distribution[key] for key in ("name", "version", "record")):
+                raise ValueError("Hermes installed distribution record is incomplete")
+            _archive_relative_name(str(distribution["record"]))
+        installer = value.get("installer")
+        if not isinstance(installer, dict) or set(installer) != {"name", "contract", "python"} or installer.get("name") != "uv" or installer.get("contract") != "sync --frozen --no-dev --no-editable":
+            raise ValueError("Hermes install provenance installer is not the reviewed locked build")
     entries = value.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("Hermes install provenance entry set is empty")
@@ -1014,7 +1065,7 @@ def _read_hermes_install_provenance(
             if (
                 isinstance(entry.get("size"), bool)
                 or not isinstance(entry.get("size"), int)
-                or entry["size"] < 1
+                or entry["size"] < 0
             ):
                 raise ValueError("Hermes install provenance file size is invalid")
             _validated_hex_sha(entry.get("sha256"), field="Hermes install file SHA256", length=64)
@@ -1091,7 +1142,12 @@ def _validate_hermes_install_closure(
         content = contents.get(str(entry["path"]))
         if content is None or hashlib.sha256(content).hexdigest() != str(entry["sha256"]):
             raise ValueError("Hermes install archive content differs from provenance")
-        if str(entry["path"]).startswith("hermes_cli/"):
+        if str(entry["path"]) in {
+            "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/kanban_broker_canary.py",
+            "hermes_cli/kanban_broker_client.py", "hermes_cli/kanban_broker_install.py",
+            "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_service.py",
+            "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_dedicated_broker.py",
+        }:
             try:
                 tree = ast.parse(content.decode("utf-8"), filename=str(entry["path"]))
             except (UnicodeDecodeError, SyntaxError) as exc:
@@ -1100,8 +1156,8 @@ def _validate_hermes_install_closure(
             if not executable_nodes:
                 raise ValueError("Hermes install first-party module is a placeholder")
     main_content = contents.get("hermes_cli/main.py", b"")
-    if b"hermes_cli.kanban_broker_client" not in main_content or b"def main" not in main_content:
-        raise ValueError("Hermes install main module does not execute the broker client closure")
+    if b"def main" not in main_content:
+        raise ValueError("Hermes install main module does not provide the worker entrypoint")
     return {"archive": archive, "provenance": provenance}
 
 
@@ -1189,6 +1245,13 @@ def _validate_radulator_publisher_source(
     ):
         raise ValueError("Radulator lifecycle controller is unsafe or unavailable")
     git = Path(git_executable)
+    status = subprocess.run(
+        [str(git), "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=False, capture_output=True, text=True, timeout=10,
+        env=_git_command_environment(),
+    )
+    if status.returncode != 0 or status.stdout:
+        raise ValueError("Radulator source checkout must be clean and source-derived")
     try:
         result = subprocess.run(
             [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
@@ -1210,9 +1273,48 @@ def _validate_radulator_publisher_source(
         raise ValueError("Radulator source checkout has no verifiable Git HEAD")
     if head != expected:
         raise ValueError("Radulator source SHA does not match Git HEAD")
+    # A clean HEAD alone does not bind the two executable inputs: a caller
+    # could replace a tracked file and then supply its replacement digest.
+    # Compare both bytes and executable mode with the immutable Git blobs.
+    reviewed_probe_sha: str | None = None
+    for relative, actual in (
+        ("ops/hermes/radulator/trusted_publisher.py", probe),
+        ("ops/hermes/radulator/lifecycle_controller.py", lifecycle),
+    ):
+        listing = subprocess.run(
+            [str(git), "-C", str(source), "ls-tree", "-z", expected, "--", relative],
+            check=False, capture_output=True, timeout=10, env=_git_command_environment(),
+        )
+        records = listing.stdout.split(b"\0") if listing.returncode == 0 else []
+        records = [record for record in records if record]
+        if len(records) != 1 or b"\t" not in records[0]:
+            raise ValueError("Radulator reviewed source file is not bound to Git")
+        metadata, path_bytes = records[0].split(b"\t", 1)
+        fields = metadata.split()
+        if len(fields) != 3 or fields[1] != b"blob" or path_bytes.decode("utf-8") != relative:
+            raise ValueError("Radulator reviewed source Git entry is invalid")
+        mode, blob_sha = fields[0], fields[2]
+        if mode not in {b"100644", b"100755"} or re.fullmatch(rb"[0-9a-f]{40}", blob_sha) is None:
+            raise ValueError("Radulator reviewed source Git mode or blob is invalid")
+        blob = subprocess.run(
+            [str(git), "-C", str(source), "cat-file", "blob", blob_sha.decode("ascii")],
+            check=False, capture_output=True, timeout=10, env=_git_command_environment(),
+        )
+        if blob.returncode != 0:
+            raise ValueError("Radulator reviewed source Git blob is unavailable")
+        actual_bytes, actual_info = _read_sealed_file_bytes(
+            actual, max_bytes=_MAX_RUNTIME_FILE_BYTES
+        )
+        executable = bool(stat.S_IMODE(actual_info.st_mode) & 0o111)
+        if actual_bytes != blob.stdout or executable != (mode == b"100755"):
+            raise ValueError("Radulator source file differs from the reviewed Git blob")
+        if relative == "ops/hermes/radulator/trusted_publisher.py":
+            reviewed_probe_sha = hashlib.sha256(blob.stdout).hexdigest()
     probe_info = _read_publisher_probe(
         probe, expected_sha256=publisher_probe_sha256
     )
+    if reviewed_probe_sha != probe_info["sha256"]:
+        raise ValueError("publisher preflight digest is not the reviewed Git blob")
     return {
         **probe_info,
         "source_sha": head,
@@ -1241,6 +1343,11 @@ def _validate_hermes_source_provenance(
     if git != Path("/usr/bin/git"):
         raise ValueError("Hermes source verification requires /usr/bin/git")
     try:
+        status = subprocess.run(
+            [str(git), "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=False, capture_output=True, text=True, timeout=10,
+            env=_git_command_environment(),
+        )
         head = subprocess.run(
             [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
             check=False, capture_output=True, text=True, timeout=10,
@@ -1253,7 +1360,13 @@ def _validate_hermes_source_provenance(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("Hermes source Git identity cannot be verified") from exc
-    if head.returncode != 0 or head.stdout.strip() != expected or re.fullmatch(r"[0-9a-f]{40}", tree.stdout.strip()) is None:
+    if (
+        status.returncode != 0
+        or status.stdout
+        or head.returncode != 0
+        or head.stdout.strip() != expected
+        or re.fullmatch(r"[0-9a-f]{40}", tree.stdout.strip()) is None
+    ):
         raise ValueError("Hermes source SHA does not match Git HEAD")
     pyproject, _ = _read_sealed_file_bytes(source / "pyproject.toml", max_bytes=_MAX_RUNTIME_FILE_BYTES)
     uv_lock, _ = _read_sealed_file_bytes(source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES)
@@ -1266,6 +1379,15 @@ def _validate_hermes_source_provenance(
     lock_digest = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
     if provenance.get("pyproject_lock_sha256") != lock_digest:
         raise ValueError("Hermes pyproject/lock digest differs from the checkout")
+    if "locked_packages" in provenance:
+        locked = _locked_uv_packages(uv_lock)
+        if provenance.get("locked_packages") != locked:
+            raise ValueError("Hermes install provenance lock records differ from uv.lock")
+        _archive_bytes, _first_party_files = _git_archive_hermes_cli(
+            source, expected=expected, git=git
+        )
+        if provenance.get("first_party_git_archive_sha256") != hashlib.sha256(_archive_bytes).hexdigest():
+            raise ValueError("Hermes first-party install bytes differ from the reviewed Git archive")
 
 
 def render_sealed_runtime_plan(
@@ -3965,6 +4087,71 @@ def _rollback_failed_activation(
         )
 
 
+def _register_activation_repository(
+    config: dict[str, object], *, operator_client_config: Path
+) -> dict[str, object]:
+    """Consume the sealed registration input through the real broker socket."""
+    registration_value = config.get("registration_file_path")
+    if not isinstance(registration_value, str):
+        raise ValueError("broker activation registration file is required")
+    registration_path = Path(registration_value)
+    raw, info = _read_sealed_file_bytes(
+        registration_path, max_bytes=1024 * 1024
+    )
+    if (
+        info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) not in {0o600, 0o644}
+    ):
+        raise ValueError("broker activation registration file ownership or mode is unsafe")
+    try:
+        registration = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("broker activation registration file is invalid") from exc
+    required = {
+        "contract", "repository_id", "source_path", "default_branch", "project_id",
+        "remote_repository", "expected_source_sha",
+    }
+    if (
+        not isinstance(registration, dict)
+        or set(registration) != required
+        or registration.get("contract") != "hermes.kanban_broker_register_request.v1"
+        or not isinstance(registration.get("repository_id"), str)
+        or not isinstance(registration.get("source_path"), str)
+        or not isinstance(registration.get("default_branch"), str)
+        or not isinstance(registration.get("remote_repository"), dict)
+        or re.fullmatch(r"[0-9a-f]{40}", str(registration.get("expected_source_sha"))) is None
+    ):
+        raise ValueError("broker activation registration fields are not exact")
+    expected_sha = str(registration["expected_source_sha"])
+    configured_sha = config.get("remote_policy_source_sha")
+    if configured_sha != expected_sha:
+        raise ValueError("broker activation registration SHA differs from service policy")
+    from hermes_cli.kanban_broker_client import load_broker_client
+
+    client = load_broker_client(operator_client_config, expected_surface="operator")
+    request = dict(registration)
+    request.pop("contract", None)
+    result = client.call("register_repository", request)
+    expected_source = Path(str(registration["source_path"])).resolve(strict=True)
+    if (
+        not isinstance(result, dict)
+        or set(result) != {
+            "repository_id", "source_path", "default_branch", "base_sha", "fingerprint",
+            "project_id", "remote_repository", "remote_repository_sha256",
+        }
+        or result.get("repository_id") != registration["repository_id"]
+        or result.get("source_path") != str(expected_source)
+        or result.get("default_branch") != registration["default_branch"]
+        or result.get("base_sha") != expected_sha
+        or result.get("project_id") != registration["project_id"]
+        or result.get("remote_repository") != registration["remote_repository"]
+    ):
+        raise ValueError("broker activation registration readback does not match the sealed input")
+    return result
+
+
 def activate_installation(
     *,
     service_config_path: Path,
@@ -4030,6 +4217,12 @@ def activate_installation(
             if time.monotonic() >= deadline:
                 raise ValueError("broker activation sockets did not become ready")
             time.sleep(0.05)
+        # Registration is an operator-authorized broker operation.  It is
+        # consumed from the sealed file so activation cannot silently drift
+        # from the source SHA or remote policy encoded by the plan.
+        _register_activation_repository(
+            config, operator_client_config=Path(operator_client_config)
+        )
         attestation = canary_generator(
             service_config_path=service_config_path,
             expected_owner_uid=expected_owner_uid,
@@ -4149,6 +4342,231 @@ def rollback_installation(
     return disabled
 
 
+def _git_command_environment() -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _source_git_identity(source: Path, *, expected: str, git: Path) -> tuple[str, str]:
+    """Return HEAD/tree only for a clean checkout with immutable Git state."""
+    if git != Path("/usr/bin/git"):
+        raise ValueError("Hermes source verification requires /usr/bin/git")
+    status = subprocess.run(
+        [str(git), "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=False, capture_output=True, text=True, timeout=10,
+        env=_git_command_environment(),
+    )
+    if status.returncode != 0 or status.stdout:
+        raise ValueError("Hermes source checkout must be clean and source-derived")
+    head_result = subprocess.run(
+        [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+        check=False, capture_output=True, text=True, timeout=10,
+        env=_git_command_environment(),
+    )
+    tree_result = subprocess.run(
+        [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{tree}"],
+        check=False, capture_output=True, text=True, timeout=10,
+        env=_git_command_environment(),
+    )
+    head = head_result.stdout.strip()
+    tree = tree_result.stdout.strip()
+    if (
+        head_result.returncode != 0
+        or head != expected
+        or re.fullmatch(r"[0-9a-f]{40}", tree) is None
+    ):
+        raise ValueError("Hermes source SHA/tree does not match the clean checkout")
+    return head, tree
+
+
+def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
+    """Extract the complete non-editable package set from a real uv.lock."""
+    try:
+        document = tomllib.loads(uv_lock.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError("Hermes uv.lock is not a valid locked document") from exc
+    if document.get("version") != 1 or not isinstance(document.get("package"), list):
+        raise ValueError("Hermes uv.lock has no supported package set")
+    records: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for package in document["package"]:
+        if not isinstance(package, dict):
+            raise ValueError("Hermes uv.lock package record is malformed")
+        name = package.get("name")
+        version = package.get("version")
+        source = package.get("source")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
+            raise ValueError("Hermes uv.lock package name is invalid")
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+!~-]{0,127}", version):
+            raise ValueError("Hermes uv.lock package version is invalid")
+        if not isinstance(source, dict):
+            raise ValueError("Hermes uv.lock package source is missing")
+        # The repository itself is intentionally copied from Git below.  It
+        # must never be accepted as an editable dependency in the installed
+        # closure, while every third-party package must carry lock artifacts.
+        if "editable" in source:
+            if source.get("editable") != ".":
+                raise ValueError("Hermes uv.lock has an unsupported editable package")
+            continue
+        artifacts: list[dict[str, object]] = []
+        for key in ("sdist", "wheels"):
+            values = package.get(key, []) if key == "wheels" else [package.get(key)]
+            if key == "wheels" and not isinstance(values, list):
+                raise ValueError("Hermes uv.lock wheel artifacts are malformed")
+            if key == "sdist" and values == [None]:
+                values = []
+            for artifact in values:
+                if not isinstance(artifact, dict):
+                    raise ValueError("Hermes uv.lock package has no artifact hash")
+                url = artifact.get("url")
+                digest = artifact.get("hash")
+                size = artifact.get("size")
+                if (
+                    not isinstance(url, str)
+                    or not url.startswith(("https://", "http://"))
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+                    or isinstance(size, bool)
+                    or not isinstance(size, int)
+                    or size <= 0
+                ):
+                    raise ValueError("Hermes uv.lock package has no complete artifact hash")
+                artifacts.append({"url": url, "sha256": digest[7:], "size": size})
+        if not artifacts:
+            raise ValueError("Hermes uv.lock package has no artifact hash")
+        key = (name.lower().replace("_", "-").replace(".", "-"), version)
+        if key in seen:
+            raise ValueError("Hermes uv.lock contains duplicate package records")
+        seen.add(key)
+        records.append({
+            "name": name,
+            "version": version,
+            "source": {str(k): source[k] for k in sorted(source)},
+            "artifacts": sorted(artifacts, key=lambda item: (str(item["url"]), str(item["sha256"]))),
+        })
+    if len(records) < 2:
+        raise ValueError("Hermes lock does not describe a complete dependency closure")
+    records.sort(key=lambda item: (str(item["name"]).lower(), str(item["version"])))
+    return records
+
+
+def _git_archive_hermes_cli(source: Path, *, expected: str, git: Path) -> tuple[bytes, dict[str, bytes]]:
+    """Read first-party bytes from the exact Git commit; never from install_root."""
+    result = subprocess.run(
+        [str(git), "-C", str(source), "archive", "--format=tar", expected, "--", "hermes_cli"],
+        check=False, capture_output=True, timeout=30, env=_git_command_environment(),
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise ValueError("Hermes first-party Git archive cannot be read")
+    files: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as stream:
+            for member in stream.getmembers():
+                raw = member.name.rstrip("/") if member.isdir() else member.name
+                if raw == "hermes_cli":
+                    continue
+                if not raw.startswith("hermes_cli/"):
+                    raise ValueError("Hermes Git archive contains an unexpected path")
+                relative = _archive_relative_name(raw)
+                if member.isdir():
+                    continue
+                if member.issym() or member.islnk() or not member.isfile():
+                    raise ValueError("Hermes first-party Git archive contains an unsafe entry")
+                if member.size < 1 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                    raise ValueError("Hermes first-party Git archive entry is too large")
+                handle = stream.extractfile(member)
+                if handle is None:
+                    raise ValueError("Hermes first-party Git archive entry is unreadable")
+                content = handle.read(_MAX_RUNTIME_ARCHIVE_FILE_BYTES + 1)
+                if len(content) != member.size:
+                    raise ValueError("Hermes first-party Git archive entry changed")
+                if relative in files:
+                    raise ValueError("Hermes first-party Git archive contains duplicate paths")
+                files[relative] = content
+    except (OSError, tarfile.TarError) as exc:
+        raise ValueError("Hermes first-party Git archive is invalid") from exc
+    required = {
+        "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/kanban_broker_client.py",
+        "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_broker_service.py",
+        "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_install.py",
+        "hermes_cli/kanban_dedicated_broker.py", "hermes_cli/kanban_broker_canary.py",
+    }
+    if not required.issubset(files):
+        raise ValueError("Hermes Git archive is missing the complete first-party broker closure")
+    return result.stdout, files
+
+
+def _verify_installed_distributions(site_packages: Path, locked: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Verify every installed dist-info RECORD and bind it to uv.lock."""
+    locked_by_key = {
+        (str(item["name"]).lower().replace("_", "-").replace(".", "-"), str(item["version"])): item
+        for item in locked
+    }
+    installed: list[dict[str, object]] = []
+    for metadata_path in sorted(site_packages.glob("*.dist-info/METADATA"), key=lambda p: p.as_posix()):
+        raw, _ = _read_sealed_file_bytes(metadata_path, max_bytes=_MAX_RUNTIME_FILE_BYTES)
+        metadata: dict[str, str] = {}
+        for line in raw.decode("utf-8").splitlines():
+            if not line:
+                break
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                if key in {"Name", "Version"}:
+                    metadata[key] = value
+        name, version = metadata.get("Name"), metadata.get("Version")
+        key = (str(name).lower().replace("_", "-").replace(".", "-"), str(version))
+        if not name or not version or key not in locked_by_key:
+            raise ValueError("installed Hermes dependency is not bound to uv.lock")
+        dist_info = metadata_path.parent
+        record_path = dist_info / "RECORD"
+        record_raw, _ = _read_sealed_file_bytes(record_path, max_bytes=_MAX_RUNTIME_FILE_BYTES)
+        try:
+            rows = list(csv.reader(record_raw.decode("utf-8").splitlines()))
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise ValueError("installed Hermes dependency RECORD is invalid") from exc
+        seen: set[str] = set()
+        for row in rows:
+            if len(row) != 3 or not row[0] or row[0].startswith("/") or "\\" in row[0]:
+                raise ValueError("installed Hermes dependency RECORD path is unsafe")
+            relative = PurePosixPath(row[0])
+            if row[0] in seen or row[0].startswith("/") or "\\" in row[0] or "\x00" in row[0]:
+                raise ValueError("installed Hermes dependency RECORD path is unsafe")
+            seen.add(row[0])
+            install_root = site_packages.parents[2]
+            candidate = site_packages / Path(row[0])
+            candidate_info = candidate.lstat()
+            if stat.S_ISLNK(candidate_info.st_mode) or not stat.S_ISREG(candidate_info.st_mode):
+                raise ValueError("installed Hermes dependency RECORD target is unsafe")
+            target = candidate.resolve()
+            if target != install_root and install_root not in target.parents:
+                raise ValueError("installed Hermes dependency RECORD path escapes the staging root")
+            if not target.is_file():
+                raise ValueError("installed Hermes dependency RECORD is incomplete")
+            if row[1].startswith("sha256="):
+                expected = row[1][len("sha256="):]
+                actual = base64.urlsafe_b64encode(hashlib.sha256(target.read_bytes()).digest()).decode("ascii").rstrip("=")
+                if expected != actual:
+                    raise ValueError("installed Hermes dependency RECORD digest differs")
+        direct_url = dist_info / "direct_url.json"
+        if direct_url.exists():
+            direct_raw, _ = _read_sealed_file_bytes(direct_url, max_bytes=_MAX_RUNTIME_FILE_BYTES)
+            try:
+                direct = json.loads(direct_raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("installed Hermes dependency direct_url is invalid") from exc
+            if not isinstance(direct, dict) or any(key not in {"url", "archive_info", "vcs_info", "dir_info"} for key in direct):
+                raise ValueError("installed Hermes dependency direct_url is not exact")
+        installed.append({"name": name, "version": version, "record": str(record_path.relative_to(site_packages).as_posix())})
+    if not installed:
+        raise ValueError("Hermes dependency closure has no installed distributions")
+    installed.sort(key=lambda item: (str(item["name"]).lower(), str(item["version"])))
+    return installed
+
+
 def build_hermes_install_archive(
     *,
     source_root: Path,
@@ -4157,75 +4575,134 @@ def build_hermes_install_archive(
     output_archive: Path,
     output_provenance: Path,
     git_executable: Path = Path("/usr/bin/git"),
+    uv_executable: Path = Path("/opt/homebrew/bin/uv"),
 ) -> dict[str, str]:
-    """Build the deterministic non-editable Hermes closure input.
+    """Build a source-derived, locked, non-editable Hermes closure.
 
-    ``install_root`` is the output of the reviewed build/install step (not a
-    checkout).  This command binds it to the actual Hermes Git HEAD and the
-    bytes of that checkout's ``pyproject.toml`` and ``uv.lock`` before it
-    emits a deterministic archive plus detached provenance.  The renderer
-    only accepts provenance carrying this builder contract.
+    The install root is deliberately an output directory, never an input
+    tree.  First-party bytes come from ``git archive`` at the clean reviewed
+    commit; third-party bytes come from a fresh ``uv sync --frozen`` using the
+    real lockfile.  This keeps a caller from making an arbitrary directory
+    look like a reviewed Hermes installation by merely self-attesting it.
     """
     source = Path(source_root)
     install = Path(install_root)
     expected = _validated_hex_sha(source_sha, field="Hermes source SHA", length=40)
-    for path, field in ((source, "Hermes source checkout"), (install, "Hermes install closure")):
+    for path, field in ((source, "Hermes source checkout"),):
         if not path.is_absolute() or path == Path(path.anchor):
             raise ValueError(f"{field} must be a bounded absolute directory")
         info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
             raise ValueError(f"{field} must be a real directory")
     git = Path(git_executable)
-    if git != Path("/usr/bin/git"):
-        raise ValueError("Hermes source verification requires /usr/bin/git")
+    uv = Path(uv_executable)
+    if not uv.is_absolute() or ".." in uv.parts:
+        raise ValueError("Hermes locked installer path is invalid")
     try:
-        head_result = subprocess.run(
-            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
-            check=False, capture_output=True, text=True, timeout=10,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
-        )
-        tree_result = subprocess.run(
-            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{tree}"],
-            check=False, capture_output=True, text=True, timeout=10,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
-        )
+        _head, tree = _source_git_identity(source, expected=expected, git=git)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("Hermes source Git identity cannot be verified") from exc
-    head = head_result.stdout.strip()
-    tree = tree_result.stdout.strip()
-    if head_result.returncode != 0 or head != expected or re.fullmatch(r"[0-9a-f]{40}", tree) is None:
-        raise ValueError("Hermes source SHA does not match Git HEAD")
-    pyproject, _ = _read_sealed_file_bytes(source / "pyproject.toml", max_bytes=_MAX_RUNTIME_FILE_BYTES)
-    uv_lock, _ = _read_sealed_file_bytes(source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES)
+    pyproject, _ = _read_sealed_file_bytes(
+        source / "pyproject.toml", max_bytes=_MAX_RUNTIME_FILE_BYTES
+    )
+    uv_lock, _ = _read_sealed_file_bytes(
+        source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES
+    )
+    locked_packages = _locked_uv_packages(uv_lock)
+    git_archive, first_party_files = _git_archive_hermes_cli(
+        source, expected=expected, git=git
+    )
     pyproject_sha = hashlib.sha256(pyproject).hexdigest()
     uv_lock_sha = hashlib.sha256(uv_lock).hexdigest()
     lock_sha = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
 
+    if install.exists():
+        info = install.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Hermes install closure staging root must be a fresh directory")
+        if any(install.iterdir()):
+            raise ValueError("Hermes install closure staging root must be fresh and source-derived")
+    else:
+        install.mkdir(parents=True, mode=0o700)
+    os.chmod(install, 0o700)
+    if install.stat().st_uid != os.geteuid() or stat.S_IMODE(install.stat().st_mode) != 0o700:
+        raise ValueError("Hermes install closure staging root ownership is unsafe")
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-uv-cache-") as cache_dir:
+            env = {
+                "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "UV_CACHE_DIR": cache_dir,
+                "UV_PROJECT_ENVIRONMENT": str(install),
+                "UV_NO_PROGRESS": "1",
+                "UV_PYTHON_DOWNLOADS": "never",
+                "PYTHONNOUSERSITE": "1",
+            }
+            result = subprocess.run(
+                [str(uv), "sync", "--frozen", "--no-dev", "--no-install-project",
+                 "--no-editable", "--link-mode", "copy", "--python", sys.executable],
+                cwd=str(source), check=False, capture_output=True, timeout=600, env=env,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Hermes locked dependency build could not run") from exc
+    if result.returncode != 0:
+        raise ValueError("Hermes locked dependency build failed")
+    version_dir = install / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = version_dir / "site-packages"
+    if not site_packages.is_dir() or site_packages.is_symlink():
+        raise ValueError("Hermes locked dependency build did not produce site-packages")
+    # Install the first-party package from the exact Git archive into the real
+    # site-packages directory.  This is what makes ``python -I script.py``
+    # import the same package as the broker entrypoint.
+    first_party_root = site_packages / "hermes_cli"
+    if first_party_root.exists() or first_party_root.is_symlink():
+        raise ValueError("Hermes dependency build unexpectedly supplied editable first-party bytes")
+    for path_value, content in sorted(first_party_files.items()):
+        target = site_packages.joinpath(*PurePosixPath(path_value).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        os.chmod(target, 0o444)
+    os.chmod(first_party_root, 0o555)
+    # Freeze every installed path before making the detached archive.  The
+    # archive's manifest consequently records the exact mode that startup
+    # verification must observe, including native files and stdlib metadata.
+    for directory, dirs, files in os.walk(site_packages, topdown=False, followlinks=False):
+        for name in files:
+            target = Path(directory) / name
+            info = target.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("Hermes dependency closure contains an unsupported file")
+            os.chmod(target, 0o555 if stat.S_IMODE(info.st_mode) & 0o111 else 0o444)
+        for name in dirs:
+            target = Path(directory) / name
+            if not target.is_symlink():
+                os.chmod(target, 0o555)
+    installed_distributions = _verify_installed_distributions(site_packages, locked_packages)
     entries: list[dict[str, object]] = []
     contents: dict[str, bytes] = {}
     links: dict[str, str] = {}
-    all_paths = sorted(install.rglob("*"), key=lambda item: item.as_posix())
+    all_paths = sorted(site_packages.rglob("*"), key=lambda item: item.as_posix())
     if len(all_paths) > _MAX_RUNTIME_ARCHIVE_ENTRIES:
         raise ValueError("Hermes install closure contains too many entries")
     for item in all_paths:
-        relative = item.relative_to(install)
+        relative = item.relative_to(site_packages)
         if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
             raise ValueError("Hermes install closure path is unsafe")
         info = item.lstat()
         path_value = relative.as_posix()
-        mode = stat.S_IMODE(info.st_mode)
         origin = "first-party" if path_value == "hermes_cli" or path_value.startswith("hermes_cli/") else "dependency"
+        mode = stat.S_IMODE(info.st_mode)
         if stat.S_ISDIR(info.st_mode):
-            if mode & 0o222:
-                raise ValueError("Hermes install closure contains a mutable directory")
+            if mode != 0o555:
+                raise ValueError("Hermes install closure directory mode is not immutable")
             entries.append({"path": path_value + "/", "type": "directory", "mode": mode, "origin": origin})
         elif stat.S_ISREG(info.st_mode):
-            if info.st_nlink != 1 or mode & 0o222 or info.st_size < 1 or info.st_size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+            if info.st_nlink != 1 or mode & 0o222 or info.st_size < 0 or info.st_size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
                 raise ValueError("Hermes install closure contains a mutable or linked file")
             content, _ = _read_sealed_file_bytes(item, max_bytes=_MAX_RUNTIME_ARCHIVE_FILE_BYTES)
-            digest = hashlib.sha256(content).hexdigest()
             contents[path_value] = content
-            entries.append({"path": path_value, "type": "file", "mode": mode, "origin": origin, "size": len(content), "sha256": digest})
+            entries.append({"path": path_value, "type": "file", "mode": mode, "origin": origin, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()})
         elif stat.S_ISLNK(info.st_mode):
             target = os.readlink(item)
             if not target or target.startswith("/") or "\\" in target or "\x00" in target:
@@ -4234,13 +4711,13 @@ def build_hermes_install_archive(
             if resolved.is_absolute() or any(part in {"", ".", ".."} for part in resolved.parts):
                 raise ValueError("Hermes install closure symlink escapes the root")
             links[path_value] = resolved.as_posix()
-            entries.append({"path": path_value, "type": "symlink", "target": resolved.as_posix(), "mode": mode, "origin": origin})
+            entries.append({"path": path_value, "type": "symlink", "target": resolved.as_posix(), "mode": 0o555, "origin": origin})
         else:
             raise ValueError("Hermes install closure contains a special file")
     available = {str(entry["path"]).rstrip("/") for entry in entries}
     if "hermes_cli/main.py" not in available or "hermes_cli/kanban_broker_client.py" not in available:
-        raise ValueError("Hermes install closure is missing the broker worker entrypoint")
-    if not any(str(entry["path"]).startswith("hermes_cli/") is False for entry in entries):
+        raise ValueError("Hermes install closure is missing the source-derived broker entrypoint")
+    if not any(entry["origin"] == "dependency" for entry in entries):
         raise ValueError("Hermes install closure is missing locked dependencies")
     for link, target in links.items():
         if target not in available:
@@ -4287,6 +4764,10 @@ def build_hermes_install_archive(
         "pyproject_sha256": pyproject_sha,
         "uv_lock_sha256": uv_lock_sha,
         "pyproject_lock_sha256": lock_sha,
+        "first_party_git_archive_sha256": hashlib.sha256(git_archive).hexdigest(),
+        "locked_packages": locked_packages,
+        "installed_distributions": installed_distributions,
+        "installer": {"name": "uv", "contract": "sync --frozen --no-dev --no-editable", "python": sys.version.split()[0]},
         "install_archive_sha256": archive_sha,
         "entries": entries,
     }
@@ -4423,6 +4904,7 @@ def main(argv: list[str] | None = None) -> int:
     builder.add_argument("--output-archive", type=Path, required=True)
     builder.add_argument("--output-provenance", type=Path, required=True)
     builder.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
+    builder.add_argument("--uv", type=Path, default=Path("/opt/homebrew/bin/uv"))
     builder.add_argument("--json", action="store_true")
     identities = subparsers.add_parser("provision-identities")
     identities.add_argument("--plan", type=Path, required=True)
@@ -4489,6 +4971,7 @@ def main(argv: list[str] | None = None) -> int:
             output_archive=args.output_archive,
             output_provenance=args.output_provenance,
             git_executable=args.git,
+            uv_executable=args.uv,
         )
         # Only digests and reviewed source identity are emitted.  No archive
         # bytes or source contents are printed by this command.
@@ -5475,8 +5958,12 @@ def render_broker_installation_plan(
             {"path": str(runtime_input_root), "uid": 0, "gid": 0, "mode": 0o700},
             {"path": str(sealed_runtime_root), "uid": 0, "gid": 0, "mode": 0o711},
             {"path": str(entrypoint_path.parent), "uid": 0, "gid": 0, "mode": 0o711},
-            {"path": str(Path(config["worker_hermes_root"]) / "profiles"), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
-            {"path": str(Path(config["worker_hermes_root"]) / "profiles" / dispatcher_profile), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
+            # The model owns the profile document, but the profile directory
+            # is a root-owned immutable activation boundary.  This lets a
+            # root writer replace the model-owned document without granting
+            # the model authority to swap the parent or its routing target.
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles"), "uid": 0, "gid": 0, "mode": 0o555},
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles" / dispatcher_profile), "uid": 0, "gid": 0, "mode": 0o555},
         ],
     )
     filesystem_plan["sealed_runtime"]["archive_destinations"] = [
@@ -5882,6 +6369,19 @@ def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bo
         or stat.S_IMODE(info.st_mode) != 0o600
     ):
         raise ValueError("dispatcher profile config ownership or mode is unsafe")
+    parent = path.parent
+    try:
+        parent_info = parent.lstat()
+    except OSError as exc:
+        raise ValueError("dispatcher profile parent is unavailable") from exc
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or stat.S_IMODE(parent_info.st_mode) != 0o555
+    ):
+        raise ValueError("dispatcher profile parent ownership or mode is unsafe")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -5911,9 +6411,51 @@ def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bo
     if seen != set(updates):
         raise ValueError("dispatcher profile config flags are incomplete")
     replacement = "".join(result).encode("utf-8")
-    _atomic_artifact_write(path, replacement, mode=0o600, uid=expected_owner, gid=expected_group)
+    # _atomic_artifact_write intentionally refuses to replace a pre-existing
+    # immutable plan artifact.  Activation is the one reviewed transition
+    # that must replace this model-owned document; perform that replacement
+    # descriptor-relatively beneath the root-owned 0555 parent.
+    parent_fd = _open_directory_fd(parent)
+    parent_before = os.fstat(parent_fd)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchown(fd, expected_owner, expected_group)
+            os.fchmod(fd, 0o600)
+            view = memoryview(replacement)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (parent_after.st_dev, parent_after.st_ino):
+            raise ValueError("dispatcher profile parent changed during activation")
+        os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except (FileNotFoundError, OSError):
+            pass
+        raise
+    finally:
+        os.close(parent_fd)
     reread, read_info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
-    if reread != replacement or read_info.st_uid != expected_owner or read_info.st_gid != expected_group:
+    if (
+        reread != replacement
+        or read_info.st_uid != expected_owner
+        or read_info.st_gid != expected_group
+        or stat.S_IMODE(read_info.st_mode) != 0o600
+    ):
         raise ValueError("dispatcher profile config activation readback failed")
 
 
