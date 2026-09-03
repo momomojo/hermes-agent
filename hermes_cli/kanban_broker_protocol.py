@@ -8,6 +8,7 @@ import json
 import os
 import ctypes
 import platform
+import re
 import socket
 import struct
 from pathlib import Path
@@ -287,7 +288,17 @@ class BrokerRPCServer:
                 "project_id",
                 "remote_repository",
             }
-            if set(body) not in (allowed, allowed | {"expected_source_sha"}):
+            # Registration is a source-binding operation.  An operator must
+            # carry the reviewed immutable commit through the authenticated
+            # wire request; allowing the field to be omitted would make the
+            # broker silently trust whatever branch is currently checked out.
+            expected_source_sha = body.get("expected_source_sha")
+            if (
+                not isinstance(expected_source_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", expected_source_sha) is None
+            ):
+                raise ProtocolError("register_repository expected_source_sha is required")
+            if set(body) != allowed | {"expected_source_sha"}:
                 raise ProtocolError("register_repository contains unsupported fields")
             result = self.broker.register_repository(
                 peer_uid=peer_uid,
@@ -296,7 +307,7 @@ class BrokerRPCServer:
                 default_branch=str(body.get("default_branch") or ""),
                 project_id=body.get("project_id"),
                 remote_repository=body.get("remote_repository"),
-                expected_source_sha=body.get("expected_source_sha"),
+                expected_source_sha=expected_source_sha,
             )
         elif self.surface == "operator" and method == "refresh_repository_base":
             if set(body) != {"repository_id", "expected_old_base_sha"}:

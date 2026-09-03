@@ -4991,6 +4991,18 @@ def test_operator_rpc_is_separate_from_controller_surface(tmp_path):
     )
     response = operator.dispatch(peer_uid=os.geteuid(), message=request)
     assert response["result"]["repository_id"] == "radulator"
+
+    missing_source_binding = dict(body)
+    missing_source_binding.pop("expected_source_sha")
+    missing_request = signed_request(
+        key,
+        sequence=2,
+        nonce="operator-nonce-missing-source",
+        method="register_repository",
+        body=missing_source_binding,
+    )
+    with pytest.raises(ProtocolError, match="expected_source_sha"):
+        operator.dispatch(peer_uid=os.geteuid(), message=missing_request)
     broker.close()
 
 

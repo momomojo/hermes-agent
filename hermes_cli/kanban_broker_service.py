@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_cli.kanban_broker_install import validate_identity_separation
+from hermes_cli.kanban_broker_install import validate_runtime_attestation_state
 from hermes_cli.kanban_broker_install import (
     system_group_memberships,
     validate_group_separation,
@@ -380,6 +381,7 @@ def service_from_config(
         raise BrokerServiceError("unsupported broker service config")
     try:
         validate_runtime_identity(config, expected_package_owner_uid=0)
+        validate_runtime_attestation_state(config)
     except (KeyError, OSError, ValueError) as exc:
         raise BrokerServiceError("broker immutable runtime identity failed") from exc
     if Path(__file__).resolve().parent != Path(config["package_root"]).resolve():
@@ -479,7 +481,11 @@ def service_from_config(
 
 
 def serve_config(path: Path) -> None:
-    broker, service = service_from_config(_read_config(path))
+    config = _read_config(path)
+    bound_path = config.get("service_config_path")
+    if bound_path is not None and Path(str(bound_path)) != Path(path):
+        raise BrokerServiceError("broker service config path binding changed")
+    broker, service = service_from_config(config)
 
     def request_stop(_signum, _frame) -> None:
         service.stop()

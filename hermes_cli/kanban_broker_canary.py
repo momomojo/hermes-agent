@@ -361,6 +361,45 @@ def _routing_profile_check(config: dict[str, Any]) -> bool:
     )
     if routing_path.parent != expected_profile_root:
         return False
+    profile_config_path = Path(str(config.get("dispatcher_profile_config_path") or ""))
+    if profile_config_path != expected_profile_root / "config.yaml":
+        return False
+    try:
+        profile_info = profile_config_path.lstat()
+        if (
+            stat.S_ISLNK(profile_info.st_mode)
+            or not stat.S_ISREG(profile_info.st_mode)
+            or profile_info.st_uid != int(config["model_uid"])
+            or profile_info.st_gid != int(config["workspace_gid"])
+            or profile_info.st_nlink != 1
+            or stat.S_IMODE(profile_info.st_mode) != 0o600
+        ):
+            return False
+        profile_lines = profile_config_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not profile_lines or profile_lines[0] != "kanban:":
+        return False
+    profile_values: dict[str, str] = {}
+    for line in profile_lines[1:]:
+        if not line.startswith("  ") or ": " not in line:
+            return False
+        key, value = line[2:].split(": ", 1)
+        if not key or key in profile_values:
+            return False
+        profile_values[key] = value
+    expected_profile_values = {
+        "dedicated_broker_enabled": "false",
+        "trusted_publisher_enabled": "false",
+        "dedicated_broker_controller_client_config": str(config.get("controller_client_config") or ""),
+        "dedicated_broker_publisher_client_config": str(config.get("publisher_client_config") or ""),
+        "dedicated_broker_operator_client_config": str(config.get("operator_client_config") or ""),
+        "dedicated_broker_registration_file": str(config.get("registration_file_path") or ""),
+        "dedicated_broker_expected_source_sha": str(config.get("remote_policy_source_sha") or ""),
+        "dedicated_broker_dispatcher_profile": profile,
+    }
+    if profile_values != expected_profile_values:
+        return False
     profile_info = routing_path.parent.lstat()
     if (
         stat.S_ISLNK(profile_info.st_mode)
@@ -451,16 +490,28 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
     probe = Path(str(config.get("publisher_probe_path") or ""))
     python = Path(str(config.get("python_executable") or ""))
     manifest = Path(str(config.get("runtime_manifest_path") or ""))
-    if not probe.is_absolute() or not python.is_absolute() or not manifest.is_absolute():
+    client_config = Path(str(config.get("publisher_client_config") or ""))
+    if (
+        not probe.is_absolute()
+        or not python.is_absolute()
+        or not manifest.is_absolute()
+        or not client_config.is_absolute()
+        or ".." in probe.parts
+        or ".." in python.parts
+        or ".." in manifest.parts
+        or ".." in client_config.parts
+    ):
         return False
     command = [
         str(python), "-I", "-B", str(probe),
+        "--runtime-preflight",
         "--runtime-root", str(python.parent.parent),
         "--runtime-manifest", str(manifest),
         "--runtime-manifest-sha256", str(config.get("runtime_manifest_sha256") or ""),
         "--runtime-python-version", str(config.get("python_version") or ""),
         "--runtime-python-sha256", str(config.get("python_sha256") or ""),
-        "--runtime-preflight",
+        "--repository-id", str(config.get("publisher_repository_id") or "radulator"),
+        "--broker-client-config", str(client_config),
     ]
     try:
         result = subprocess.run(

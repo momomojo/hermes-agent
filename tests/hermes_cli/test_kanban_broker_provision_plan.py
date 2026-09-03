@@ -96,7 +96,7 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
                 if isinstance(value, tuple):
                     content, mode = value
                 else:
-                    content, mode = value, 0o644
+                    content, mode = value, 0o444
                 member = tarfile.TarInfo(f"{root_name}/{name}")
                 member.size = len(content)
                 member.mode = mode
@@ -109,9 +109,9 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
         python_archive,
         "python",
         {
-            "bin/python3.11": (b"sealed-python-fixture\n", 0o755),
-            "bin/python3": (b"sealed-python-fixture\n", 0o755),
-            "lib/python3.11/fixture.py": (b"RUNTIME = True\n", 0o644),
+            "bin/python3.11": (b"sealed-python-fixture\n", 0o555),
+            "bin/python3": (b"sealed-python-fixture\n", 0o555),
+            "lib/python3.11/fixture.py": (b"RUNTIME = True\n", 0o664),
         },
     )
     python_sha = hashlib.sha256(python_archive.read_bytes()).hexdigest()
@@ -154,7 +154,7 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
             "origin": "first-party" if name.startswith("hermes_cli/") else "dependency",
         })
     for name, content in sorted(package_files.items()):
-        mode = 0o644
+        mode = 0o444
         provenance_entries.append({
             "path": name,
             "type": "file",
@@ -164,11 +164,35 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
             "sha256": hashlib.sha256(content).hexdigest(),
         })
     provenance_entries.sort(key=lambda item: item["path"])
+    hermes_source = tmp_path / "hermes-source"
+    hermes_source.mkdir(parents=True, exist_ok=True)
+    (hermes_source / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
+    (hermes_source / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    if not (hermes_source / ".git").exists():
+        subprocess.run(["/usr/bin/git", "init", "-q", str(hermes_source)], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "config", "user.email", "fixture@example.invalid"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "config", "user.name", "fixture"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "add", "pyproject.toml", "uv.lock"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "commit", "-qm", "fixture"], check=True)
+    source_sha = subprocess.run(
+        ["/usr/bin/git", "-C", str(hermes_source), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    source_tree_sha = subprocess.run(
+        ["/usr/bin/git", "-C", str(hermes_source), "rev-parse", "HEAD^{tree}"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    pyproject_bytes = (hermes_source / "pyproject.toml").read_bytes()
+    uv_lock_bytes = (hermes_source / "uv.lock").read_bytes()
     provenance = {
         "contract": "hermes.kanban_broker_hermes_install_provenance.v1",
         "schema_version": 1,
-        "hermes_source_sha": "b" * 40,
-        "pyproject_lock_sha256": "c" * 64,
+        "builder_contract": "hermes.kanban_broker_hermes_install_builder.v1",
+        "hermes_source_sha": source_sha,
+        "hermes_source_tree_sha": source_tree_sha,
+        "pyproject_sha256": hashlib.sha256(pyproject_bytes).hexdigest(),
+        "uv_lock_sha256": hashlib.sha256(uv_lock_bytes).hexdigest(),
+        "pyproject_lock_sha256": hashlib.sha256(pyproject_bytes + b"\0" + uv_lock_bytes).hexdigest(),
         "install_archive_sha256": package_sha,
         "entries": provenance_entries,
     }
@@ -181,8 +205,15 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
 def _publisher_probe(tmp_path: Path) -> tuple[Path, str]:
     import hashlib
 
-    path = tmp_path / "trusted_publisher.py"
+    checkout = tmp_path / "radulator-checkout"
+    script_dir = checkout / "ops/hermes/radulator"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "lifecycle_controller.py").write_text(
+        "def main():\n    return 0\n", encoding="utf-8"
+    )
+    path = script_dir / "trusted_publisher.py"
     path.write_text(
+        "# argparse contract: --broker-client-config, list_publish_obligations\n"
         "from hermes_cli import kanban_broker_client\n"
         "import json\n"
         "if '--runtime-preflight' in __import__('sys').argv:\n"
@@ -194,7 +225,27 @@ def _publisher_probe(tmp_path: Path) -> tuple[Path, str]:
         "'broker_client_module':kanban_broker_client.__file__,"
         "'broker_rpc':'PASS'}, sort_keys=True))\n"
     )
+    if not (checkout / ".git").exists():
+        subprocess.run(["/usr/bin/git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(checkout), "config", "user.email", "fixture@example.invalid"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(checkout), "config", "user.name", "fixture"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(checkout), "add", "ops"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(checkout), "commit", "-qm", "fixture"], check=True)
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _radulator_source_sha(tmp_path: Path) -> str:
+    return subprocess.run(
+        ["/usr/bin/git", "-C", str(tmp_path / "radulator-checkout"), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _hermes_source_sha(tmp_path: Path) -> str:
+    return subprocess.run(
+        ["/usr/bin/git", "-C", str(tmp_path / "hermes-source"), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
 
 
 def _render(tmp_path: Path):
@@ -214,9 +265,10 @@ def _render(tmp_path: Path):
         hermes_install_provenance_sha256=provenance_sha,
         publisher_probe_path=publisher_probe,
         publisher_probe_sha256=publisher_probe_sha,
-        hermes_source_sha="b" * 40,
+        hermes_source_sha=_hermes_source_sha(tmp_path),
+        hermes_source_path=tmp_path / "hermes-source",
         radulator_source_path=tmp_path / "radulator-checkout",
-        radulator_source_sha="a" * 40,
+        radulator_source_sha=_radulator_source_sha(tmp_path),
         dispatcher_profile="radulator",
     )
 
@@ -240,6 +292,7 @@ def _runtime_kwargs(tmp_path: Path) -> dict:
         "hermes_install_provenance_sha256": provenance_sha,
         "publisher_probe_path": publisher_probe,
         "publisher_probe_sha256": publisher_probe_sha,
+        "hermes_source_path": tmp_path / "hermes-source",
     }
 
 
@@ -252,9 +305,31 @@ def test_renderer_requires_explicit_source_sha_and_dispatcher_profile(tmp_path):
             desired_identities=_desired(),
             install_root=tmp_path / "install",
             **_runtime_kwargs(tmp_path),
-            hermes_source_sha="b" * 40,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
             radulator_source_path=tmp_path / "radulator-checkout",
             radulator_source_sha=None,
+            dispatcher_profile="radulator",
+        )
+
+
+def test_renderer_rejects_lookalike_publisher_script_outside_reviewed_checkout(tmp_path):
+    from hermes_cli.kanban_broker_install import render_broker_installation_plan
+    import hashlib
+
+    kwargs = _runtime_kwargs(tmp_path)
+    fake = tmp_path / "lookalike-trusted-publisher.py"
+    fake.write_text("print('PASS')\n", encoding="utf-8")
+    kwargs["publisher_probe_path"] = fake
+    kwargs["publisher_probe_sha256"] = hashlib.sha256(fake.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="reviewed Radulator path"):
+        render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
             dispatcher_profile="radulator",
         )
     with pytest.raises(ValueError, match="dispatcher profile"):
@@ -263,9 +338,9 @@ def test_renderer_requires_explicit_source_sha_and_dispatcher_profile(tmp_path):
             desired_identities=_desired(),
             install_root=tmp_path / "install",
             **_runtime_kwargs(tmp_path),
-            hermes_source_sha="b" * 40,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
             radulator_source_path=tmp_path / "radulator-checkout",
-            radulator_source_sha="a" * 40,
+            radulator_source_sha=_radulator_source_sha(tmp_path),
             dispatcher_profile="",
         )
 
@@ -281,9 +356,9 @@ def test_renderer_rejects_occupied_or_name_id_mismatch(tmp_path):
             desired_identities=_desired(),
             install_root=tmp_path / "install",
             **_runtime_kwargs(tmp_path),
-            hermes_source_sha="b" * 40,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
             radulator_source_path=tmp_path / "radulator-checkout",
-            radulator_source_sha="a" * 40,
+            radulator_source_sha=_radulator_source_sha(tmp_path),
             dispatcher_profile="radulator",
         )
 
@@ -291,7 +366,7 @@ def test_renderer_rejects_occupied_or_name_id_mismatch(tmp_path):
 def test_renderer_emits_exact_remote_policy_and_immutable_artifact_manifest(tmp_path):
     plan = _render(tmp_path)
     assert plan["contract"] == "hermes.kanban_broker_install_plan.v1"
-    assert plan["radulator_source_sha"] == "a" * 40
+    assert plan["radulator_source_sha"] == _radulator_source_sha(tmp_path)
     assert plan["service_config"]["enabled"] is False
     assert plan["service_config"]["trusted_publisher_enabled"] is False
     assert ["wheel", 0] in plan["identity_plan"]["groups"]
@@ -356,7 +431,7 @@ def test_renderer_emits_exact_remote_policy_and_immutable_artifact_manifest(tmp_
     assert runtime["package_manifest_sha256"] == expected_package_sha
     assert runtime["package_manifest_sha256"] == plan["service_config"]["package_manifest_sha256"]
     assert runtime["runtime_manifest_path"].endswith("/install/runtime-manifest.json")
-    assert plan["hermes_source_sha"] == "b" * 40
+    assert plan["hermes_source_sha"] == _hermes_source_sha(tmp_path)
     # The broker is Seatbelt-wrapped; the worker is a separate unprivileged
     # launchd job. Both use the immutable -I entrypoint and no PYTHONPATH.
     payloads = plan["asset_payload_manifest"]["payloads"]
@@ -382,7 +457,7 @@ def test_renderer_emits_exact_remote_policy_and_immutable_artifact_manifest(tmp_
         value for path, value in payloads.items() if path.endswith("runtime-attestation.json")
     )
     attestation = json.loads(base64.b64decode(attestation_raw))
-    assert attestation["hermes_source_sha"] == "b" * 40
+    assert attestation["hermes_source_sha"] == _hermes_source_sha(tmp_path)
     assert attestation["hermes_install_archive_sha256"] == runtime["sealed_runtime"]["archives"][1]["sha256"]
     assert attestation["runtime_manifest_path"] == runtime_manifest["runtime_root"].replace(
         "/runtime/sealed", "/install/runtime-manifest.json"
@@ -467,11 +542,13 @@ def test_cli_accepts_reviewed_inputs_and_writes_the_disabled_plan(tmp_path, caps
         "--publisher-probe-sha256",
         publisher_probe_sha,
         "--hermes-source-sha",
-        "b" * 40,
+        _hermes_source_sha(tmp_path),
+        "--hermes-source-path",
+        str(tmp_path / "hermes-source"),
         "--radulator-source-path",
         str(tmp_path / "radulator-checkout"),
         "--source-sha",
-        "a" * 40,
+        _radulator_source_sha(tmp_path),
         "--dispatcher-profile",
         "radulator",
     ]) == 0
@@ -636,9 +713,10 @@ def test_renderer_requires_complete_hermes_provenance_manifest(tmp_path):
             hermes_install_provenance_sha256="a" * 64,
             publisher_probe_path=publisher_probe,
             publisher_probe_sha256=publisher_probe_sha,
-            hermes_source_sha="b" * 40,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            hermes_source_path=tmp_path / "hermes-source",
             radulator_source_path=tmp_path / "radulator-checkout",
-            radulator_source_sha="a" * 40,
+            radulator_source_sha=_radulator_source_sha(tmp_path),
             dispatcher_profile="radulator",
         )
 
@@ -688,6 +766,105 @@ def test_runtime_tree_manifest_rejects_tampered_and_unexpected_entries(tmp_path)
             entries,
             expected_owner_uid=runtime.stat().st_uid,
             expected_owner_gid=runtime.stat().st_gid,
+        )
+
+
+def test_runtime_tree_manifest_compares_regular_file_mode_exactly(tmp_path):
+    from hermes_cli.kanban_broker_install import _verify_runtime_tree_against_manifest
+
+    runtime = tmp_path / "sealed"
+    runtime.mkdir()
+    payload = runtime / "payload.py"
+    payload.write_text("VALUE = 1\n", encoding="utf-8")
+    payload.chmod(0o444)
+    import hashlib
+
+    entries = [{
+        "path": "payload.py",
+        "type": "file",
+        "mode": 0o444,
+        "size": payload.stat().st_size,
+        "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+    }]
+    _verify_runtime_tree_against_manifest(
+        runtime,
+        entries,
+        expected_owner_uid=runtime.stat().st_uid,
+        expected_owner_gid=runtime.stat().st_gid,
+    )
+    payload.chmod(0o666)
+    with pytest.raises(ValueError, match="metadata"):
+        _verify_runtime_tree_against_manifest(
+            runtime,
+            entries,
+            expected_owner_uid=runtime.stat().st_uid,
+            expected_owner_gid=runtime.stat().st_gid,
+        )
+
+
+def test_official_runtime_provenance_binds_astral_origin():
+    from hermes_cli import kanban_broker_install as installer
+
+    assert installer.OFFICIAL_RUNTIME_SOURCE_REPOSITORY == "astral-sh/python-build-standalone"
+    assert installer.OFFICIAL_RUNTIME_RELEASE_URL.startswith(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/"
+    )
+
+
+def test_hermes_install_builder_binds_git_and_lock_inputs(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    source = tmp_path / "hermes-source"
+    source.mkdir()
+    (source / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
+    (source / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    subprocess.run(["/usr/bin/git", "init", "-q", str(source)], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "config", "user.name", "fixture"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "add", "pyproject.toml", "uv.lock"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+    source_sha = subprocess.run(
+        ["/usr/bin/git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    install = tmp_path / "install-closure"
+    (install / "hermes_cli").mkdir(parents=True)
+    (install / "hermes_dep").mkdir()
+    for path, content in {
+        install / "hermes_cli/main.py": "from hermes_cli.kanban_broker_client import X\ndef main(): return X\n",
+        install / "hermes_cli/kanban_broker_client.py": "X = 'ok'\n",
+        install / "hermes_dep/runtime.py": "VALUE = 1\n",
+    }.items():
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o444)
+    (install / "hermes_cli").chmod(0o555)
+    (install / "hermes_dep").chmod(0o555)
+    install.chmod(0o555)
+    archive = tmp_path / "closure.tar.gz"
+    provenance = tmp_path / "closure.provenance.json"
+    result = installer.build_hermes_install_archive(
+        source_root=source,
+        install_root=install,
+        source_sha=source_sha,
+        output_archive=archive,
+        output_provenance=provenance,
+    )
+    assert result["source_sha"] == source_sha
+    assert result["archive_sha256"] == __import__("hashlib").sha256(archive.read_bytes()).hexdigest()
+    parsed = installer._read_hermes_install_provenance(
+        provenance,
+        expected_sha256=result["provenance_sha256"],
+        expected_archive_sha256=result["archive_sha256"],
+        expected_source_sha=source_sha,
+    )
+    assert parsed["builder_contract"] == installer.HERMES_INSTALL_BUILDER_CONTRACT
+    with pytest.raises(ValueError, match="source SHA"):
+        installer.build_hermes_install_archive(
+            source_root=source,
+            install_root=install,
+            source_sha="a" * 40,
+            output_archive=tmp_path / "bad.tar.gz",
+            output_provenance=tmp_path / "bad.provenance.json",
         )
 
 
@@ -746,3 +923,11 @@ def test_render_materializes_named_profile_and_consumed_routing_config(tmp_path)
     assert routing["controller_client_config"].endswith("clients/controller/client.json")
     assert routing["publisher_client_config"].endswith("clients/publisher/client.json")
     assert routing["operator_client_config"].endswith("clients/operator/client.json")
+    profile_yaml = next(
+        base64.b64decode(value).decode("utf-8")
+        for path, value in payloads.items()
+        if path.endswith("/profiles/radulator/config.yaml")
+    )
+    assert "dedicated_broker_enabled: false" in profile_yaml
+    assert "trusted_publisher_enabled: false" in profile_yaml
+    assert "dedicated_broker_publisher_client_config:" in profile_yaml

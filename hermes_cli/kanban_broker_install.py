@@ -6,6 +6,7 @@ import argparse
 import ast
 import base64
 import grp
+import gzip
 import hashlib
 import hmac
 import io
@@ -66,14 +67,15 @@ OFFICIAL_RUNTIME_ARCHIVE_SHA256 = "01f0de017aacd7528084dbacd46c66cfe9a0b0cd1255b
 SEALED_RUNTIME_CONTRACT = "hermes.kanban_broker_sealed_runtime.v1"
 RUNTIME_MANIFEST_CONTRACT = "hermes.kanban_broker_runtime_manifest.v1"
 HERMES_INSTALL_PROVENANCE_CONTRACT = "hermes.kanban_broker_hermes_install_provenance.v1"
+HERMES_INSTALL_BUILDER_CONTRACT = "hermes.kanban_broker_hermes_install_builder.v1"
 PUBLISHER_PROBE_CONTRACT = "radulator.publisher_runtime_preflight.v1"
-OFFICIAL_RUNTIME_SOURCE_REPOSITORY = "indygreg/python-build-standalone"
+OFFICIAL_RUNTIME_SOURCE_REPOSITORY = "astral-sh/python-build-standalone"
 OFFICIAL_RUNTIME_RELEASE_TAG = "20260602"
 OFFICIAL_RUNTIME_ASSET_NAME = (
     "cpython-3.11.15+20260602-aarch64-apple-darwin-install_only.tar.gz"
 )
 OFFICIAL_RUNTIME_RELEASE_URL = (
-    "https://github.com/indygreg/python-build-standalone/releases/download/"
+    "https://github.com/astral-sh/python-build-standalone/releases/download/"
     f"{OFFICIAL_RUNTIME_RELEASE_TAG}/{OFFICIAL_RUNTIME_ASSET_NAME}"
 )
 OFFICIAL_RUNTIME_VERIFICATION_STATUS = "external-sha256-bound"
@@ -178,6 +180,7 @@ if resolved_module != runtime_root and runtime_root not in resolved_module.paren
 def render_broker_service_config(
     *,
     install_root: Path,
+    service_config_path: Path | None = None,
     state_dir: Path,
     workspace_root: Path,
     worker_hermes_root: Path,
@@ -215,8 +218,13 @@ def render_broker_service_config(
     remote_policy_source_sha: str | None = None,
     dispatcher_profile: str | None = None,
     dispatcher_routing_config_path: Path | None = None,
+    dispatcher_profile_config_path: Path | None = None,
     publisher_probe_path: Path | None = None,
     publisher_probe_sha256: str | None = None,
+    publisher_client_config: Path | None = None,
+    controller_client_config: Path | None = None,
+    operator_client_config: Path | None = None,
+    publisher_repository_id: str | None = None,
     registration_file_path: Path | None = None,
     runtime_attestation_path: Path | None = None,
     runtime_manifest_path: Path | None = None,
@@ -297,6 +305,7 @@ def render_broker_service_config(
         *([runtime_attestation_path] if runtime_attestation_path is not None else []),
         *([runtime_manifest_path] if runtime_manifest_path is not None else []),
         *([publisher_probe_path] if publisher_probe_path is not None else []),
+        *([publisher_client_config] if publisher_client_config is not None else []),
         *([registration_file_path] if registration_file_path is not None else []),
     ):
         if not runtime_path.is_absolute():
@@ -321,6 +330,7 @@ def render_broker_service_config(
         *([runtime_attestation_path] if runtime_attestation_path is not None else []),
         *([runtime_manifest_path] if runtime_manifest_path is not None else []),
         *([publisher_probe_path] if publisher_probe_path is not None else []),
+        *([publisher_client_config] if publisher_client_config is not None else []),
         *([registration_file_path] if registration_file_path is not None else []),
     ):
         if private_path == install_root or install_root not in private_path.parents:
@@ -369,6 +379,11 @@ def render_broker_service_config(
         "launchd_plist_path": str(launchd_plist_path),
         "worker_launchd_plist_path": str(worker_launchd_plist_path),
     }
+    if service_config_path is not None:
+        service_path = Path(service_config_path)
+        if not service_path.is_absolute() or ".." in service_path.parts:
+            raise ValueError("service config path is invalid")
+        payload["service_config_path"] = str(service_path)
     if runtime_entrypoint_path is not None:
         payload["runtime_entrypoint_path"] = str(runtime_entrypoint_path)
         payload["runtime_entrypoint_sha256"] = str(runtime_entrypoint_sha256)
@@ -384,6 +399,11 @@ def render_broker_service_config(
         if not routing_path.is_absolute() or ".." in routing_path.parts:
             raise ValueError("dispatcher routing config path is invalid")
         payload["dispatcher_routing_config_path"] = str(routing_path)
+    if dispatcher_profile_config_path is not None:
+        profile_config_path = Path(dispatcher_profile_config_path)
+        if not profile_config_path.is_absolute() or ".." in profile_config_path.parts:
+            raise ValueError("dispatcher profile config path is invalid")
+        payload["dispatcher_profile_config_path"] = str(profile_config_path)
     if publisher_probe_path is not None:
         publisher_probe_path = Path(publisher_probe_path)
         if not publisher_probe_path.is_absolute() or ".." in publisher_probe_path.parts:
@@ -397,6 +417,25 @@ def render_broker_service_config(
         payload["publisher_probe_contract"] = PUBLISHER_PROBE_CONTRACT
     elif publisher_probe_sha256 is not None:
         raise ValueError("publisher preflight script path is required for its digest")
+    if publisher_client_config is not None:
+        publisher_client_config = Path(publisher_client_config)
+        if not publisher_client_config.is_absolute() or ".." in publisher_client_config.parts:
+            raise ValueError("publisher client config path is invalid")
+        payload["publisher_client_config"] = str(publisher_client_config)
+    for client_name, client_path in (
+        ("controller_client_config", controller_client_config),
+        ("operator_client_config", operator_client_config),
+    ):
+        if client_path is None:
+            continue
+        client_path = Path(client_path)
+        if not client_path.is_absolute() or ".." in client_path.parts:
+            raise ValueError(f"{client_name} path is invalid")
+        payload[client_name] = str(client_path)
+    if publisher_repository_id is not None:
+        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", str(publisher_repository_id)) is None:
+            raise ValueError("publisher repository id is invalid")
+        payload["publisher_repository_id"] = str(publisher_repository_id)
     if registration_file_path is not None:
         registration_file_path = Path(registration_file_path)
         if not registration_file_path.is_absolute() or ".." in registration_file_path.parts:
@@ -789,6 +828,12 @@ def _read_runtime_archive_manifest(
                     continue
                 if member.islnk() or not member.isfile():
                     raise ValueError(f"{role} archive contains an unsupported special or hard-linked file")
+                # The reviewed archives carry ordinary distribution modes
+                # (0644/0755, and the pinned CPython asset uses 0664/0775).
+                # Harden those source modes for the installed sealed tree.
+                # The live verifier below records and compares the resulting
+                # exact mode, so a later chmod(2) cannot be normalized away.
+                mode = 0o555 if mode & 0o111 else 0o444
                 if member.size < 0 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES or unpacked_bytes + member.size > _MAX_RUNTIME_ARCHIVE_UNPACKED_BYTES:
                     raise ValueError(f"{role} archive exceeds the unpacked size limit")
                 handle = stream.extractfile(member)
@@ -802,7 +847,7 @@ def _read_runtime_archive_manifest(
                 entries.append({
                     "path": relative,
                     "type": "file",
-                    "mode": 0o555 if mode & 0o111 else 0o444,
+                    "mode": mode,
                     "size": len(content),
                     "sha256": digest,
                 })
@@ -897,7 +942,11 @@ def _read_hermes_install_provenance(
     required = {
         "contract",
         "schema_version",
+        "builder_contract",
         "hermes_source_sha",
+        "hermes_source_tree_sha",
+        "pyproject_sha256",
+        "uv_lock_sha256",
         "pyproject_lock_sha256",
         "install_archive_sha256",
         "entries",
@@ -906,6 +955,8 @@ def _read_hermes_install_provenance(
         raise ValueError("Hermes install provenance fields are not exact")
     if value.get("contract") != HERMES_INSTALL_PROVENANCE_CONTRACT or value.get("schema_version") != 1:
         raise ValueError("Hermes install provenance contract is unsupported")
+    if value.get("builder_contract") != HERMES_INSTALL_BUILDER_CONTRACT:
+        raise ValueError("Hermes install provenance was not produced by the reviewed builder")
     if value.get("hermes_source_sha") != expected_source_sha:
         raise ValueError("Hermes install provenance source SHA differs from the reviewed input")
     _validated_hex_sha(
@@ -913,6 +964,9 @@ def _read_hermes_install_provenance(
         field="Hermes pyproject/lock SHA256",
         length=64,
     )
+    _validated_hex_sha(value.get("hermes_source_tree_sha"), field="Hermes source tree SHA", length=40)
+    _validated_hex_sha(value.get("pyproject_sha256"), field="Hermes pyproject SHA256", length=64)
+    _validated_hex_sha(value.get("uv_lock_sha256"), field="Hermes uv.lock SHA256", length=64)
     if value.get("install_archive_sha256") != expected_archive_sha256:
         raise ValueError("Hermes install provenance archive SHA differs from the staged archive")
     entries = value.get("entries")
@@ -947,7 +1001,13 @@ def _read_hermes_install_provenance(
         if origin not in {"first-party", "dependency"}:
             raise ValueError("Hermes install provenance origin is invalid")
         mode = entry.get("mode")
-        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in {0o444, 0o555}:
+        if (
+            isinstance(mode, bool)
+            or not isinstance(mode, int)
+            or mode < 0
+            or mode > 0o777
+            or mode & 0o222
+        ):
             raise ValueError("Hermes install provenance mode is invalid")
         normalized_entry = dict(entry)
         if entry_type == "file":
@@ -1067,7 +1127,15 @@ def _read_publisher_probe(path: Path, *, expected_sha256: str) -> dict[str, obje
         ast.parse(raw.decode("utf-8"), filename=str(probe))
     except (UnicodeDecodeError, SyntaxError) as exc:
         raise ValueError("publisher preflight script is not valid Python") from exc
-    if b"kanban_broker_client" not in raw or b"runtime-preflight" not in raw:
+    if any(
+        token not in raw
+        for token in (
+            b"kanban_broker_client",
+            b"runtime-preflight",
+            b"list_publish_obligations",
+            b"--broker-client-config",
+        )
+    ):
         raise ValueError("publisher preflight script does not implement the reviewed contract")
     return {
         "source_path": str(probe),
@@ -1075,6 +1143,129 @@ def _read_publisher_probe(path: Path, *, expected_sha256: str) -> dict[str, obje
         "size": len(raw),
         "contract": PUBLISHER_PROBE_CONTRACT,
     }
+
+
+def _validate_radulator_publisher_source(
+    checkout: Path,
+    *,
+    expected_source_sha: str,
+    publisher_probe: Path,
+    publisher_probe_sha256: str,
+    git_executable: Path,
+) -> dict[str, object]:
+    """Bind the preflight to the reviewed Radulator checkout and Git HEAD.
+
+    A digest supplied for an arbitrary Python file is not a trust boundary:
+    an operator could point it at a look-alike script which prints PASS.  The
+    production path is fixed to the reviewed Radulator source tree, and the
+    checkout's immutable HEAD is checked with the pinned Apple Git identity.
+    """
+    source = Path(checkout)
+    expected = _validated_hex_sha(
+        expected_source_sha, field="Radulator source SHA", length=40
+    )
+    if not source.is_absolute() or source == Path(source.anchor):
+        raise ValueError("Radulator source checkout must be a bounded absolute directory")
+    source_info = source.lstat()
+    if (
+        stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISDIR(source_info.st_mode)
+        or source_info.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(source_info.st_mode) & 0o022
+    ):
+        raise ValueError("Radulator source checkout ownership or mode is unsafe")
+    expected_probe = source / "ops" / "hermes" / "radulator" / "trusted_publisher.py"
+    probe = Path(publisher_probe)
+    if probe != expected_probe:
+        raise ValueError("publisher preflight script is not the reviewed Radulator path")
+    lifecycle = source / "ops" / "hermes" / "radulator" / "lifecycle_controller.py"
+    lifecycle_info = lifecycle.lstat()
+    if (
+        stat.S_ISLNK(lifecycle_info.st_mode)
+        or not stat.S_ISREG(lifecycle_info.st_mode)
+        or lifecycle_info.st_uid not in {0, os.geteuid()}
+        or lifecycle_info.st_nlink != 1
+        or stat.S_IMODE(lifecycle_info.st_mode) & 0o022
+    ):
+        raise ValueError("Radulator lifecycle controller is unsafe or unavailable")
+    git = Path(git_executable)
+    try:
+        result = subprocess.run(
+            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Radulator source HEAD cannot be verified") from exc
+    head = result.stdout.strip()
+    if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise ValueError("Radulator source checkout has no verifiable Git HEAD")
+    if head != expected:
+        raise ValueError("Radulator source SHA does not match Git HEAD")
+    probe_info = _read_publisher_probe(
+        probe, expected_sha256=publisher_probe_sha256
+    )
+    return {
+        **probe_info,
+        "source_sha": head,
+        "source_path": str(source),
+        "lifecycle_controller_path": str(lifecycle),
+        "lifecycle_controller_sha256": _safe_file_sha256(lifecycle),
+    }
+
+
+def _validate_hermes_source_provenance(
+    source_root: Path,
+    *,
+    expected_source_sha: str,
+    provenance: dict[str, object],
+    git_executable: Path,
+) -> None:
+    """Check builder provenance against the actual Hermes checkout bytes."""
+    source = Path(source_root)
+    expected = _validated_hex_sha(expected_source_sha, field="Hermes source SHA", length=40)
+    if not source.is_absolute() or source == Path(source.anchor):
+        raise ValueError("Hermes source checkout must be a bounded absolute directory")
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError("Hermes source checkout ownership or mode is unsafe")
+    git = Path(git_executable)
+    if git != Path("/usr/bin/git"):
+        raise ValueError("Hermes source verification requires /usr/bin/git")
+    try:
+        head = subprocess.run(
+            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=False, capture_output=True, text=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        tree = subprocess.run(
+            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{tree}"],
+            check=False, capture_output=True, text=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Hermes source Git identity cannot be verified") from exc
+    if head.returncode != 0 or head.stdout.strip() != expected or re.fullmatch(r"[0-9a-f]{40}", tree.stdout.strip()) is None:
+        raise ValueError("Hermes source SHA does not match Git HEAD")
+    pyproject, _ = _read_sealed_file_bytes(source / "pyproject.toml", max_bytes=_MAX_RUNTIME_FILE_BYTES)
+    uv_lock, _ = _read_sealed_file_bytes(source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES)
+    if provenance.get("hermes_source_tree_sha") != tree.stdout.strip():
+        raise ValueError("Hermes source tree SHA differs from provenance")
+    if provenance.get("pyproject_sha256") != hashlib.sha256(pyproject).hexdigest():
+        raise ValueError("Hermes pyproject digest differs from provenance")
+    if provenance.get("uv_lock_sha256") != hashlib.sha256(uv_lock).hexdigest():
+        raise ValueError("Hermes uv.lock digest differs from provenance")
+    lock_digest = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
+    if provenance.get("pyproject_lock_sha256") != lock_digest:
+        raise ValueError("Hermes pyproject/lock digest differs from the checkout")
 
 
 def render_sealed_runtime_plan(
@@ -1086,6 +1277,7 @@ def render_sealed_runtime_plan(
     hermes_install_provenance_path: Path,
     hermes_install_provenance_sha256: str,
     hermes_source_sha: str,
+    hermes_source_path: Path | None = None,
     runtime_root: Path,
     entrypoint_path: Path,
 ) -> dict[str, object]:
@@ -1112,6 +1304,13 @@ def render_sealed_runtime_plan(
     )
     hermes = cast(dict[str, object], closure["archive"])
     provenance = cast(dict[str, object], closure["provenance"])
+    if hermes_source_path is not None:
+        _validate_hermes_source_provenance(
+            Path(hermes_source_path),
+            expected_source_sha=hermes_source_sha,
+            provenance=provenance,
+            git_executable=Path("/usr/bin/git"),
+        )
     merged: dict[str, dict[str, object]] = {}
     for item in python["entries"]:
         path = str(item["path"])
@@ -2434,6 +2633,49 @@ def render_dispatcher_routing_config(
     return _json_artifact_bytes(payload).decode("utf-8")
 
 
+def render_dispatcher_profile_config_yaml(
+    *,
+    profile: str,
+    controller_client_config: Path,
+    publisher_client_config: Path,
+    operator_client_config: Path,
+    registration_file: Path,
+    expected_source_sha: str,
+) -> str:
+    """Render the profile config consumed by ``kanban_broker_routing``.
+
+    This deliberately uses the tiny supported subset of YAML rather than a
+    new runtime dependency.  Values are absolute, bounded paths and are
+    emitted in a fixed order for reproducible plans.
+    """
+    if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile) is None:
+        raise ValueError("dispatcher profile is invalid")
+    source_sha = _validated_hex_sha(
+        expected_source_sha, field="Radulator source SHA", length=40
+    )
+    paths = {
+        "controller": Path(controller_client_config),
+        "publisher": Path(publisher_client_config),
+        "operator": Path(operator_client_config),
+        "registration": Path(registration_file),
+    }
+    if any(not path.is_absolute() or ".." in path.parts for path in paths.values()):
+        raise ValueError("dispatcher profile config paths are invalid")
+    # Keep this as a flat nested ``kanban`` mapping: config.py and
+    # kanban_broker_routing.py both resolve these exact keys.
+    return (
+        "kanban:\n"
+        "  dedicated_broker_enabled: false\n"
+        "  trusted_publisher_enabled: false\n"
+        f"  dedicated_broker_controller_client_config: {paths['controller']}\n"
+        f"  dedicated_broker_publisher_client_config: {paths['publisher']}\n"
+        f"  dedicated_broker_operator_client_config: {paths['operator']}\n"
+        f"  dedicated_broker_registration_file: {paths['registration']}\n"
+        f"  dedicated_broker_expected_source_sha: {source_sha}\n"
+        f"  dedicated_broker_dispatcher_profile: {profile}\n"
+    )
+
+
 def _absolute_parts(path: Path) -> tuple[str, ...]:
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
@@ -2920,7 +3162,7 @@ def _verify_runtime_tree_against_manifest(
                             observed.append({
                                 "path": relative.as_posix(),
                                 "type": "file",
-                                "mode": 0o555 if stat.S_IMODE(info.st_mode) & 0o111 else 0o444,
+                                "mode": stat.S_IMODE(info.st_mode),
                                 "size": int(info.st_size),
                                 "sha256": digest.hexdigest(),
                             })
@@ -3543,30 +3785,50 @@ def activate_service_config(
     )
     activated = dict(config)
     activated["trusted_publisher_enabled"] = True
-    reread = _replace_service_config(path, original=original, payload=activated)
-    if (
-        reread.get("enabled") is not True
-        or reread.get("trusted_publisher_enabled") is not True
-    ):
-        raise ValueError("broker activation readback failed")
-    if reread.get("runtime_attestation_path") is not None:
-        _update_runtime_attestation(
-            reread,
-            service_config_path=Path(path),
-            active=True,
-            revoked=False,
-            isolated_probe={
-                "command": [
-                    str(reread["python_executable"]),
-                    "-I",
-                    "-B",
-                    str(Path(reread["python_executable"]).parent.parent / "runtime-probe.py"),
-                ],
-                "outcome": "PASS",
-            },
-            publisher_probe_status="PASS",
-        )
-    return reread
+    activated_bytes = _json_artifact_bytes(activated)
+    activated_digest = hashlib.sha256(activated_bytes).hexdigest()
+    try:
+        # Publish the active attestation first, bound to the exact bytes that
+        # will be installed.  Until the final config rename succeeds the
+        # service still has trusted_publisher_enabled=false and therefore
+        # cannot publish; a crash leaves an explicit mismatch for startup to
+        # reject and rollback.
+        if config.get("runtime_attestation_path") is not None:
+            _update_runtime_attestation(
+                config,
+                service_config_path=Path(path),
+                active=True,
+                revoked=False,
+                isolated_probe={
+                    "command": [
+                        str(config["python_executable"]),
+                        "-I",
+                        "-B",
+                        str(Path(config["python_executable"]).parent.parent / "runtime-probe.py"),
+                    ],
+                    "outcome": "PASS",
+                },
+                publisher_probe_status="PASS",
+                service_config_sha256=activated_digest,
+            )
+        _set_dispatcher_profile_activation(config, enabled=True)
+        reread = _replace_service_config(path, original=original, payload=activated)
+        if (
+            reread.get("enabled") is not True
+            or reread.get("trusted_publisher_enabled") is not True
+            or service_config_sha256(path, expected_owner_uid=expected_owner_uid)
+            != activated_digest
+        ):
+            raise ValueError("broker activation readback failed")
+        return reread
+    except Exception:
+        # Best-effort local recovery is itself fail-closed; the outer
+        # activation flow also performs launchd bootout and disabled readback.
+        try:
+            disable_service_config(path, expected_owner_uid=expected_owner_uid)
+        except Exception:
+            pass
+        raise
 
 
 def stage_service_config(path: Path, *, expected_owner_uid: int) -> dict:
@@ -3887,6 +4149,165 @@ def rollback_installation(
     return disabled
 
 
+def build_hermes_install_archive(
+    *,
+    source_root: Path,
+    install_root: Path,
+    source_sha: str,
+    output_archive: Path,
+    output_provenance: Path,
+    git_executable: Path = Path("/usr/bin/git"),
+) -> dict[str, str]:
+    """Build the deterministic non-editable Hermes closure input.
+
+    ``install_root`` is the output of the reviewed build/install step (not a
+    checkout).  This command binds it to the actual Hermes Git HEAD and the
+    bytes of that checkout's ``pyproject.toml`` and ``uv.lock`` before it
+    emits a deterministic archive plus detached provenance.  The renderer
+    only accepts provenance carrying this builder contract.
+    """
+    source = Path(source_root)
+    install = Path(install_root)
+    expected = _validated_hex_sha(source_sha, field="Hermes source SHA", length=40)
+    for path, field in ((source, "Hermes source checkout"), (install, "Hermes install closure")):
+        if not path.is_absolute() or path == Path(path.anchor):
+            raise ValueError(f"{field} must be a bounded absolute directory")
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"{field} must be a real directory")
+    git = Path(git_executable)
+    if git != Path("/usr/bin/git"):
+        raise ValueError("Hermes source verification requires /usr/bin/git")
+    try:
+        head_result = subprocess.run(
+            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=False, capture_output=True, text=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        tree_result = subprocess.run(
+            [str(git), "-C", str(source), "rev-parse", "--verify", "HEAD^{tree}"],
+            check=False, capture_output=True, text=True, timeout=10,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("Hermes source Git identity cannot be verified") from exc
+    head = head_result.stdout.strip()
+    tree = tree_result.stdout.strip()
+    if head_result.returncode != 0 or head != expected or re.fullmatch(r"[0-9a-f]{40}", tree) is None:
+        raise ValueError("Hermes source SHA does not match Git HEAD")
+    pyproject, _ = _read_sealed_file_bytes(source / "pyproject.toml", max_bytes=_MAX_RUNTIME_FILE_BYTES)
+    uv_lock, _ = _read_sealed_file_bytes(source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES)
+    pyproject_sha = hashlib.sha256(pyproject).hexdigest()
+    uv_lock_sha = hashlib.sha256(uv_lock).hexdigest()
+    lock_sha = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
+
+    entries: list[dict[str, object]] = []
+    contents: dict[str, bytes] = {}
+    links: dict[str, str] = {}
+    all_paths = sorted(install.rglob("*"), key=lambda item: item.as_posix())
+    if len(all_paths) > _MAX_RUNTIME_ARCHIVE_ENTRIES:
+        raise ValueError("Hermes install closure contains too many entries")
+    for item in all_paths:
+        relative = item.relative_to(install)
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("Hermes install closure path is unsafe")
+        info = item.lstat()
+        path_value = relative.as_posix()
+        mode = stat.S_IMODE(info.st_mode)
+        origin = "first-party" if path_value == "hermes_cli" or path_value.startswith("hermes_cli/") else "dependency"
+        if stat.S_ISDIR(info.st_mode):
+            if mode & 0o222:
+                raise ValueError("Hermes install closure contains a mutable directory")
+            entries.append({"path": path_value + "/", "type": "directory", "mode": mode, "origin": origin})
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1 or mode & 0o222 or info.st_size < 1 or info.st_size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                raise ValueError("Hermes install closure contains a mutable or linked file")
+            content, _ = _read_sealed_file_bytes(item, max_bytes=_MAX_RUNTIME_ARCHIVE_FILE_BYTES)
+            digest = hashlib.sha256(content).hexdigest()
+            contents[path_value] = content
+            entries.append({"path": path_value, "type": "file", "mode": mode, "origin": origin, "size": len(content), "sha256": digest})
+        elif stat.S_ISLNK(info.st_mode):
+            target = os.readlink(item)
+            if not target or target.startswith("/") or "\\" in target or "\x00" in target:
+                raise ValueError("Hermes install closure symlink target is unsafe")
+            resolved = PurePosixPath(posixpath.normpath((PurePosixPath(path_value).parent / target).as_posix()))
+            if resolved.is_absolute() or any(part in {"", ".", ".."} for part in resolved.parts):
+                raise ValueError("Hermes install closure symlink escapes the root")
+            links[path_value] = resolved.as_posix()
+            entries.append({"path": path_value, "type": "symlink", "target": resolved.as_posix(), "mode": mode, "origin": origin})
+        else:
+            raise ValueError("Hermes install closure contains a special file")
+    available = {str(entry["path"]).rstrip("/") for entry in entries}
+    if "hermes_cli/main.py" not in available or "hermes_cli/kanban_broker_client.py" not in available:
+        raise ValueError("Hermes install closure is missing the broker worker entrypoint")
+    if not any(str(entry["path"]).startswith("hermes_cli/") is False for entry in entries):
+        raise ValueError("Hermes install closure is missing locked dependencies")
+    for link, target in links.items():
+        if target not in available:
+            raise ValueError("Hermes install closure symlink target is missing")
+    entries.sort(key=lambda item: str(item["path"]))
+    raw_tar = io.BytesIO()
+    with tarfile.open(fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT) as stream:
+        root_member = tarfile.TarInfo("hermes-install/")
+        root_member.type = tarfile.DIRTYPE
+        root_member.mode = 0o555
+        root_member.uid = root_member.gid = 0
+        root_member.mtime = 0
+        stream.addfile(root_member)
+        for entry in entries:
+            relative = str(entry["path"])
+            name = "hermes-install/" + relative
+            member = tarfile.TarInfo(name)
+            member.uid = member.gid = 0
+            member.mtime = 0
+            member.mode = int(entry["mode"])
+            if entry["type"] == "directory":
+                member.type = tarfile.DIRTYPE
+                stream.addfile(member)
+            elif entry["type"] == "file":
+                content = contents[relative]
+                member.size = len(content)
+                stream.addfile(member, io.BytesIO(content))
+            else:
+                member.type = tarfile.SYMTYPE
+                parent = PurePosixPath(relative).parent
+                member.linkname = posixpath.relpath(str(entry["target"]), start=parent.as_posix())
+                stream.addfile(member)
+    compressed = io.BytesIO()
+    with gzip.GzipFile(fileobj=compressed, mode="wb", mtime=0) as gzip_stream:
+        gzip_stream.write(raw_tar.getvalue())
+    archive_bytes = compressed.getvalue()
+    archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+    provenance = {
+        "contract": HERMES_INSTALL_PROVENANCE_CONTRACT,
+        "schema_version": 1,
+        "builder_contract": HERMES_INSTALL_BUILDER_CONTRACT,
+        "hermes_source_sha": expected,
+        "hermes_source_tree_sha": tree,
+        "pyproject_sha256": pyproject_sha,
+        "uv_lock_sha256": uv_lock_sha,
+        "pyproject_lock_sha256": lock_sha,
+        "install_archive_sha256": archive_sha,
+        "entries": entries,
+    }
+    provenance_bytes = _json_artifact_bytes(provenance)
+    output_archive = Path(output_archive)
+    output_provenance = Path(output_provenance)
+    for output in (output_archive, output_provenance):
+        if not output.is_absolute() or output == Path(output.anchor):
+            raise ValueError("Hermes builder outputs must be bounded absolute files")
+        output.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_artifact_write(output_archive, archive_bytes, mode=0o444, uid=os.geteuid(), gid=os.getegid())
+    _atomic_artifact_write(output_provenance, provenance_bytes, mode=0o644, uid=os.geteuid(), gid=os.getegid())
+    return {
+        "archive_sha256": archive_sha,
+        "provenance_sha256": hashlib.sha256(provenance_bytes).hexdigest(),
+        "source_sha": expected,
+        "source_tree_sha": tree,
+        "pyproject_lock_sha256": lock_sha,
+    }
+
+
 def disable_service_config(path: Path, *, expected_owner_uid: int) -> dict:
     """Atomically restore both activation gates to exact false."""
     path = Path(path)
@@ -3905,6 +4326,7 @@ def disable_service_config(path: Path, *, expected_owner_uid: int) -> dict:
     _update_runtime_attestation(
         reread, service_config_path=path, active=False, revoked=True
     )
+    _set_dispatcher_profile_activation(reread, enabled=False)
     return reread
 
 
@@ -3970,6 +4392,7 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--publisher-probe", type=Path, required=True)
     render.add_argument("--publisher-probe-sha256", required=True)
     render.add_argument("--hermes-source-sha", required=True)
+    render.add_argument("--hermes-source-path", type=Path, required=True)
     render.add_argument("--radulator-source-path", type=Path, required=True)
     render.add_argument("--source-sha", "--radulator-source-sha", required=True)
     render.add_argument("--dispatcher-profile", required=True)
@@ -3990,6 +4413,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     allocator.add_argument("--inventory", type=Path, required=True)
     allocator.add_argument("--output", type=Path, required=True)
+    builder = subparsers.add_parser(
+        "build-hermes-install",
+        help="build a reproducible complete Hermes install closure archive",
+    )
+    builder.add_argument("--source-root", type=Path, required=True)
+    builder.add_argument("--install-root", type=Path, required=True)
+    builder.add_argument("--source-sha", required=True)
+    builder.add_argument("--output-archive", type=Path, required=True)
+    builder.add_argument("--output-provenance", type=Path, required=True)
+    builder.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
+    builder.add_argument("--json", action="store_true")
     identities = subparsers.add_parser("provision-identities")
     identities.add_argument("--plan", type=Path, required=True)
     assets = subparsers.add_parser("provision-assets")
@@ -4023,6 +4457,7 @@ def main(argv: list[str] | None = None) -> int:
             publisher_probe_path=args.publisher_probe,
             publisher_probe_sha256=args.publisher_probe_sha256,
             hermes_source_sha=args.hermes_source_sha,
+            hermes_source_path=args.hermes_source_path,
             radulator_source_path=args.radulator_source_path,
             radulator_source_sha=args.source_sha,
             dispatcher_profile=args.dispatcher_profile,
@@ -4045,6 +4480,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         output = _validated_install_path(args.output, field="identity allocation output", allow_root=False)
         _atomic_artifact_write(output, _json_artifact_bytes(desired), mode=0o600, uid=os.geteuid(), gid=os.getegid())
+        return 0
+    if args.command == "build-hermes-install":
+        result = build_hermes_install_archive(
+            source_root=args.source_root,
+            install_root=args.install_root,
+            source_sha=args.source_sha,
+            output_archive=args.output_archive,
+            output_provenance=args.output_provenance,
+            git_executable=args.git,
+        )
+        # Only digests and reviewed source identity are emitted.  No archive
+        # bytes or source contents are printed by this command.
+        if args.json:
+            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0
     if args.command == "seal-plan":
         seal_broker_installation_plan(
@@ -4511,6 +4960,7 @@ def render_broker_installation_plan(
     publisher_probe_path: Path,
     publisher_probe_sha256: str,
     hermes_source_sha: str | None,
+    hermes_source_path: Path | None = None,
     radulator_source_path: Path,
     radulator_source_sha: str | None,
     dispatcher_profile: str,
@@ -4537,6 +4987,8 @@ def render_broker_installation_plan(
     hermes_commit_sha = _validated_hex_sha(
         hermes_source_sha, field="Hermes source SHA", length=40
     )
+    if hermes_source_path is None:
+        raise ValueError("Hermes source checkout is required for provenance verification")
     radulator_checkout = _validated_install_path(
         radulator_source_path, field="Radulator source checkout"
     )
@@ -4563,8 +5015,12 @@ def render_broker_installation_plan(
     if not git.is_absolute() or ".." in git.parts:
         raise ValueError("Git executable path is invalid")
     git_digest = _apple_system_binary_sha256(git)
-    publisher_probe = _read_publisher_probe(
-        Path(publisher_probe_path), expected_sha256=publisher_probe_sha256
+    publisher_probe = _validate_radulator_publisher_source(
+        radulator_checkout,
+        expected_source_sha=source_sha,
+        publisher_probe=Path(publisher_probe_path),
+        publisher_probe_sha256=publisher_probe_sha256,
+        git_executable=git,
     )
 
     state_dir = root / "state"
@@ -4572,6 +5028,7 @@ def render_broker_installation_plan(
     worker_home = root / "worker-home"
     profile_root = worker_home / "profiles" / dispatcher_profile
     dispatcher_routing_config_path = profile_root / "kanban-routing.json"
+    dispatcher_profile_config_path = profile_root / "config.yaml"
     handoff_root = root / "publisher-handoffs"
     socket_root = root / "sockets"
     key_root = root / "keys"
@@ -4642,6 +5099,7 @@ def render_broker_installation_plan(
         hermes_install_provenance_path=hermes_install_provenance_path,
         hermes_install_provenance_sha256=hermes_install_provenance_sha256,
         hermes_source_sha=hermes_commit_sha,
+        hermes_source_path=hermes_source_path,
         runtime_root=sealed_runtime_root,
         entrypoint_path=entrypoint_path,
     )
@@ -4717,6 +5175,7 @@ def render_broker_installation_plan(
     })
     config = json.loads(render_broker_service_config(
         install_root=root,
+        service_config_path=service_config_path,
         state_dir=state_dir,
         workspace_root=workspace_root,
         worker_hermes_root=worker_home,
@@ -4760,8 +5219,13 @@ def render_broker_installation_plan(
         remote_policy_source_sha=source_sha,
         dispatcher_profile=dispatcher_profile,
         dispatcher_routing_config_path=dispatcher_routing_config_path,
+        dispatcher_profile_config_path=dispatcher_profile_config_path,
         publisher_probe_path=runtime_publisher_probe_path,
         publisher_probe_sha256=str(publisher_probe["sha256"]),
+        publisher_client_config=client_paths["publisher"],
+        controller_client_config=client_paths["controller"],
+        operator_client_config=client_paths["operator"],
+        publisher_repository_id="radulator",
         registration_file_path=registration_path,
         install_nonce=install_nonce,
     ))
@@ -4775,6 +5239,14 @@ def render_broker_installation_plan(
             sequence_path=sequence_paths[surface],
         ).encode("utf-8")
     routing_config = render_dispatcher_routing_config(
+        profile=dispatcher_profile,
+        controller_client_config=client_paths["controller"],
+        publisher_client_config=client_paths["publisher"],
+        operator_client_config=client_paths["operator"],
+        registration_file=registration_path,
+        expected_source_sha=source_sha,
+    ).encode("utf-8")
+    profile_config = render_dispatcher_profile_config_yaml(
         profile=dispatcher_profile,
         controller_client_config=client_paths["controller"],
         publisher_client_config=client_paths["publisher"],
@@ -4896,6 +5368,7 @@ def render_broker_installation_plan(
             expected_sha256=str(publisher_probe["sha256"]),
         )[0],
         str(dispatcher_routing_config_path): routing_config,
+        str(dispatcher_profile_config_path): profile_config,
     })
     for surface in ("controller", "publisher", "operator"):
         payload_bytes[str(surface_keys[surface])] = secrets.token_bytes(32)
@@ -4950,6 +5423,13 @@ def render_broker_installation_plan(
             "gid": int(config["workspace_gid"]),
             "mode": 0o600,
             "kind": "dispatcher_routing_config",
+        },
+        {
+            "path": str(dispatcher_profile_config_path),
+            "uid": int(config["model_uid"]),
+            "gid": int(config["workspace_gid"]),
+            "mode": 0o600,
+            "kind": "dispatcher_profile_config",
         },
         {
             "path": str(entrypoint_path),
@@ -5242,22 +5722,24 @@ def _update_runtime_attestation(
     revoked: bool,
     isolated_probe: dict[str, object] | None = None,
     publisher_probe_status: str | None = None,
+    service_config_sha256: str | None = None,
 ) -> None:
     """Publish only sanitized runtime state; never include keys or credentials."""
     raw_path = config.get("runtime_attestation_path")
     if raw_path is None:
         return
     path = Path(str(raw_path))
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
-                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o644):
-            raise ValueError("runtime attestation ownership or mode is unsafe")
-        raw = os.read(fd, 1024 * 1024 + 1)
-    finally:
-        os.close(fd)
+    # The configured path is never opened directly.  This descriptor-relative
+    # reader checks every parent component with O_NOFOLLOW and records the
+    # target inode before/after reading, closing the final-path race window.
+    raw, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if (
+        info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o644
+    ):
+        raise ValueError("runtime attestation ownership or mode is unsafe")
     try:
         attestation = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -5369,8 +5851,110 @@ def _update_runtime_attestation(
             or _safe_file_sha256(probe) != updated.get("publisher_probe_sha256")
         ):
             raise ValueError("runtime attestation publisher script binding is unsafe")
-    updated["service_config_sha256"] = _safe_file_sha256(Path(service_config_path))
+    if service_config_sha256 is None:
+        service_digest = _safe_file_sha256(Path(service_config_path))
+    else:
+        service_digest = _validated_hex_sha(
+            service_config_sha256, field="service config SHA256", length=64
+        )
+    updated["service_config_sha256"] = service_digest
     _atomic_artifact_write(path, _json_artifact_bytes(updated), mode=0o644, uid=0, gid=0)
+
+
+def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bool) -> None:
+    """Atomically update the named profile's real routing configuration.
+
+    The profile is model-owned, so the broker never edits it through a model
+    process or an ambient absolute-path open.  The descriptor-bound read and
+    writer ensure activation cannot silently replace a symlinked profile.
+    """
+    raw_path = config.get("dispatcher_profile_config_path")
+    if raw_path is None:
+        return
+    path = Path(str(raw_path))
+    expected_owner = int(config["model_uid"])
+    expected_group = int(config["workspace_gid"])
+    raw, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if (
+        info.st_uid != expected_owner
+        or info.st_gid != expected_group
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise ValueError("dispatcher profile config ownership or mode is unsafe")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("dispatcher profile config is not UTF-8") from exc
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0] != "kanban:\n":
+        raise ValueError("dispatcher profile config contract is invalid")
+    updates = {
+        "  dedicated_broker_enabled: ": "true" if enabled else "false",
+        "  trusted_publisher_enabled: ": "true" if enabled else "false",
+    }
+    seen: set[str] = set()
+    result: list[str] = []
+    for line in lines[1:]:
+        newline = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if newline else line
+        matched = False
+        for prefix, value in updates.items():
+            if body.startswith(prefix):
+                if body[len(prefix):] not in {"true", "false"} or prefix in seen:
+                    raise ValueError("dispatcher profile config flags are invalid")
+                body = prefix + value
+                seen.add(prefix)
+                matched = True
+                break
+        result.append(body + newline)
+    if seen != set(updates):
+        raise ValueError("dispatcher profile config flags are incomplete")
+    replacement = "".join(result).encode("utf-8")
+    _atomic_artifact_write(path, replacement, mode=0o600, uid=expected_owner, gid=expected_group)
+    reread, read_info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if reread != replacement or read_info.st_uid != expected_owner or read_info.st_gid != expected_group:
+        raise ValueError("dispatcher profile config activation readback failed")
+
+
+def validate_runtime_attestation_state(config: dict[str, object]) -> None:
+    """Require the service's durable runtime attestation to agree with flags."""
+    raw_path = config.get("runtime_attestation_path")
+    if raw_path is None:
+        return
+    path = Path(str(raw_path))
+    raw, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if (
+        info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o644
+    ):
+        raise ValueError("runtime attestation ownership or mode is unsafe")
+    try:
+        attestation = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime attestation is invalid JSON") from exc
+    if not isinstance(attestation, dict):
+        raise ValueError("runtime attestation is not an object")
+    trusted = config.get("trusted_publisher_enabled") is True
+    if (
+        attestation.get("active") is not trusted
+        or attestation.get("revoked") is not (not trusted)
+        or (trusted and attestation.get("publisher_probe_status") != "PASS")
+        or (trusted and not isinstance(attestation.get("isolated_probe"), dict))
+        or attestation.get("runtime_root") != str(config.get("python_executable", "")).rsplit("/bin/", 1)[0]
+        or attestation.get("runtime_manifest_path") != config.get("runtime_manifest_path")
+        or attestation.get("runtime_manifest_sha256") != config.get("runtime_manifest_sha256")
+    ):
+        raise ValueError("runtime attestation does not authorize service state")
+    configured_service_path = config.get("service_config_path")
+    if configured_service_path is not None:
+        service_bytes, _service_info = _read_sealed_file_bytes(
+            Path(str(configured_service_path)), max_bytes=1024 * 1024
+        )
+        if attestation.get("service_config_sha256") != hashlib.sha256(service_bytes).hexdigest():
+            raise ValueError("runtime attestation service config digest does not match")
 
 
 def _rebase_path_string(value: object, *, source_root: Path, output_root: Path) -> object:
