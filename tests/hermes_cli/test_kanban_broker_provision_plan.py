@@ -9,6 +9,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import tarfile
@@ -797,14 +798,27 @@ def test_hermes_install_archive_executes_main_and_dependency_closure(tmp_path):
         (package_archive.parent / "hermes-install.provenance.json").read_text(encoding="utf-8")
     )
     assert len(provenance["entries"]) > 100
+    first_party = {entry["path"] for entry in provenance["entries"] if entry["origin"] == "first-party"}
+    # The worker executes ``hermes_cli.main … chat``, whose classic path
+    # imports the top-level ``cli`` module and the ``agent``/``tools``
+    # packages; a closure carrying only ``hermes_cli`` would import cleanly
+    # here yet fail on the first real task.
+    for required in ("cli.py", "run_agent.py", "agent/__init__.py", "tools/__init__.py", "gateway/assets/status_phrases.yaml", "plugins/browser/browser_use/plugin.yaml"):
+        assert required in first_party, required
+    assert not any(path.startswith(("tests/", "scripts/", "docs/")) for path in first_party)
     wrapper = tmp_path / "worker_import.py"
     wrapper.write_text(
+        "import sys\n"
         "from hermes_cli.main import main\n"
         "from hermes_cli import kanban_broker_client\n"
+        "import cli, run_agent, agent, tools, gateway\n"
         "assert callable(main)\n"
-        "assert kanban_broker_client.__file__.startswith(__import__('sys').prefix)\n",
+        "for module in (kanban_broker_client, cli, run_agent, agent, tools, gateway):\n"
+        "    assert module.__file__.startswith(sys.prefix), module.__file__\n",
         encoding="utf-8",
     )
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir()
     result = subprocess.run(
         [
             str(env_root / "bin/python"),
@@ -815,7 +829,11 @@ def test_hermes_install_archive_executes_main_and_dependency_closure(tmp_path):
         check=False,
         capture_output=True,
         text=True,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        env={
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(worker_home),
+            "HERMES_HOME": str(worker_home / ".hermes"),
+        },
     )
     assert result.returncode == 0, result.stderr
 
@@ -1531,17 +1549,17 @@ def test_installed_distribution_rejects_direct_url_and_wheel_record_mismatch(tmp
         "artifacts": [{"url": "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     installed = installer._verify_installed_distributions(
-        site_packages, locked, supported_tags=_fixture_tags(), wheel_bytes=lambda artifact: wheel(payload)
+        site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset(), wheel_bytes=lambda artifact: wheel(payload)
     )
     assert installed[0]["artifact"]["sha256"] == "a" * 64
     with pytest.raises(ValueError, match="not bound to the locked wheel"):
         installer._verify_installed_distributions(
-            site_packages, locked, supported_tags=_fixture_tags(), wheel_bytes=lambda artifact: wheel(b"VALUE = 2\n")
+            site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset(), wheel_bytes=lambda artifact: wheel(b"VALUE = 2\n")
         )
     (site_packages / "sample-1.0.dist-info/direct_url.json").write_bytes(b"{}")
     with pytest.raises(ValueError, match="registry-locked"):
         installer._verify_installed_distributions(
-            site_packages, locked, supported_tags=_fixture_tags()
+            site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset()
         )
 
 
@@ -1575,7 +1593,7 @@ def test_installed_distribution_rejects_blank_record_digest(tmp_path):
         "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     with pytest.raises(ValueError, match="RECORD|sha256|digest"):
-        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset())
 
 
 def test_installed_distribution_rejects_unrecorded_file(tmp_path):
@@ -1593,7 +1611,7 @@ def test_installed_distribution_rejects_unrecorded_file(tmp_path):
         "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     with pytest.raises(ValueError, match="unrecorded|coverage|RECORD"):
-        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset())
 
 
 def test_installed_distribution_rejects_metadata_only_closure(tmp_path):
@@ -1621,7 +1639,7 @@ def test_installed_distribution_rejects_metadata_only_closure(tmp_path):
         "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     with pytest.raises(ValueError, match="payload|complete|closure"):
-        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags(), first_party_tops=frozenset())
 
 
 def test_rendered_worker_profile_directories_pass_real_worker_validation(tmp_path):
@@ -2151,3 +2169,33 @@ def test_publisher_asset_manifest_matches_radulators_own_installer_when_availabl
     entries, digest = module._source_manifest(module_path.parent, expected_uid=os.getuid())
     assert bound["publisher_asset_manifest"] == entries
     assert bound["publisher_asset_manifest_sha256"] == digest
+
+
+def test_first_party_closure_follows_the_declared_packaging(tmp_path):
+    """The closure is exactly what pyproject declares at the reviewed commit."""
+    from hermes_cli import kanban_broker_install as installer
+
+    source, _env, _archive, source_sha = _real_hermes_builder()
+    modules, roots, package_data = installer._declared_first_party_layout(
+        (source / "pyproject.toml").read_bytes()
+    )
+    assert {"cli", "run_agent", "hermes_constants", "utils"} <= modules
+    assert {"hermes_cli", "agent", "tools", "gateway", "plugins"} <= roots
+    assert "gateway" in package_data and "plugins" in package_data
+    digest, files = installer._git_archive_first_party(source, expected=source_sha, git=Path("/usr/bin/git"))
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert installer.FIRST_PARTY_REQUIRED_FILES <= set(files)
+    assert "gateway/assets/status_phrases.yaml" in files
+    assert "plugins/browser/browser_use/plugin.yaml" in files
+    assert not any(path.startswith(("tests/", "scripts/", "website/", "docs/")) for path in files)
+    assert not any("__pycache__" in path or path.endswith(".pyc") for path in files)
+    # Namespace subpackages (no __init__.py) are part of the wheel and must
+    # be in the closure; directories whose names are not identifiers (for
+    # example ``plugins/hermes-achievements``) are not packages and are not.
+    assert "plugins/browser/browserbase/provider.py" in files
+    assert not any(path.startswith("plugins/hermes-achievements/") and path.endswith(".py") for path in files)
+    # A different commit or a tampered pyproject changes the closure identity.
+    with pytest.raises(ValueError):
+        installer._declared_first_party_layout(b"[tool.setuptools]\npy-modules = ['cli']\n")
+    with pytest.raises(ValueError, match="cannot be read|Git archive"):
+        installer._git_archive_first_party(source, expected="0" * 40, git=Path("/usr/bin/git"))

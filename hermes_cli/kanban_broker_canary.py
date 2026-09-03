@@ -577,6 +577,16 @@ def _publisher_runtime_preflight_check(
     except (OSError, ValueError):
         return False
 
+    # The probe must authenticate as the publisher identity: its client config
+    # is publisher-owned 0600 and the broker requires the socket peer uid to
+    # be the publisher uid.  The root activation runner therefore drops to
+    # that identity for the child, and the broker-side window later proves
+    # the call actually arrived from it.
+    try:
+        publisher_uid = int(config["publisher_uid"])
+        publisher_gid = int(config["publisher_gid"])
+    except (KeyError, TypeError, ValueError):
+        return False
     # Resolve the operator broker interface.  In tests an in-process broker is
     # injected; in production the operator client is loaded from the config.
     operator = _operator_broker
@@ -629,6 +639,9 @@ def _publisher_runtime_preflight_check(
             text=True,
             timeout=15,
             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            user=publisher_uid,
+            group=publisher_gid,
+            extra_groups=[] if os.geteuid() == 0 else None,  # windows-footgun: ok - macOS-only activation canary
         )
         child_ok = result.returncode == 0 and not result.stderr
         stdout = result.stdout
@@ -696,10 +709,6 @@ def _publisher_runtime_preflight_check(
     if len(broker_calls) != 1:
         return False
     single = broker_calls[0]
-    try:
-        publisher_uid = int(config["publisher_uid"])
-    except (KeyError, TypeError, ValueError):
-        return False
     if (
         not isinstance(single, dict)
         or single.get("method") != "list_publish_obligations"

@@ -7,6 +7,7 @@ import ast
 import base64
 import csv
 import dataclasses
+import fnmatch
 import grp
 import gzip
 import hashlib
@@ -1854,19 +1855,7 @@ def _validate_hermes_install_closure(
         archive_path,
         expected_sha256=archive_sha256,
         strip_prefix="hermes-install",
-        required_paths={
-            "hermes_cli/__init__.py",
-            "hermes_cli/main.py",
-            "hermes_cli/kanban_broker_canary.py",
-            "hermes_cli/kanban_broker_client.py",
-            "hermes_cli/kanban_broker_install.py",
-            "hermes_cli/kanban_broker_protocol.py",
-            "hermes_cli/kanban_broker_service.py",
-            "hermes_cli/kanban_broker_worker.py",
-            "hermes_cli/kanban_dedicated_broker.py",
-            "hermes_constants.py",
-            "utils.py",
-        },
+        required_paths=set(FIRST_PARTY_REQUIRED_FILES),
         role="Hermes install",
     )
     provenance = _read_hermes_install_provenance(
@@ -1891,14 +1880,7 @@ def _validate_hermes_install_closure(
         content = contents.get(str(entry["path"]))
         if content is None or hashlib.sha256(content).hexdigest() != str(entry["sha256"]):
             raise ValueError("Hermes install archive content differs from provenance")
-        if str(entry["path"]) in {
-            "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/kanban_broker_canary.py",
-            "hermes_cli/kanban_broker_client.py", "hermes_cli/kanban_broker_install.py",
-            "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_service.py",
-            "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_dedicated_broker.py",
-            "hermes_constants.py",
-            "utils.py",
-        }:
+        if str(entry["path"]) in FIRST_PARTY_REQUIRED_FILES:
             try:
                 tree = ast.parse(content.decode("utf-8"), filename=str(entry["path"]))
             except (UnicodeDecodeError, SyntaxError) as exc:
@@ -1945,6 +1927,9 @@ def _validate_hermes_install_closure(
             supported_tags=_python_identity_supported_tags(
                 cast(dict[str, object], provenance["python_identity"])
             ),
+            first_party_tops=_first_party_tops([
+                str(entry["path"]) for entry in provenance_entries if entry.get("origin") == "first-party"
+            ]),
             allow_external_record_targets=True,
             wheel_bytes=_fetch_locked_artifact if verify_artifacts else None,
         )
@@ -2212,11 +2197,19 @@ def _validate_hermes_source_provenance(
     )
     if provenance.get("locked_packages") != locked:
         raise ValueError("Hermes install provenance lock records differ from uv.lock")
-    _archive_bytes, _first_party_files = _git_archive_hermes_cli(
+    first_party_digest, first_party_files = _git_archive_first_party(
         source, expected=expected, git=git
     )
-    if provenance.get("first_party_git_archive_sha256") != hashlib.sha256(_archive_bytes).hexdigest():
+    if provenance.get("first_party_git_archive_sha256") != first_party_digest:
         raise ValueError("Hermes first-party install bytes differ from the reviewed Git archive")
+    recorded = {
+        str(entry["path"]): str(entry.get("sha256"))
+        for entry in cast(list[dict[str, object]], provenance.get("entries") or [])
+        if entry.get("origin") == "first-party" and entry.get("type") == "file"
+    }
+    expected_files = {path: hashlib.sha256(content).hexdigest() for path, content in first_party_files.items()}
+    if recorded != expected_files:
+        raise ValueError("Hermes first-party closure differs from the reviewed commit's declared runtime")
 
 
 def render_sealed_runtime_plan(
@@ -5519,32 +5512,114 @@ def _locked_uv_packages(
     return result
 
 
-def _git_archive_hermes_cli(source: Path, *, expected: str, git: Path) -> tuple[bytes, dict[str, bytes]]:
-    """Read first-party bytes from the exact Git commit; never from install_root."""
-    result = subprocess.run(
-        [
-            str(git), "-C", str(source), "archive", "--format=tar", expected,
-            "--", "hermes_cli", "hermes_constants.py", "utils.py",
-        ],
+FIRST_PARTY_REQUIRED_FILES = frozenset({
+    "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/kanban_broker_client.py",
+    "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_broker_service.py",
+    "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_install.py",
+    "hermes_cli/kanban_dedicated_broker.py", "hermes_cli/kanban_broker_canary.py",
+    "cli.py", "run_agent.py", "hermes_constants.py", "utils.py",
+    "agent/__init__.py", "tools/__init__.py",
+})
+_PACKAGE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _declared_first_party_layout(
+    pyproject: bytes,
+) -> tuple[frozenset[str], frozenset[str], dict[str, tuple[str, ...]]]:
+    """Return the modules, package roots, and package data pyproject declares.
+
+    The closure ships exactly what the project's own wheel would contain, so
+    the definition of "the complete Hermes runtime" is the reviewed
+    ``[tool.setuptools]`` declaration at the exact commit, not a hand-picked
+    list that silently omits ``cli``/``agent``/``tools`` and only fails once a
+    real worker starts.
+    """
+    try:
+        document = tomllib.loads(pyproject.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError("Hermes pyproject is not a valid TOML document") from exc
+    setuptools = document.get("tool", {}).get("setuptools", {})
+    if not isinstance(setuptools, dict):
+        raise ValueError("Hermes pyproject has no setuptools declaration")
+    modules = setuptools.get("py-modules", [])
+    include = setuptools.get("packages", {}).get("find", {}).get("include", [])
+    package_data = setuptools.get("package-data", {})
+    if (
+        not isinstance(modules, list) or not modules
+        or not all(isinstance(item, str) and _PACKAGE_NAME_RE.fullmatch(item) for item in modules)
+        or not isinstance(include, list) or not include
+        or not all(isinstance(item, str) for item in include)
+        or not isinstance(package_data, dict)
+    ):
+        raise ValueError("Hermes pyproject first-party declaration is malformed")
+    roots: set[str] = set()
+    for pattern in include:
+        root = pattern.split(".", 1)[0]
+        if not _PACKAGE_NAME_RE.fullmatch(root) or pattern not in {root, root + ".*"}:
+            raise ValueError("Hermes pyproject package include pattern is unsupported")
+        roots.add(root)
+    data: dict[str, tuple[str, ...]] = {}
+    for package, globs in package_data.items():
+        if (
+            not isinstance(package, str) or not _PACKAGE_NAME_RE.fullmatch(package)
+            or package not in roots
+            or not isinstance(globs, list)
+            or not all(isinstance(item, str) and item and ".." not in item and not item.startswith("/") for item in globs)
+        ):
+            raise ValueError("Hermes pyproject package-data declaration is malformed")
+        data[package] = tuple(globs)
+    if "hermes_cli" not in roots or "cli" not in modules:
+        raise ValueError("Hermes pyproject does not declare the worker runtime")
+    return frozenset(modules), frozenset(roots), data
+
+
+def _package_data_matches(relative: str, patterns: tuple[str, ...]) -> bool:
+    for pattern in patterns:
+        candidates = {pattern, pattern.replace("**/", "")}
+        if any(fnmatch.fnmatchcase(relative, candidate) for candidate in candidates):
+            return True
+    return False
+
+
+def _git_archive_first_party(
+    source: Path, *, expected: str, git: Path
+) -> tuple[str, dict[str, bytes]]:
+    """Read the complete first-party runtime from the exact Git commit.
+
+    Returns the closure digest (over the sorted path/content digests) and the
+    file bytes.  Only the packages, modules and package data declared by the
+    commit's own pyproject are included, mirroring setuptools' pyproject
+    discovery (``namespaces = true`` by default: every directory whose name
+    is a valid identifier is a package, ``__init__.py`` or not).  Nothing is
+    read from ``install_root`` or the working tree.
+    """
+    shown = subprocess.run(
+        [str(git), "-C", str(source), "show", f"{expected}:pyproject.toml"],
         check=False, capture_output=True, timeout=30, env=_git_command_environment(),
+    )
+    if shown.returncode != 0 or not shown.stdout:
+        raise ValueError("Hermes pyproject cannot be read from the reviewed commit")
+    modules, roots, package_data = _declared_first_party_layout(shown.stdout)
+    paths = [f"{name}.py" for name in sorted(modules)] + sorted(roots)
+    result = subprocess.run(
+        [str(git), "-C", str(source), "archive", "--format=tar", expected, "--", *paths],
+        check=False, capture_output=True, timeout=120, env=_git_command_environment(),
     )
     if result.returncode != 0 or not result.stdout:
         raise ValueError("Hermes first-party Git archive cannot be read")
-    files: dict[str, bytes] = {}
+    contents: dict[str, bytes] = {}
     try:
         with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as stream:
-            for member in stream.getmembers():
-                raw = member.name.rstrip("/") if member.isdir() else member.name
-                if raw == "hermes_cli":
-                    continue
-                if raw not in {"hermes_constants.py", "utils.py"} and not raw.startswith("hermes_cli/"):
-                    raise ValueError("Hermes Git archive contains an unexpected path")
-                relative = _archive_relative_name(raw)
+            members = stream.getmembers()
+            if len(members) > _MAX_RUNTIME_ARCHIVE_ENTRIES:
+                raise ValueError("Hermes first-party Git archive contains too many entries")
+            for member in members:
                 if member.isdir():
                     continue
                 if member.issym() or member.islnk() or not member.isfile():
                     raise ValueError("Hermes first-party Git archive contains an unsafe entry")
-                if member.size < 1 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
+                relative = _archive_relative_name(member.name)
+                if member.size < 0 or member.size > _MAX_RUNTIME_ARCHIVE_FILE_BYTES:
                     raise ValueError("Hermes first-party Git archive entry is too large")
                 handle = stream.extractfile(member)
                 if handle is None:
@@ -5552,33 +5627,53 @@ def _git_archive_hermes_cli(source: Path, *, expected: str, git: Path) -> tuple[
                 content = handle.read(_MAX_RUNTIME_ARCHIVE_FILE_BYTES + 1)
                 if len(content) != member.size:
                     raise ValueError("Hermes first-party Git archive entry changed")
-                if relative in files:
+                if relative in contents:
                     raise ValueError("Hermes first-party Git archive contains duplicate paths")
-                files[relative] = content
+                contents[relative] = content
     except (OSError, tarfile.TarError) as exc:
         raise ValueError("Hermes first-party Git archive is invalid") from exc
-    required = {
-        "hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_cli/kanban_broker_client.py",
-        "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_broker_service.py",
-        "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_install.py",
-        "hermes_cli/kanban_dedicated_broker.py", "hermes_cli/kanban_broker_canary.py",
-    }
-    if not required.issubset(files):
-        raise ValueError("Hermes Git archive is missing the complete first-party broker closure")
-    return result.stdout, files
+    files: dict[str, bytes] = {}
+    for relative, content in contents.items():
+        parts = PurePosixPath(relative).parts
+        if "__pycache__" in parts or relative.endswith((".pyc", ".pyo")):
+            continue
+        top = parts[0]
+        if len(parts) == 1:
+            if relative.endswith(".py") and relative[:-3] in modules:
+                files[relative] = content
+            continue
+        if top not in roots:
+            raise ValueError("Hermes first-party Git archive contains an undeclared top-level path")
+        if relative.endswith(".py"):
+            if all(_PACKAGE_NAME_RE.fullmatch(part) for part in parts[:-1]):
+                files[relative] = content
+            continue
+        if _package_data_matches(str(PurePosixPath(*parts[1:])), package_data.get(top, ())):
+            files[relative] = content
+    if not FIRST_PARTY_REQUIRED_FILES.issubset(files):
+        raise ValueError("Hermes Git archive is missing the complete first-party runtime")
+    digest = hashlib.sha256(
+        _canonical_json_bytes([
+            [path, hashlib.sha256(files[path]).hexdigest()] for path in sorted(files)
+        ])
+    ).hexdigest()
+    return digest, files
 
 
 _HERMES_RECORD_ALLOWLIST = frozenset({
     "LICENSE",
     "_virtualenv.py",
     "_virtualenv.pth",
-    "hermes_constants.py",
-    "utils.py",
 })
 
 
-def _record_path_is_first_party(path: str) -> bool:
-    return path.startswith("hermes_cli/") or path in _HERMES_RECORD_ALLOWLIST
+def _record_path_is_first_party(path: str, first_party_tops: frozenset[str]) -> bool:
+    """First-party runtime files are copied from Git, never RECORD-owned."""
+    return path in _HERMES_RECORD_ALLOWLIST or PurePosixPath(path).parts[0] in first_party_tops
+
+
+def _first_party_tops(files: dict[str, object] | list[str]) -> frozenset[str]:
+    return frozenset(PurePosixPath(str(path).rstrip("/")).parts[0] for path in files)
 
 
 def _selected_locked_artifact(
@@ -5831,6 +5926,7 @@ def _verify_installed_distributions(
     locked: list[dict[str, object]],
     *,
     supported_tags: list[object],
+    first_party_tops: frozenset[str],
     allow_external_record_targets: bool = False,
     wheel_bytes=None,
 ) -> list[dict[str, object]]:
@@ -5973,7 +6069,7 @@ def _verify_installed_distributions(
         else:
             raise ValueError("installed Hermes dependency closure contains a special or linked file")
     missing_record = sorted(actual_files - set(record_owner) - {
-        path for path in actual_files if _record_path_is_first_party(path)
+        path for path in actual_files if _record_path_is_first_party(path, first_party_tops)
     })
     if missing_record:
         raise ValueError("installed Hermes dependency closure contains unrecorded files")
@@ -6047,9 +6143,10 @@ def build_hermes_install_archive(
         source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES
     )
     locked_packages = _locked_uv_packages(uv_lock, marker_environment=marker_environment)
-    git_archive, first_party_files = _git_archive_hermes_cli(
+    first_party_digest, first_party_files = _git_archive_first_party(
         source, expected=expected, git=git
     )
+    first_party_tops = _first_party_tops(first_party_files)
     pyproject_sha = hashlib.sha256(pyproject).hexdigest()
     uv_lock_sha = hashlib.sha256(uv_lock).hexdigest()
     lock_sha = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
@@ -6109,15 +6206,15 @@ def build_hermes_install_archive(
     # Install the first-party package from the exact Git archive into the real
     # site-packages directory.  This is what makes ``python -I script.py``
     # import the same package as the broker entrypoint.
-    first_party_root = site_packages / "hermes_cli"
-    if first_party_root.exists() or first_party_root.is_symlink():
-        raise ValueError("Hermes dependency build unexpectedly supplied editable first-party bytes")
+    for top in sorted(first_party_tops):
+        candidate = site_packages / top
+        if candidate.exists() or candidate.is_symlink():
+            raise ValueError("Hermes dependency build unexpectedly supplied editable first-party bytes")
     for path_value, content in sorted(first_party_files.items()):
         target = site_packages.joinpath(*PurePosixPath(path_value).parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
         os.chmod(target, 0o444)
-    os.chmod(first_party_root, 0o555)
     # Freeze every installed path before making the detached archive.  The
     # archive's manifest consequently records the exact mode that startup
     # verification must observe, including native files and stdlib metadata.
@@ -6138,6 +6235,7 @@ def build_hermes_install_archive(
         site_packages,
         locked_packages,
         supported_tags=supported_tags,
+        first_party_tops=first_party_tops,
         wheel_bytes=_fetch_locked_artifact,
     )
     entries: list[dict[str, object]] = []
@@ -6154,10 +6252,7 @@ def build_hermes_install_archive(
         path_value = relative.as_posix()
         origin = (
             "first-party"
-            if path_value == "hermes_cli"
-            or path_value.startswith("hermes_cli/")
-            or path_value == "hermes_constants.py"
-            or path_value == "utils.py"
+            if PurePosixPath(path_value).parts[0] in first_party_tops
             else "dependency"
         )
         mode = stat.S_IMODE(info.st_mode)
@@ -6183,8 +6278,8 @@ def build_hermes_install_archive(
         else:
             raise ValueError("Hermes install closure contains a special file")
     available = {str(entry["path"]).rstrip("/") for entry in entries}
-    if "hermes_cli/main.py" not in available or "hermes_cli/kanban_broker_client.py" not in available:
-        raise ValueError("Hermes install closure is missing the source-derived broker entrypoint")
+    if not FIRST_PARTY_REQUIRED_FILES.issubset(available):
+        raise ValueError("Hermes install closure is missing the source-derived worker runtime")
     if not any(entry["origin"] == "dependency" for entry in entries):
         raise ValueError("Hermes install closure is missing locked dependencies")
     for link, target in links.items():
@@ -6232,7 +6327,7 @@ def build_hermes_install_archive(
         "pyproject_sha256": pyproject_sha,
         "uv_lock_sha256": uv_lock_sha,
         "pyproject_lock_sha256": lock_sha,
-        "first_party_git_archive_sha256": hashlib.sha256(git_archive).hexdigest(),
+        "first_party_git_archive_sha256": first_party_digest,
         "locked_packages": locked_packages,
         "installed_distributions": installed_distributions,
         "uv_identity": bound_uv_identity,

@@ -341,6 +341,7 @@ def _make_config(tmp_path: Path) -> dict[str, Any]:
         "publisher_probe_sha256": _PROBE_SHA256,
         "package_root": str(package_root),
         "publisher_uid": os.geteuid(),
+        "publisher_gid": os.getegid(),
     }
 
 
@@ -671,3 +672,40 @@ def test_canary_check_fails_when_the_single_call_is_not_from_the_publisher_uid(b
         return result
 
     assert _run_canary(config, adapter, side_effect) is False
+
+
+def test_canary_runs_the_preflight_child_as_the_publisher_identity(broker_fixture, tmp_path):
+    """The root activation runner must drop to the publisher uid/gid for the
+    probe; otherwise the publisher-owned 0600 client config and the broker's
+    peer-uid check make every production activation fail."""
+    broker, _source, _base = broker_fixture
+    config = _make_config(tmp_path)
+    adapter = _DirectBrokerOperator(broker)
+    good_json = _good_child_json(config)
+    seen: dict[str, Any] = {}
+
+    def side_effect(*args, **kwargs):
+        seen.update(kwargs)
+        broker.list_publish_obligations(
+            peer_uid=os.geteuid(),
+            query={
+                "contract": "hermes.publisher_obligation_query.v1",
+                "repository_id": "radulator",
+                "after_created_at": 0,
+                "after_receipt_id": "",
+                "limit": 1,
+            },
+        )
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = good_json
+        result.stderr = ""
+        return result
+
+    assert _run_canary(config, adapter, side_effect) is True
+    assert seen["user"] == os.geteuid()
+    assert seen["group"] == os.getegid()
+    assert seen["extra_groups"] == ([] if os.geteuid() == 0 else None)
+    assert "HOME" not in seen["env"] and "GH_TOKEN" not in seen["env"]
+    missing_gid = {key: value for key, value in config.items() if key != "publisher_gid"}
+    assert _run_canary(missing_gid, adapter, side_effect) is False
