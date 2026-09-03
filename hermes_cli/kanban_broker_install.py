@@ -71,6 +71,33 @@ SEALED_RUNTIME_CONTRACT = "hermes.kanban_broker_sealed_runtime.v1"
 RUNTIME_MANIFEST_CONTRACT = "hermes.kanban_broker_runtime_manifest.v1"
 HERMES_INSTALL_PROVENANCE_CONTRACT = "hermes.kanban_broker_hermes_install_provenance.v1"
 HERMES_INSTALL_BUILDER_CONTRACT = "hermes.kanban_broker_hermes_install_builder.v1"
+HERMES_INSTALL_PROVENANCE_FIELDS = frozenset({
+    "contract",
+    "schema_version",
+    "builder_contract",
+    "hermes_source_sha",
+    "hermes_source_tree_sha",
+    "pyproject_sha256",
+    "uv_lock_sha256",
+    "pyproject_lock_sha256",
+    "first_party_git_archive_sha256",
+    "locked_packages",
+    "installed_distributions",
+    "installer",
+    "install_archive_sha256",
+    "entries",
+})
+HERMES_INSTALL_PROVENANCE_SEAL_FIELDS = frozenset({
+    "contract",
+    "schema_version",
+    "fields",
+    "hermes_source_sha",
+    "install_archive_sha256",
+    "provenance_sha256",
+    "entry_count",
+    "locked_package_count",
+    "installed_distribution_count",
+})
 PUBLISHER_PROBE_CONTRACT = "radulator.publisher_runtime_preflight.v1"
 OFFICIAL_RUNTIME_SOURCE_REPOSITORY = "astral-sh/python-build-standalone"
 OFFICIAL_RUNTIME_RELEASE_TAG = "20260602"
@@ -942,23 +969,11 @@ def _read_hermes_install_provenance(
         value = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Hermes install provenance manifest is invalid JSON") from exc
-    legacy_required = {
-        "contract",
-        "schema_version",
-        "builder_contract",
-        "hermes_source_sha",
-        "hermes_source_tree_sha",
-        "pyproject_sha256",
-        "uv_lock_sha256",
-        "pyproject_lock_sha256",
-        "install_archive_sha256",
-        "entries",
-    }
-    modern_required = legacy_required | {
-        "first_party_git_archive_sha256", "locked_packages", "installed_distributions", "installer"
-    }
-    if not isinstance(value, dict) or (set(value) != legacy_required and set(value) != modern_required):
-        raise ValueError("Hermes install provenance fields are not exact")
+    if not isinstance(value, dict) or set(value) != HERMES_INSTALL_PROVENANCE_FIELDS:
+        raise ValueError(
+            "Hermes install provenance must use the modern source-derived schema; "
+            "legacy provenance requires migration"
+        )
     if value.get("contract") != HERMES_INSTALL_PROVENANCE_CONTRACT or value.get("schema_version") != 1:
         raise ValueError("Hermes install provenance contract is unsupported")
     if value.get("builder_contract") != HERMES_INSTALL_BUILDER_CONTRACT:
@@ -975,51 +990,50 @@ def _read_hermes_install_provenance(
     _validated_hex_sha(value.get("uv_lock_sha256"), field="Hermes uv.lock SHA256", length=64)
     if value.get("install_archive_sha256") != expected_archive_sha256:
         raise ValueError("Hermes install provenance archive SHA differs from the staged archive")
-    if set(value) == modern_required:
-        _validated_hex_sha(
-            value.get("first_party_git_archive_sha256"),
-            field="Hermes first-party Git archive SHA256",
-            length=64,
+    _validated_hex_sha(
+        value.get("first_party_git_archive_sha256"),
+        field="Hermes first-party Git archive SHA256",
+        length=64,
+    )
+    locked = value.get("locked_packages")
+    if not isinstance(locked, list) or len(locked) < 2:
+        raise ValueError("Hermes install provenance lock closure is incomplete")
+    previous_lock_key: tuple[str, str] | None = None
+    for package in locked:
+        if not isinstance(package, dict) or set(package) != {"name", "version", "source", "artifacts"}:
+            raise ValueError("Hermes install provenance lock record is malformed")
+        name, version, source, artifacts = (
+            package.get("name"), package.get("version"), package.get("source"), package.get("artifacts")
         )
-        locked = value.get("locked_packages")
-        if not isinstance(locked, list) or len(locked) < 2:
-            raise ValueError("Hermes install provenance lock closure is incomplete")
-        previous_lock_key: tuple[str, str] | None = None
-        for package in locked:
-            if not isinstance(package, dict) or set(package) != {"name", "version", "source", "artifacts"}:
-                raise ValueError("Hermes install provenance lock record is malformed")
-            name, version, source, artifacts = (
-                package.get("name"), package.get("version"), package.get("source"), package.get("artifacts")
-            )
-            if not isinstance(name, str) or not isinstance(version, str) or not isinstance(source, dict) or not isinstance(artifacts, list) or not artifacts:
-                raise ValueError("Hermes install provenance lock record is incomplete")
-            lock_key = (name.lower().replace("_", "-").replace(".", "-"), version)
-            if previous_lock_key is not None and lock_key < previous_lock_key:
-                raise ValueError("Hermes install provenance lock records are not ordered")
-            previous_lock_key = lock_key
-            previous_artifact: tuple[str, str] | None = None
-            for artifact in artifacts:
-                if not isinstance(artifact, dict) or set(artifact) != {"url", "sha256", "size"}:
-                    raise ValueError("Hermes install provenance artifact record is malformed")
-                if not isinstance(artifact.get("url"), str) or not isinstance(artifact.get("size"), int) or int(artifact["size"]) <= 0:
-                    raise ValueError("Hermes install provenance artifact record is incomplete")
-                digest = _validated_hex_sha(artifact.get("sha256"), field="Hermes locked artifact SHA256", length=64)
-                artifact_key = (str(artifact["url"]), digest)
-                if previous_artifact is not None and artifact_key < previous_artifact:
-                    raise ValueError("Hermes install provenance artifacts are not ordered")
-                previous_artifact = artifact_key
-        installed = value.get("installed_distributions")
-        if not isinstance(installed, list) or not installed:
-            raise ValueError("Hermes install provenance has no installed distributions")
-        for distribution in installed:
-            if not isinstance(distribution, dict) or set(distribution) != {"name", "version", "record"}:
-                raise ValueError("Hermes installed distribution record is malformed")
-            if not all(isinstance(distribution.get(key), str) and distribution[key] for key in ("name", "version", "record")):
-                raise ValueError("Hermes installed distribution record is incomplete")
-            _archive_relative_name(str(distribution["record"]))
-        installer = value.get("installer")
-        if not isinstance(installer, dict) or set(installer) != {"name", "contract", "python"} or installer.get("name") != "uv" or installer.get("contract") != "sync --frozen --no-dev --no-editable":
-            raise ValueError("Hermes install provenance installer is not the reviewed locked build")
+        if not isinstance(name, str) or not isinstance(version, str) or not isinstance(source, dict) or not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("Hermes install provenance lock record is incomplete")
+        lock_key = (name.lower().replace("_", "-").replace(".", "-"), version)
+        if previous_lock_key is not None and lock_key < previous_lock_key:
+            raise ValueError("Hermes install provenance lock records are not ordered")
+        previous_lock_key = lock_key
+        previous_artifact: tuple[str, str] | None = None
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or set(artifact) != {"url", "sha256", "size"}:
+                raise ValueError("Hermes install provenance artifact record is malformed")
+            if not isinstance(artifact.get("url"), str) or isinstance(artifact.get("size"), bool) or not isinstance(artifact.get("size"), int) or int(artifact["size"]) <= 0:
+                raise ValueError("Hermes install provenance artifact record is incomplete")
+            digest = _validated_hex_sha(artifact.get("sha256"), field="Hermes locked artifact SHA256", length=64)
+            artifact_key = (str(artifact["url"]), digest)
+            if previous_artifact is not None and artifact_key < previous_artifact:
+                raise ValueError("Hermes install provenance artifacts are not ordered")
+            previous_artifact = artifact_key
+    installed = value.get("installed_distributions")
+    if not isinstance(installed, list) or not installed:
+        raise ValueError("Hermes install provenance has no installed distributions")
+    for distribution in installed:
+        if not isinstance(distribution, dict) or set(distribution) != {"name", "version", "record"}:
+            raise ValueError("Hermes installed distribution record is malformed")
+        if not all(isinstance(distribution.get(key), str) and distribution[key] for key in ("name", "version", "record")):
+            raise ValueError("Hermes installed distribution record is incomplete")
+        _archive_relative_name(str(distribution["record"]))
+    installer = value.get("installer")
+    if not isinstance(installer, dict) or set(installer) != {"name", "contract", "python"} or installer.get("name") != "uv" or installer.get("contract") != "sync --frozen --no-dev --no-editable":
+        raise ValueError("Hermes install provenance installer is not the reviewed locked build")
     entries = value.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("Hermes install provenance entry set is empty")
@@ -1118,6 +1132,8 @@ def _validate_hermes_install_closure(
             "hermes_cli/kanban_broker_service.py",
             "hermes_cli/kanban_broker_worker.py",
             "hermes_cli/kanban_dedicated_broker.py",
+            "hermes_constants.py",
+            "utils.py",
         },
         role="Hermes install",
     )
@@ -1147,6 +1163,8 @@ def _validate_hermes_install_closure(
             "hermes_cli/kanban_broker_client.py", "hermes_cli/kanban_broker_install.py",
             "hermes_cli/kanban_broker_protocol.py", "hermes_cli/kanban_broker_service.py",
             "hermes_cli/kanban_broker_worker.py", "hermes_cli/kanban_dedicated_broker.py",
+            "hermes_constants.py",
+            "utils.py",
         }:
             try:
                 tree = ast.parse(content.decode("utf-8"), filename=str(entry["path"]))
@@ -1379,15 +1397,14 @@ def _validate_hermes_source_provenance(
     lock_digest = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
     if provenance.get("pyproject_lock_sha256") != lock_digest:
         raise ValueError("Hermes pyproject/lock digest differs from the checkout")
-    if "locked_packages" in provenance:
-        locked = _locked_uv_packages(uv_lock)
-        if provenance.get("locked_packages") != locked:
-            raise ValueError("Hermes install provenance lock records differ from uv.lock")
-        _archive_bytes, _first_party_files = _git_archive_hermes_cli(
-            source, expected=expected, git=git
-        )
-        if provenance.get("first_party_git_archive_sha256") != hashlib.sha256(_archive_bytes).hexdigest():
-            raise ValueError("Hermes first-party install bytes differ from the reviewed Git archive")
+    locked = _locked_uv_packages(uv_lock)
+    if provenance.get("locked_packages") != locked:
+        raise ValueError("Hermes install provenance lock records differ from uv.lock")
+    _archive_bytes, _first_party_files = _git_archive_hermes_cli(
+        source, expected=expected, git=git
+    )
+    if provenance.get("first_party_git_archive_sha256") != hashlib.sha256(_archive_bytes).hexdigest():
+        raise ValueError("Hermes first-party install bytes differ from the reviewed Git archive")
 
 
 def render_sealed_runtime_plan(
@@ -4457,7 +4474,10 @@ def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
 def _git_archive_hermes_cli(source: Path, *, expected: str, git: Path) -> tuple[bytes, dict[str, bytes]]:
     """Read first-party bytes from the exact Git commit; never from install_root."""
     result = subprocess.run(
-        [str(git), "-C", str(source), "archive", "--format=tar", expected, "--", "hermes_cli"],
+        [
+            str(git), "-C", str(source), "archive", "--format=tar", expected,
+            "--", "hermes_cli", "hermes_constants.py", "utils.py",
+        ],
         check=False, capture_output=True, timeout=30, env=_git_command_environment(),
     )
     if result.returncode != 0 or not result.stdout:
@@ -4469,7 +4489,7 @@ def _git_archive_hermes_cli(source: Path, *, expected: str, git: Path) -> tuple[
                 raw = member.name.rstrip("/") if member.isdir() else member.name
                 if raw == "hermes_cli":
                     continue
-                if not raw.startswith("hermes_cli/"):
+                if raw not in {"hermes_constants.py", "utils.py"} and not raw.startswith("hermes_cli/"):
                     raise ValueError("Hermes Git archive contains an unexpected path")
                 relative = _archive_relative_name(raw)
                 if member.isdir():
@@ -4691,7 +4711,14 @@ def build_hermes_install_archive(
             raise ValueError("Hermes install closure path is unsafe")
         info = item.lstat()
         path_value = relative.as_posix()
-        origin = "first-party" if path_value == "hermes_cli" or path_value.startswith("hermes_cli/") else "dependency"
+        origin = (
+            "first-party"
+            if path_value == "hermes_cli"
+            or path_value.startswith("hermes_cli/")
+            or path_value == "hermes_constants.py"
+            or path_value == "utils.py"
+            else "dependency"
+        )
         mode = stat.S_IMODE(info.st_mode)
         if stat.S_ISDIR(info.st_mode):
             if mode != 0o555:
@@ -5824,11 +5851,22 @@ def render_broker_installation_plan(
         },
     }
     runtime_attestation_bytes = _json_artifact_bytes(runtime_attestation)
-    provenance_bytes, _provenance_info = _read_sealed_file_bytes(
+    provenance_bytes, provenance_info = _read_sealed_file_bytes(
         Path(hermes_install_provenance_path),
         max_bytes=_MAX_RUNTIME_FILE_BYTES,
         expected_sha256=hermes_install_provenance_sha256,
     )
+    try:
+        provenance_document = json.loads(provenance_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Hermes install provenance manifest is invalid JSON") from exc
+    if (
+        not isinstance(provenance_document, dict)
+        or set(provenance_document) != HERMES_INSTALL_PROVENANCE_FIELDS
+    ):
+        raise ValueError("Hermes install provenance must use the modern source-derived schema")
+    if provenance_info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(provenance_info.st_mode) not in {0o444, 0o600, 0o644}:
+        raise ValueError("Hermes install provenance manifest ownership or mode is unsafe")
     # Keys are generated once during rendering and carried only by the
     # root-owned payload manifest.  They are never printed by the CLI.
     payload_bytes: dict[str, bytes] = {}
@@ -5843,8 +5881,7 @@ def render_broker_installation_plan(
         str(remote_policy_path): _json_artifact_bytes(remote_policy),
         str(registration_path): _json_artifact_bytes(registration),
         str(runtime_manifest_path): runtime_manifest_bytes,
-        str(runtime_attestation_path): runtime_attestation_bytes,
-        str(runtime_hermes_provenance_path): provenance_bytes,
+            str(runtime_attestation_path): runtime_attestation_bytes,
         str(runtime_publisher_probe_path): _read_sealed_file_bytes(
             Path(publisher_probe_path),
             max_bytes=_MAX_RUNTIME_FILE_BYTES,
@@ -5977,7 +6014,7 @@ def render_broker_installation_plan(
     for item in filesystem_plan["files"]:
         path = str(item["path"])
         content = payload_bytes.get(path)
-        if content is None and str(item.get("kind")) == "runtime_archive":
+        if content is None and str(item.get("kind")) in {"runtime_archive", "hermes_install_provenance"}:
             content = b""
         if content is None:
             raise ValueError(f"filesystem plan payload is missing for {path}")
@@ -5997,15 +6034,36 @@ def render_broker_installation_plan(
             "sha256": str(hermes_install_archive_sha256),
             "size": int(sealed_runtime["archives"][1]["size"]),
         },
+        {
+            "path": str(runtime_hermes_provenance_path),
+            "source_path": str(hermes_install_provenance_path),
+            "sha256": str(hermes_install_provenance_sha256),
+            "size": len(provenance_bytes),
+        },
     ]
     for item in filesystem_plan["files"]:
-        if item.get("kind") == "runtime_archive":
+        if item.get("kind") in {"runtime_archive", "hermes_install_provenance"}:
             external = next(ref for ref in external_payloads if ref["path"] == item["path"])
             item["sha256"] = str(external["sha256"])
             item["size"] = int(external["size"])
     payload_manifest = {
         "contract": ASSET_PAYLOAD_CONTRACT,
         "schema_version": 1,
+        # Keep the complete provenance as a bounded external payload.  This
+        # compact seal record lets root sealing bind the exact modern schema
+        # without duplicating a multi-megabyte recursive entry list in capped
+        # payloads.json.
+        "hermes_install_provenance": {
+            "contract": HERMES_INSTALL_PROVENANCE_CONTRACT,
+            "schema_version": 1,
+            "fields": sorted(HERMES_INSTALL_PROVENANCE_FIELDS),
+            "hermes_source_sha": str(provenance_document["hermes_source_sha"]),
+            "install_archive_sha256": str(provenance_document["install_archive_sha256"]),
+            "provenance_sha256": str(hermes_install_provenance_sha256),
+            "entry_count": len(provenance_document["entries"]),
+            "locked_package_count": len(provenance_document["locked_packages"]),
+            "installed_distribution_count": len(provenance_document["installed_distributions"]),
+        },
         "files": [
             {
                 "path": str(item["path"]),
@@ -6018,7 +6076,7 @@ def render_broker_installation_plan(
         "payloads": {
             path: base64.b64encode(payload_bytes[path]).decode("ascii")
             for path in sorted(payload_bytes)
-            if any(str(item["path"]) == path and item.get("kind") != "runtime_archive"
+            if any(str(item["path"]) == path and item.get("kind") not in {"runtime_archive", "hermes_install_provenance"}
                    for item in filesystem_plan["files"])
         },
         "external_payloads": external_payloads,
@@ -6394,7 +6452,9 @@ def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bo
         "  trusted_publisher_enabled: ": "true" if enabled else "false",
     }
     seen: set[str] = set()
-    result: list[str] = []
+    # Retain the YAML document's root key while replacing only the two
+    # activation flags below it.
+    result: list[str] = [lines[0]]
     for line in lines[1:]:
         newline = "\n" if line.endswith("\n") else ""
         body = line[:-1] if newline else line
@@ -6877,6 +6937,17 @@ def seal_broker_installation_plan(*, input_root: Path, output_root: Path) -> dic
         contract=ASSET_PAYLOAD_CONTRACT,
         allow_unprivileged_owner=True,
     )
+    embedded_provenance = payloads.get("hermes_install_provenance")
+    if (
+        not isinstance(embedded_provenance, dict)
+        or set(embedded_provenance) != HERMES_INSTALL_PROVENANCE_SEAL_FIELDS
+        or embedded_provenance.get("contract") != HERMES_INSTALL_PROVENANCE_CONTRACT
+        or embedded_provenance.get("schema_version") != 1
+        or embedded_provenance.get("fields") != sorted(HERMES_INSTALL_PROVENANCE_FIELDS)
+    ):
+        raise ValueError(
+            "offline plan is missing the complete modern Hermes provenance contract"
+        )
     outer = {
         "contract": BROKER_INSTALL_PLAN_CONTRACT,
         "schema_version": 1,

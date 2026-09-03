@@ -5021,12 +5021,13 @@ def test_broker_seatbelt_profile_denies_inet_but_allows_unix_socket(tmp_path):
         workspace_root=workspace,
         socket_dir=tmp_path,
     )
+    python_executable = sys.executable
     inet = subprocess.run(
         [
             "sandbox-exec",
             "-p",
             profile,
-            ".venv/bin/python",
+            python_executable,
             "-c",
             "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('127.0.0.1', 0))",
         ],
@@ -5041,7 +5042,7 @@ def test_broker_seatbelt_profile_denies_inet_but_allows_unix_socket(tmp_path):
             "sandbox-exec",
             "-p",
             profile,
-            ".venv/bin/python",
+            python_executable,
             "-c",
             "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
         ],

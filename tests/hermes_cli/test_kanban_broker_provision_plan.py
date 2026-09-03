@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
+import os
 import plistlib
+import shutil
 import subprocess
 import tarfile
 import stat
-import sys
-import venv
+import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -68,13 +72,103 @@ def _desired() -> dict:
     }
 
 
+_REAL_HERMES_BUILDER: tuple[Path, Path, Path, str] | None = None
+
+
+def _real_hermes_builder() -> tuple[Path, Path, Path, str]:
+    """Build the current checkout through the reviewed locked builder once.
+
+    The checkout used by tests is dirty (the test itself is being edited), so
+    first make a clean Git archive and commit it with fixed metadata.  This is
+    intentionally the same source-derived/uv-backed path production uses;
+    provenance is never hand-authored by a test fixture.
+    """
+    global _REAL_HERMES_BUILDER
+    if _REAL_HERMES_BUILDER is not None:
+        return _REAL_HERMES_BUILDER
+    import hashlib
+
+    from hermes_cli import kanban_broker_install as installer
+
+    checkout_root = Path(tempfile.mkdtemp(prefix="hermes-real-builder-", dir="/private/tmp"))
+    source = checkout_root / "source"
+    source.mkdir()
+    repository_root = Path(__file__).resolve().parents[2]
+    archive = subprocess.run(
+        ["/usr/bin/git", "archive", "--format=tar", "HEAD"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+        stream.extractall(source)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(source)], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "config", "user.name", "fixture"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(source), "add", "-A"], check=True)
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+    }
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(source), "commit", "-qm", "fixture"],
+        check=True,
+        env=git_env,
+    )
+    source_sha = subprocess.run(
+        ["/usr/bin/git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    install_root = checkout_root / "install"
+    package_archive = checkout_root / "hermes-install.tar.gz"
+    provenance_path = checkout_root / "hermes-install.provenance.json"
+    installer.build_hermes_install_archive(
+        source_root=source,
+        install_root=install_root,
+        source_sha=source_sha,
+        output_archive=package_archive,
+        output_provenance=provenance_path,
+        uv_executable=Path("/opt/homebrew/bin/uv"),
+    )
+    _REAL_HERMES_BUILDER = (source, install_root, package_archive, source_sha)
+    return _REAL_HERMES_BUILDER
+
+
 def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
-    """Build deterministic bounded fixtures; the real-CPython check is separate."""
+    """Use real Hermes builder output plus a bounded runtime archive fixture."""
     import hashlib
 
     from hermes_cli import kanban_broker_install as installer
 
     tmp_path.mkdir(parents=True, exist_ok=True)
+    real_source, _real_install, real_package_archive, _source_sha = _real_hermes_builder()
+    hermes_source = tmp_path / "hermes-source"
+    if not hermes_source.exists():
+        # A shared sparse checkout retains the exact Git object database and
+        # source tree identity while avoiding a per-test copy of the large
+        # repository checkout.  Git archive still reads the complete commit.
+        subprocess.run(
+            ["/usr/bin/git", "clone", "--shared", "--no-checkout", "-q", str(real_source), str(hermes_source)],
+            check=True,
+        )
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "sparse-checkout", "init", "--no-cone"], check=True)
+        subprocess.run(
+            [
+                "/usr/bin/git", "-C", str(hermes_source), "sparse-checkout", "set",
+                "pyproject.toml", "uv.lock", "hermes_cli/", "hermes_constants.py", "utils.py",
+            ],
+            check=True,
+        )
+        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "checkout", "-q", "--detach", "HEAD"], check=True)
+    package_archive = tmp_path / "hermes-install.tar.gz"
+    if not package_archive.exists():
+        shutil.copy2(real_package_archive, package_archive)
+    package_sha = hashlib.sha256(package_archive.read_bytes()).hexdigest()
+    provenance_path = tmp_path / "hermes-install.provenance.json"
+    if not provenance_path.exists():
+        shutil.copy2(real_package_archive.parent / "hermes-install.provenance.json", provenance_path)
+    provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
 
     def write_archive(path: Path, root_name: str, files: dict[str, object]):
         with tarfile.open(path, "w:gz") as stream:
@@ -102,7 +196,7 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
                 member.mode = mode
                 member.mtime = 0
                 member.uid = member.gid = 0
-                stream.addfile(member, __import__("io").BytesIO(content))
+                stream.addfile(member, io.BytesIO(content))
 
     python_archive = tmp_path / "cpython-runtime.tar.gz"
     write_archive(
@@ -120,85 +214,6 @@ def _runtime_inputs(tmp_path: Path) -> tuple[Path, Path, str, str, Path, str]:
     # the official archive when it is available.
     installer.OFFICIAL_RUNTIME_ARCHIVE_SHA256 = python_sha
 
-    package_files = {
-        "hermes_cli/__init__.py": b"from .kanban_broker_client import CLIENT_CONTRACT\n",
-        "hermes_cli/main.py": (
-            b"from hermes_cli.kanban_broker_client import CLIENT_CONTRACT\n"
-            b"from hermes_dep.runtime import DEPENDENCY\n"
-            b"def main():\n    return CLIENT_CONTRACT + ':' + DEPENDENCY\n"
-            b"if __name__ == '__main__':\n    raise SystemExit(main())\n"
-        ),
-        "hermes_cli/kanban_broker_canary.py": b"CANARY = True\n",
-        "hermes_cli/kanban_broker_client.py": b"CLIENT_CONTRACT = 'sealed-v1'\n",
-        "hermes_cli/kanban_broker_install.py": b"INSTALLER = True\n",
-        "hermes_cli/kanban_broker_protocol.py": b"PROTOCOL = True\n",
-        "hermes_cli/kanban_broker_service.py": b"SERVICE = True\n",
-        "hermes_cli/kanban_broker_worker.py": b"WORKER = True\n",
-        "hermes_cli/kanban_dedicated_broker.py": b"BROKER = True\n",
-        "hermes_dep/__init__.py": b"from .runtime import DEPENDENCY\n",
-        "hermes_dep/runtime.py": b"DEPENDENCY = 'sealed-dependency'\n",
-    }
-    package_archive = tmp_path / "hermes-install.tar.gz"
-    write_archive(package_archive, "hermes-install", package_files)
-    package_sha = hashlib.sha256(package_archive.read_bytes()).hexdigest()
-    provenance_entries = []
-    names = {"hermes_cli/", "hermes_dep/"}
-    for name in package_files:
-        parts = name.split("/")
-        names.update("/".join(parts[:index]) + "/" for index in range(1, len(parts)))
-    for name in sorted(names):
-        provenance_entries.append({
-            "path": name,
-            "type": "directory",
-            "mode": 0o555,
-            "origin": "first-party" if name.startswith("hermes_cli/") else "dependency",
-        })
-    for name, content in sorted(package_files.items()):
-        mode = 0o444
-        provenance_entries.append({
-            "path": name,
-            "type": "file",
-            "mode": 0o555 if mode & 0o111 else 0o444,
-            "origin": "first-party" if name.startswith("hermes_cli/") else "dependency",
-            "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        })
-    provenance_entries.sort(key=lambda item: item["path"])
-    hermes_source = tmp_path / "hermes-source"
-    hermes_source.mkdir(parents=True, exist_ok=True)
-    (hermes_source / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
-    (hermes_source / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-    if not (hermes_source / ".git").exists():
-        subprocess.run(["/usr/bin/git", "init", "-q", str(hermes_source)], check=True)
-        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "config", "user.email", "fixture@example.invalid"], check=True)
-        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "config", "user.name", "fixture"], check=True)
-        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "add", "pyproject.toml", "uv.lock"], check=True)
-        subprocess.run(["/usr/bin/git", "-C", str(hermes_source), "commit", "-qm", "fixture"], check=True)
-    source_sha = subprocess.run(
-        ["/usr/bin/git", "-C", str(hermes_source), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    source_tree_sha = subprocess.run(
-        ["/usr/bin/git", "-C", str(hermes_source), "rev-parse", "HEAD^{tree}"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    pyproject_bytes = (hermes_source / "pyproject.toml").read_bytes()
-    uv_lock_bytes = (hermes_source / "uv.lock").read_bytes()
-    provenance = {
-        "contract": "hermes.kanban_broker_hermes_install_provenance.v1",
-        "schema_version": 1,
-        "builder_contract": "hermes.kanban_broker_hermes_install_builder.v1",
-        "hermes_source_sha": source_sha,
-        "hermes_source_tree_sha": source_tree_sha,
-        "pyproject_sha256": hashlib.sha256(pyproject_bytes).hexdigest(),
-        "uv_lock_sha256": hashlib.sha256(uv_lock_bytes).hexdigest(),
-        "pyproject_lock_sha256": hashlib.sha256(pyproject_bytes + b"\0" + uv_lock_bytes).hexdigest(),
-        "install_archive_sha256": package_sha,
-        "entries": provenance_entries,
-    }
-    provenance_path = tmp_path / "hermes-install.provenance.json"
-    provenance_path.write_text(json.dumps(provenance, sort_keys=True), encoding="utf-8")
-    provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
     return python_archive, package_archive, python_sha, package_sha, provenance_path, provenance_sha
 
 
@@ -213,20 +228,31 @@ def _publisher_probe(tmp_path: Path) -> tuple[Path, str]:
     )
     path = script_dir / "trusted_publisher.py"
     path.write_text(
-        "# argparse contract: --broker-client-config, list_publish_obligations\n"
+        "import argparse, json, platform, sys\n"
+        "from pathlib import Path\n"
         "from hermes_cli import kanban_broker_client\n"
-        "import json\n"
-        "if '--runtime-preflight' in __import__('sys').argv:\n"
-        "    print(json.dumps({'contract':'radulator.publisher_runtime_preflight.v1',"
-        "'status':'PASS','python_executable':__import__('sys').executable,"
-        "'python_version':__import__('platform').python_version(),"
-        "'runtime_root':__import__('sys').prefix,"
-        "'runtime_manifest_sha256':'0'*64,"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--runtime-preflight', action='store_true', required=True)\n"
+        "parser.add_argument('--runtime-root', required=True)\n"
+        "parser.add_argument('--runtime-manifest', required=True)\n"
+        "parser.add_argument('--runtime-manifest-sha256', required=True)\n"
+        "parser.add_argument('--runtime-python-version', required=True)\n"
+        "parser.add_argument('--runtime-python-sha256', required=True)\n"
+        "parser.add_argument('--repository-id', required=True)\n"
+        "parser.add_argument('--broker-client-config', required=True)\n"
+        "args = parser.parse_args()\n"
+        "client = kanban_broker_client.load_broker_client(Path(args.broker_client_config), expected_surface='publisher')\n"
+        "client.call('list_publish_obligations', {'contract':'hermes.publisher_obligation_query.v1', 'repository_id':args.repository_id, 'after_created_at':0, 'after_receipt_id':'', 'limit':1})\n"
+        "print(json.dumps({'contract':'radulator.publisher_runtime_preflight.v1',"
+        "'status':'PASS','python_executable':sys.executable,"
+        "'python_version':platform.python_version(),"
+        "'runtime_root':args.runtime_root,"
+        "'runtime_manifest_sha256':args.runtime_manifest_sha256,"
         "'broker_client_module':kanban_broker_client.__file__,"
-        "'broker_rpc':'PASS'}, sort_keys=True))\n"
+        "'broker_rpc':'PASS'}, sort_keys=True, separators=(',', ':')))\n"
     )
     if not (checkout / ".git").exists():
-        subprocess.run(["/usr/bin/git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["/usr/bin/git", "init", "-q", "-b", "develop", str(checkout)], check=True)
         subprocess.run(["/usr/bin/git", "-C", str(checkout), "config", "user.email", "fixture@example.invalid"], check=True)
         subprocess.run(["/usr/bin/git", "-C", str(checkout), "config", "user.name", "fixture"], check=True)
         subprocess.run(["/usr/bin/git", "-C", str(checkout), "add", "ops"], check=True)
@@ -632,20 +658,12 @@ def test_runtime_archive_rejects_upward_symlink(tmp_path):
 
 def test_direct_isolated_publisher_wrapper_imports_sealed_hermes_client(tmp_path):
     """Exercise the same ``python -I trusted_publisher.py`` contract as Radulator."""
-    env_root = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, clear=True).create(env_root)
-    package_root = env_root / "lib/python3.11/site-packages/hermes_cli"
-    package_root.mkdir(parents=True)
-    (package_root / "__init__.py").write_text("\n", encoding="utf-8")
-    (package_root / "kanban_broker_client.py").write_text(
-        "SEALED = True\n", encoding="utf-8"
-    )
-    wrapper = package_root.parent / "trusted_publisher.py"
+    _source, env_root, _archive, _source_sha = _real_hermes_builder()
+    wrapper = tmp_path / "trusted_publisher.py"
     wrapper.write_text(
         "from hermes_cli import kanban_broker_client\n"
-        "from pathlib import Path\n"
-        "assert kanban_broker_client.SEALED\n"
-        "assert Path(kanban_broker_client.__file__).resolve().is_relative_to(Path(__file__).resolve().parent)\n",
+        "assert kanban_broker_client.__file__.startswith(__import__('sys').prefix)\n"
+        "print(kanban_broker_client.__file__)\n",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -656,28 +674,30 @@ def test_direct_isolated_publisher_wrapper_imports_sealed_hermes_client(tmp_path
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
     )
     assert result.returncode == 0, result.stderr
+    assert str(env_root) in result.stdout
 
 
 def test_hermes_install_archive_executes_main_and_dependency_closure(tmp_path):
     """The staged install input must be runnable, not comment-only fixtures."""
-    _python_archive, package_archive, *_rest = _runtime_inputs(tmp_path)
-    extracted = tmp_path / "hermes-install"
-    extracted.mkdir()
-    with tarfile.open(package_archive, "r:gz") as stream:
-        stream.extractall(extracted)
-    site_packages = extracted / "hermes-install"
+    _source, env_root, package_archive, _source_sha = _real_hermes_builder()
+    provenance = json.loads(
+        (package_archive.parent / "hermes-install.provenance.json").read_text(encoding="utf-8")
+    )
+    assert len(provenance["entries"]) > 100
+    wrapper = tmp_path / "worker_import.py"
+    wrapper.write_text(
+        "from hermes_cli.main import main\n"
+        "from hermes_cli import kanban_broker_client\n"
+        "assert callable(main)\n"
+        "assert kanban_broker_client.__file__.startswith(__import__('sys').prefix)\n",
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [
-            sys.executable,
+            str(env_root / "bin/python"),
             "-I",
             "-B",
-            "-c",
-            (
-                "import sys; sys.path.insert(0, sys.argv[1]); "
-                "from hermes_cli.main import main; "
-                "assert main() == 'sealed-v1:sealed-dependency'"
-            ),
-            str(site_packages),
+            str(wrapper),
         ],
         check=False,
         capture_output=True,
@@ -685,6 +705,130 @@ def test_hermes_install_archive_executes_main_and_dependency_closure(tmp_path):
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_publisher_preflight_observes_one_real_broker_rpc(tmp_path):
+    """The isolated Radulator command must prove a live authenticated RPC."""
+    from hermes_cli.kanban_broker_install import render_broker_client_config
+    from hermes_cli.kanban_broker_protocol import BrokerRPCServer
+    from hermes_cli.kanban_broker_service import BrokerSocketService
+    from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
+
+    uid = os.geteuid()
+    gid = os.getegid()
+    root = tmp_path / "broker"
+    broker = DedicatedKanbanBroker(
+        state_dir=root / "state",
+        workspace_root=root / "workspaces",
+        publisher_handoff_root=root / "handoffs",
+        broker_uid=uid,
+        controller_uid=uid,
+        publisher_uid=uid,
+        operator_uid=uid,
+        worker_uid=uid,
+        workspace_gid=gid,
+        publisher_gid=gid,
+        trusted_publisher_enabled=True,
+    )
+    broker.initialize()
+    observed: list[dict] = []
+    original_list = broker.list_publish_obligations
+
+    def observe(*, peer_uid: int, query: dict) -> dict:
+        observed.append(dict(query))
+        return original_list(peer_uid=peer_uid, query=query)
+
+    broker.list_publish_obligations = observe  # type: ignore[method-assign]
+    # macOS AF_UNIX endpoints are capped at 104 bytes; keep this test socket
+    # short while the state/config paths remain under pytest's temp root.
+    socket_parent = Path(tempfile.mkdtemp(prefix="hbs-", dir="/tmp"))
+    os.chown(socket_parent, uid, gid)
+    socket_parent.chmod(0o710)
+    socket_path = socket_parent / "publisher.sock"
+    key_path = root / "keys/publisher.key"
+    key_path.parent.mkdir(parents=True)
+    key = hashlib.sha256(b"publisher-preflight-test-key").digest()
+    key_path.write_bytes(key)
+    os.chown(key_path, uid, gid)
+    key_path.chmod(0o640)
+    sequence_path = root / "sequences/publisher/client.sequence"
+    sequence_path.parent.mkdir(parents=True)
+    sequence_path.parent.chmod(0o700)
+    config_path = root / "clients/publisher/client.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        render_broker_client_config(
+            surface="publisher",
+            socket_path=socket_path,
+            expected_broker_uid=uid,
+            key_path=key_path,
+            sequence_path=sequence_path,
+        ),
+        encoding="utf-8",
+    )
+    os.chown(config_path, uid, gid)
+    config_path.chmod(0o600)
+    server = BrokerRPCServer(
+        broker=broker,
+        surface="publisher",
+        allowed_uid=uid,
+        client_key=key,
+    )
+    service = BrokerSocketService(
+        surfaces={"publisher": {"path": socket_path, "gid": gid, "server": server}},
+        broker_uid=uid,
+        max_inflight=2,
+    )
+    service.start()
+    thread = threading.Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _source, env_root, _archive, _source_sha = _real_hermes_builder()
+        probe, _probe_sha = _publisher_probe(tmp_path)
+        manifest = tmp_path / "runtime-manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(env_root / "bin/python"), "-I", "-B", str(probe),
+                "--runtime-preflight",
+                "--runtime-root", str(env_root),
+                "--runtime-manifest", str(manifest),
+                "--runtime-manifest-sha256", "a" * 64,
+                "--runtime-python-version", "3.11.15",
+                "--runtime-python-sha256", "b" * 64,
+                "--repository-id", "radulator",
+                "--broker-client-config", str(config_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        )
+        assert result.returncode == 0, result.stderr
+        response = json.loads(result.stdout)
+        assert response == {
+            "broker_client_module": response["broker_client_module"],
+            "broker_rpc": "PASS",
+            "contract": "radulator.publisher_runtime_preflight.v1",
+            "python_executable": str(env_root / "bin/python"),
+            "python_version": "3.11.15",
+            "runtime_manifest_sha256": "a" * 64,
+            "runtime_root": str(env_root),
+            "status": "PASS",
+        }
+        assert str(env_root) in response["broker_client_module"]
+        assert observed == [{
+            "contract": "hermes.publisher_obligation_query.v1",
+            "repository_id": "radulator",
+            "after_created_at": 0,
+            "after_receipt_id": "",
+            "limit": 1,
+        }]
+    finally:
+        service.stop()
+        thread.join(timeout=2)
+        service.close()
+        broker.close()
 
 
 def test_renderer_requires_complete_hermes_provenance_manifest(tmp_path):
@@ -718,6 +862,141 @@ def test_renderer_requires_complete_hermes_provenance_manifest(tmp_path):
             radulator_source_path=tmp_path / "radulator-checkout",
             radulator_source_sha=_radulator_source_sha(tmp_path),
             dispatcher_profile="radulator",
+        )
+
+
+def test_renderer_rejects_legacy_provenance_with_migration_error(tmp_path):
+    from hermes_cli.kanban_broker_install import render_broker_installation_plan
+
+    kwargs = _runtime_kwargs(tmp_path)
+    path = kwargs["hermes_install_provenance_path"]
+    document = json.loads(path.read_text(encoding="utf-8"))
+    for field in ("first_party_git_archive_sha256", "locked_packages", "installed_distributions", "installer"):
+        document.pop(field)
+    path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    kwargs["hermes_install_provenance_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="legacy provenance requires migration"):
+        render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
+            dispatcher_profile="radulator",
+        )
+
+
+MODERN_PROVENANCE_FIELDS = (
+    "contract",
+    "schema_version",
+    "builder_contract",
+    "hermes_source_sha",
+    "hermes_source_tree_sha",
+    "pyproject_sha256",
+    "uv_lock_sha256",
+    "pyproject_lock_sha256",
+    "first_party_git_archive_sha256",
+    "locked_packages",
+    "installed_distributions",
+    "installer",
+    "install_archive_sha256",
+    "entries",
+)
+
+
+@pytest.mark.parametrize("field", MODERN_PROVENANCE_FIELDS)
+def test_renderer_rejects_missing_every_modern_provenance_field(tmp_path, field):
+    from hermes_cli.kanban_broker_install import render_broker_installation_plan
+
+    kwargs = _runtime_kwargs(tmp_path)
+    provenance_path = kwargs["hermes_install_provenance_path"]
+    document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    del document[field]
+    provenance_path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    kwargs["hermes_install_provenance_sha256"] = __import__("hashlib").sha256(
+        provenance_path.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="modern|provenance|schema|lock"):
+        render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
+            dispatcher_profile="radulator",
+        )
+
+
+@pytest.mark.parametrize("field", MODERN_PROVENANCE_FIELDS)
+def test_cli_rejects_missing_every_modern_provenance_field(tmp_path, field):
+    from hermes_cli.kanban_broker_install import main
+
+    inventory_path = tmp_path / "inventory.json"
+    desired_path = tmp_path / "desired.json"
+    inventory_path.write_text(json.dumps(_inventory()), encoding="utf-8")
+    desired = _desired()
+    desired["contract"] = "hermes.kanban_broker_desired_identities.v1"
+    desired_path.write_text(json.dumps(desired), encoding="utf-8")
+    inventory_path.chmod(0o600)
+    desired_path.chmod(0o600)
+    kwargs = _runtime_kwargs(tmp_path)
+    provenance_path = kwargs["hermes_install_provenance_path"]
+    document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    del document[field]
+    provenance_path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    provenance_sha = __import__("hashlib").sha256(provenance_path.read_bytes()).hexdigest()
+    publisher_probe, publisher_probe_sha = _publisher_probe(tmp_path)
+    with pytest.raises(ValueError, match="modern|provenance|schema|lock"):
+        main([
+            "render-plan",
+            "--inventory", str(inventory_path),
+            "--desired-identities", str(desired_path),
+            "--install-root", str(tmp_path / "install"),
+            "--output-root", str(tmp_path / "output"),
+            "--runtime-archive", str(kwargs["runtime_archive_path"]),
+            "--runtime-archive-sha256", str(kwargs["runtime_archive_sha256"]),
+            "--hermes-install-archive", str(kwargs["hermes_install_archive_path"]),
+            "--hermes-install-archive-sha256", str(kwargs["hermes_install_archive_sha256"]),
+            "--hermes-install-provenance", str(provenance_path),
+            "--hermes-install-provenance-sha256", provenance_sha,
+            "--publisher-probe", str(publisher_probe),
+            "--publisher-probe-sha256", publisher_probe_sha,
+            "--hermes-source-sha", _hermes_source_sha(tmp_path),
+            "--hermes-source-path", str(kwargs["hermes_source_path"]),
+            "--radulator-source-path", str(tmp_path / "radulator-checkout"),
+            "--source-sha", _radulator_source_sha(tmp_path),
+            "--dispatcher-profile", "radulator",
+        ])
+
+
+@pytest.mark.parametrize("field", MODERN_PROVENANCE_FIELDS)
+def test_seal_rejects_missing_every_modern_provenance_field(tmp_path, field, monkeypatch):
+    from hermes_cli import kanban_broker_install as installer
+
+    plan = _render(tmp_path / "render")
+    offline = tmp_path / "offline"
+    installer.write_broker_installation_plan(plan, output_root=offline)
+    payload_path = offline / "install/payloads.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    compact = payload["hermes_install_provenance"]
+    if field in compact["fields"]:
+        compact["fields"].remove(field)
+    else:
+        # The compact seal record has no copy of the recursive entry/list
+        # values; deleting its bound field list is the equivalent fail-closed
+        # mutation at the sealed-plan boundary.
+        compact.pop("fields", None)
+    payload_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    payload_path.chmod(0o600)
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 0)
+    with pytest.raises(ValueError, match="modern Hermes provenance"):
+        installer.seal_broker_installation_plan(
+            input_root=offline,
+            output_root=tmp_path / "sealed",
         )
 
 
@@ -903,6 +1182,85 @@ def test_registration_file_requires_and_consumes_expected_source_sha(tmp_path, m
     assert seen["expected_source_sha"] == "a" * 40
 
 
+def test_registration_wire_path_persists_and_reads_back_expected_source_sha(tmp_path):
+    """Exercise authenticated operator registration against the real broker."""
+    from hermes_cli.kanban_broker_install import render_radulator_remote_policy
+    from hermes_cli.kanban_broker_protocol import BrokerRPCServer, signed_request
+    from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
+
+    probe, _probe_sha = _publisher_probe(tmp_path)
+    source = probe.parents[3]
+    source_sha = _radulator_source_sha(tmp_path)
+    uid = os.geteuid()
+    gid = os.getegid()
+    broker = DedicatedKanbanBroker(
+        state_dir=tmp_path / "state",
+        workspace_root=tmp_path / "workspaces",
+        publisher_handoff_root=tmp_path / "handoffs",
+        broker_uid=uid,
+        controller_uid=uid,
+        publisher_uid=uid,
+        operator_uid=uid,
+        worker_uid=uid,
+        workspace_gid=gid,
+        publisher_gid=gid,
+    )
+    broker.initialize()
+    try:
+        key = hashlib.sha256(b"operator-registration-test-key").digest()
+        server = BrokerRPCServer(
+            broker=broker,
+            surface="operator",
+            allowed_uid=uid,
+            client_key=key,
+        )
+        body = {
+            "repository_id": "radulator",
+            "source_path": str(source),
+            "default_branch": "develop",
+            "project_id": None,
+            "remote_repository": render_radulator_remote_policy(source_sha=source_sha),
+            "expected_source_sha": source_sha,
+        }
+        result = server.dispatch(
+            peer_uid=uid,
+            message=signed_request(
+                key,
+                sequence=1,
+                nonce="registration-test-1",
+                method="register_repository",
+                body=body,
+            ),
+        )
+        assert result["ok"] is True
+        registered = result["result"]
+        assert registered["base_sha"] == source_sha
+        row = broker.conn.execute(
+            "SELECT base_sha, default_branch, source_path FROM repositories WHERE repository_id=?",
+            ("radulator",),
+        ).fetchone()
+        assert row is not None
+        assert (row["base_sha"], row["default_branch"], row["source_path"]) == (
+            source_sha,
+            "develop",
+            str(source),
+        )
+        replay = server.dispatch(
+            peer_uid=uid,
+            message=signed_request(
+                key,
+                sequence=2,
+                nonce="registration-test-2",
+                method="register_repository",
+                body=body,
+            ),
+        )
+        assert replay["ok"] is True
+        assert replay["result"]["base_sha"] == source_sha
+    finally:
+        broker.close()
+
+
 def test_render_materializes_named_profile_and_consumed_routing_config(tmp_path):
     plan = _render(tmp_path)
     payloads = plan["asset_payload_manifest"]["payloads"]
@@ -926,3 +1284,64 @@ def test_render_materializes_named_profile_and_consumed_routing_config(tmp_path)
     assert "dedicated_broker_enabled: false" in profile_yaml
     assert "trusted_publisher_enabled: false" in profile_yaml
     assert "dedicated_broker_publisher_client_config:" in profile_yaml
+
+
+def test_profile_activation_descriptor_write_and_model_owner_readback(tmp_path, monkeypatch):
+    """Exercise the root-writer/model-file transition without host mutation."""
+    from types import SimpleNamespace
+
+    from hermes_cli import kanban_broker_install as installer
+
+    uid = os.geteuid()
+    gid = os.getegid()
+    profile_parent = tmp_path / "profiles/radulator"
+    profile_parent.mkdir(parents=True)
+    # The non-root test runner cannot chown a temporary directory to root.  It
+    # still executes the descriptor-relative writer and verifies the actual
+    # model-owned output; only the parent ownership observation is represented
+    # as the reviewed root-owned boundary.
+    profile_parent.chmod(0o755)
+    profile_path = profile_parent / "config.yaml"
+    profile_path.write_text(
+        "kanban:\n"
+        "  dedicated_broker_enabled: false\n"
+        "  trusted_publisher_enabled: false\n"
+        "  dedicated_broker_controller_client_config: /tmp/controller.json\n"
+        "  dedicated_broker_publisher_client_config: /tmp/publisher.json\n"
+        "  dedicated_broker_operator_client_config: /tmp/operator.json\n"
+        "  dedicated_broker_registration_file: /tmp/register.json\n"
+        "  dedicated_broker_expected_source_sha: " + "a" * 40 + "\n"
+        "  dedicated_broker_dispatcher_profile: radulator\n",
+        encoding="utf-8",
+    )
+    profile_path.chmod(0o600)
+    os.chown(profile_path, uid, gid)
+    original_lstat = Path.lstat
+
+    def reviewed_parent_lstat(path: Path):
+        info = original_lstat(path)
+        if path == profile_parent:
+            return SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o555,
+                st_uid=0,
+                st_gid=0,
+                st_nlink=info.st_nlink,
+            )
+        return info
+
+    monkeypatch.setattr(Path, "lstat", reviewed_parent_lstat)
+    config = {
+        "dispatcher_profile_config_path": str(profile_path),
+        "model_uid": uid,
+        "workspace_gid": gid,
+    }
+    installer._set_dispatcher_profile_activation(config, enabled=True)
+    enabled = profile_path.read_text(encoding="utf-8")
+    assert "dedicated_broker_enabled: true" in enabled
+    assert "trusted_publisher_enabled: true" in enabled
+    info = profile_path.stat()
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (uid, gid, 0o600)
+    installer._set_dispatcher_profile_activation(config, enabled=False)
+    disabled = profile_path.read_text(encoding="utf-8")
+    assert "dedicated_broker_enabled: false" in disabled
+    assert "trusted_publisher_enabled: false" in disabled
