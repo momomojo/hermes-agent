@@ -123,13 +123,28 @@ def _real_hermes_builder() -> tuple[Path, Path, Path, str]:
     install_root = checkout_root / "install"
     package_archive = checkout_root / "hermes-install.tar.gz"
     provenance_path = checkout_root / "hermes-install.provenance.json"
+    uv = Path("/opt/homebrew/bin/uv").resolve(strict=True)
+    uv_info = uv.lstat()
+    uv_version = subprocess.run(
+        [str(uv), "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    uv_identity = {
+        "path": str(uv),
+        "uid": uv_info.st_uid,
+        "gid": uv_info.st_gid,
+        "mode": stat.S_IMODE(uv_info.st_mode),
+        "nlink": uv_info.st_nlink,
+        "version": uv_version,
+        "sha256": hashlib.sha256(uv.read_bytes()).hexdigest(),
+    }
     installer.build_hermes_install_archive(
         source_root=source,
         install_root=install_root,
         source_sha=source_sha,
         output_archive=package_archive,
         output_provenance=provenance_path,
-        uv_executable=Path("/opt/homebrew/bin/uv"),
+        uv_executable=uv,
+        uv_identity=uv_identity,
     )
     _REAL_HERMES_BUILDER = (source, install_root, package_archive, source_sha)
     return _REAL_HERMES_BUILDER
@@ -900,6 +915,7 @@ MODERN_PROVENANCE_FIELDS = (
     "first_party_git_archive_sha256",
     "locked_packages",
     "installed_distributions",
+    "uv_identity",
     "installer",
     "install_archive_sha256",
     "entries",
@@ -1117,6 +1133,142 @@ def test_hermes_install_builder_rejects_arbitrary_toy_closure(tmp_path):
             output_archive=tmp_path / "closure.tar.gz",
             output_provenance=tmp_path / "closure.provenance.json",
         )
+
+
+def test_hermes_install_provenance_v1_is_rejected_after_contract_upgrade(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    kwargs = _runtime_kwargs(tmp_path)
+    provenance = kwargs["hermes_install_provenance_path"]
+    document = json.loads(provenance.read_text(encoding="utf-8"))
+    document["contract"] = "hermes.kanban_broker_hermes_install_provenance.v1"
+    provenance.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    kwargs["hermes_install_provenance_sha256"] = hashlib.sha256(
+        provenance.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="contract|modern|version"):
+        installer.render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
+            dispatcher_profile="radulator",
+        )
+
+
+def test_renderer_rejects_installed_distribution_not_in_locked_resolution(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    kwargs = _runtime_kwargs(tmp_path)
+    provenance = kwargs["hermes_install_provenance_path"]
+    document = json.loads(provenance.read_text(encoding="utf-8"))
+    document["installed_distributions"].append({
+        "name": "unlocked-malware",
+        "version": "1.0.0",
+        "record": "unlocked_malware-1.0.0.dist-info/RECORD",
+        "artifact": {
+            "url": "https://files.pythonhosted.org/unlocked-malware.whl",
+            "sha256": "a" * 64,
+            "size": 1,
+        },
+    })
+    provenance.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    kwargs["hermes_install_provenance_sha256"] = hashlib.sha256(
+        provenance.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="lock|distribution|closure"):
+        installer.render_broker_installation_plan(
+            host_inventory=_inventory(),
+            desired_identities=_desired(),
+            install_root=tmp_path / "install",
+            **kwargs,
+            hermes_source_sha=_hermes_source_sha(tmp_path),
+            radulator_source_path=tmp_path / "radulator-checkout",
+            radulator_source_sha=_radulator_source_sha(tmp_path),
+            dispatcher_profile="radulator",
+        )
+
+
+def test_hermes_builder_requires_pinned_uv_identity(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    source, _env, _archive, source_sha = _real_hermes_builder()
+    fake_uv = tmp_path / "fake-uv"
+    fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_uv.chmod(0o555)
+    uv_identity = {
+        "path": str(fake_uv),
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "mode": 0o555,
+        "nlink": 1,
+        "version": "uv 0.11.5",
+        "sha256": hashlib.sha256(fake_uv.read_bytes()).hexdigest(),
+    }
+    with pytest.raises(ValueError, match="uv.*identity|canonical"):
+        installer.build_hermes_install_archive(
+            source_root=source,
+            install_root=tmp_path / "install",
+            source_sha=source_sha,
+            output_archive=tmp_path / "closure.tar.gz",
+            output_provenance=tmp_path / "closure.provenance.json",
+            uv_executable=fake_uv,
+            uv_identity=uv_identity,
+        )
+
+
+def _record_fixture(tmp_path: Path, record: str) -> Path:
+    site_packages = tmp_path / "env/lib/python3.11/site-packages"
+    dist_info = site_packages / "sample-1.0.dist-info"
+    package = site_packages / "sample"
+    dist_info.mkdir(parents=True)
+    package.mkdir()
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.3\nName: sample\nVersion: 1.0\n\n", encoding="utf-8"
+    )
+    (dist_info / "RECORD").write_text(record, encoding="utf-8")
+    return site_packages
+
+
+def test_installed_distribution_rejects_blank_record_digest(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    site_packages = _record_fixture(
+        tmp_path,
+        "sample/__init__.py,,10\n"
+        "sample-1.0.dist-info/METADATA,,51\n"
+        "sample-1.0.dist-info/RECORD,,\n",
+    )
+    locked = [{
+        "name": "sample",
+        "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [{"url": "https://files.example/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+    }]
+    with pytest.raises(ValueError, match="RECORD|sha256|digest"):
+        installer._verify_installed_distributions(site_packages, locked)
+
+
+def test_installed_distribution_rejects_unrecorded_file(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    site_packages = _record_fixture(
+        tmp_path,
+        "sample-1.0.dist-info/METADATA,,51\n"
+        "sample-1.0.dist-info/RECORD,,\n",
+    )
+    locked = [{
+        "name": "sample",
+        "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [{"url": "https://files.example/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+    }]
+    with pytest.raises(ValueError, match="unrecorded|coverage|RECORD"):
+        installer._verify_installed_distributions(site_packages, locked)
 
 
 def test_radulator_source_replacement_after_commit_is_rejected(tmp_path):
