@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import hashlib
 import io
@@ -92,6 +93,22 @@ def _test_toolchain():
     return trust
 
 
+def _remove_immutable_tree(path: Path) -> None:
+    """Remove a builder staging tree whose sealed closure is 0555/0444.
+
+    The real builder leaves an immutable install tree behind; without this
+    exit hook every test process leaked roughly 250 MB under /private/tmp.
+    """
+    if not path.exists():
+        return
+    for dirpath, _dirnames, _filenames in os.walk(path):
+        try:
+            os.chmod(dirpath, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _fixture_tags() -> list:
     from hermes_cli import kanban_broker_install as installer
 
@@ -172,6 +189,7 @@ def _real_hermes_builder() -> tuple[Path, Path, Path, str]:
     from hermes_cli import kanban_broker_install as installer
 
     checkout_root = Path(tempfile.mkdtemp(prefix="hermes-real-builder-", dir="/private/tmp"))
+    atexit.register(_remove_immutable_tree, checkout_root)
     source = checkout_root / "source"
     source.mkdir()
     repository_root = Path(__file__).resolve().parents[2]
