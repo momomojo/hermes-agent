@@ -602,7 +602,7 @@ def _publisher_runtime_preflight_check(
         window_resp = operator.call(
             "open_publisher_preflight_window", {}
         ) if hasattr(operator, "call") else operator.open_publisher_preflight_window(
-            peer_uid=os.geteuid()
+            peer_uid=os.geteuid()  # windows-footgun: ok - macOS-only activation canary
         )
         window_id = str(window_resp.get("window_id") or "")
         if not window_id:
@@ -642,7 +642,7 @@ def _publisher_runtime_preflight_check(
             operator.call("close_publisher_preflight_window", {"window_id": window_id})
             if hasattr(operator, "call")
             else operator.close_publisher_preflight_window(
-                peer_uid=os.geteuid(), window_id=window_id
+                peer_uid=os.geteuid(), window_id=window_id  # windows-footgun: ok - macOS-only activation canary
             )
         )
         broker_calls = list(evidence_resp.get("calls") or [])

@@ -1519,7 +1519,7 @@ def stage_toolchain(
     is written; the extracted tree and executable are then re-observed through
     the same identity functions the builder and sealer use.
     """
-    if os.geteuid() != int(toolchain.owner_uid):
+    if os.geteuid() != int(toolchain.owner_uid):  # windows-footgun: ok - macOS-only broker installer
         raise PermissionError("toolchain staging must run as the toolchain owner")
     python_root = Path(toolchain.python_root)
     uv_path = Path(toolchain.uv_executable)
@@ -1652,7 +1652,7 @@ def _read_hermes_install_provenance(
         )
     except ValueError as exc:
         raise ValueError("Hermes install provenance manifest digest or file is invalid") from exc
-    if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) not in {0o444, 0o600, 0o644}:
+    if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) not in {0o444, 0o600, 0o644}:  # windows-footgun: ok - macOS-only broker installer
         raise ValueError("Hermes install provenance manifest ownership or mode is unsafe")
     try:
         value = json.loads(raw)
@@ -1969,7 +1969,7 @@ def _read_publisher_probe(path: Path, *, expected_sha256: str) -> dict[str, obje
     except ValueError as exc:
         raise ValueError("publisher preflight script digest or file is invalid") from exc
     if (
-        info.st_uid not in {0, os.geteuid()}
+        info.st_uid not in {0, os.geteuid()}  # windows-footgun: ok - macOS-only broker installer
         or info.st_nlink != 1
         or stat.S_IMODE(info.st_mode) not in {0o444, 0o555, 0o644}
     ):
@@ -2021,7 +2021,7 @@ def _validate_radulator_publisher_source(
     if (
         stat.S_ISLNK(source_info.st_mode)
         or not stat.S_ISDIR(source_info.st_mode)
-        or source_info.st_uid not in {0, os.geteuid()}
+        or source_info.st_uid not in {0, os.geteuid()}  # windows-footgun: ok - macOS-only broker installer
         or stat.S_IMODE(source_info.st_mode) & 0o022
     ):
         raise ValueError("Radulator source checkout ownership or mode is unsafe")
@@ -2034,7 +2034,7 @@ def _validate_radulator_publisher_source(
     if (
         stat.S_ISLNK(lifecycle_info.st_mode)
         or not stat.S_ISREG(lifecycle_info.st_mode)
-        or lifecycle_info.st_uid not in {0, os.geteuid()}
+        or lifecycle_info.st_uid not in {0, os.geteuid()}  # windows-footgun: ok - macOS-only broker installer
         or lifecycle_info.st_nlink != 1
         or stat.S_IMODE(lifecycle_info.st_mode) & 0o022
     ):
@@ -2086,7 +2086,7 @@ def _validate_radulator_publisher_source(
         if (
             stat.S_ISLNK(actual_info.st_mode)
             or not stat.S_ISREG(actual_info.st_mode)
-            or actual_info.st_uid not in {0, os.geteuid()}
+            or actual_info.st_uid not in {0, os.geteuid()}  # windows-footgun: ok - macOS-only broker installer
             or actual_info.st_nlink != 1
             or stat.S_IMODE(actual_info.st_mode) & 0o022
         ):
@@ -6018,7 +6018,7 @@ def build_hermes_install_archive(
     interpreter, so no ambient ``sys.executable`` or user-owned output ever
     enters the closure's provenance.
     """
-    if os.geteuid() != int(toolchain.owner_uid):
+    if os.geteuid() != int(toolchain.owner_uid):  # windows-footgun: ok - macOS-only broker installer
         raise PermissionError("Hermes closure builder must run as the staged toolchain owner")
     source = Path(source_root)
     install = Path(install_root)
@@ -6063,7 +6063,7 @@ def build_hermes_install_archive(
     else:
         install.mkdir(parents=True, mode=0o700)
     os.chmod(install, 0o700)
-    if install.stat().st_uid != os.geteuid() or stat.S_IMODE(install.stat().st_mode) != 0o700:
+    if install.stat().st_uid != os.geteuid() or stat.S_IMODE(install.stat().st_mode) != 0o700:  # windows-footgun: ok - macOS-only broker installer
         raise ValueError("Hermes install closure staging root ownership is unsafe")
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-uv-cache-") as cache_dir:
@@ -6249,8 +6249,8 @@ def build_hermes_install_archive(
         if not output.is_absolute() or output == Path(output.anchor):
             raise ValueError("Hermes builder outputs must be bounded absolute files")
         output.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_artifact_write(output_archive, archive_bytes, mode=0o444, uid=os.geteuid(), gid=os.getegid())
-    _atomic_artifact_write(output_provenance, provenance_bytes, mode=0o644, uid=os.geteuid(), gid=os.getegid())
+    _atomic_artifact_write(output_archive, archive_bytes, mode=0o444, uid=os.geteuid(), gid=os.getegid())  # windows-footgun: ok - macOS-only broker installer
+    _atomic_artifact_write(output_provenance, provenance_bytes, mode=0o644, uid=os.geteuid(), gid=os.getegid())  # windows-footgun: ok - macOS-only broker installer
     return {
         "archive_sha256": archive_sha,
         "provenance_sha256": hashlib.sha256(provenance_bytes).hexdigest(),
@@ -6305,7 +6305,7 @@ def _read_root_json(
     allowed_owners = (
         None
         if allow_unprivileged_owner
-        else ({0, os.geteuid()} if allow_current_owner else {0})
+        else ({0, os.geteuid()} if allow_current_owner else {0})  # windows-footgun: ok - macOS-only broker installer
     )
     if allowed_owners is not None and info.st_uid not in allowed_owners:
         raise ValueError("broker installer input must be root-owned mode 0600")
@@ -6439,7 +6439,7 @@ def main(argv: list[str] | None = None) -> int:
             _read_root_json(args.inventory, contract=HOST_IDENTITY_INVENTORY_CONTRACT, allow_current_owner=True)
         )
         output = _validated_install_path(args.output, field="identity allocation output", allow_root=False)
-        _atomic_artifact_write(output, _json_artifact_bytes(desired), mode=0o600, uid=os.geteuid(), gid=os.getegid())
+        _atomic_artifact_write(output, _json_artifact_bytes(desired), mode=0o600, uid=os.geteuid(), gid=os.getegid())  # windows-footgun: ok - macOS-only broker installer
         return 0
     if args.command == "build-hermes-install":
         result = build_hermes_install_archive(
@@ -7347,7 +7347,7 @@ def render_broker_installation_plan(
         or set(provenance_document) != HERMES_INSTALL_PROVENANCE_FIELDS
     ):
         raise ValueError("Hermes install provenance must use the modern source-derived schema")
-    if provenance_info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(provenance_info.st_mode) not in {0o444, 0o600, 0o644}:
+    if provenance_info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(provenance_info.st_mode) not in {0o444, 0o600, 0o644}:  # windows-footgun: ok - macOS-only broker installer
         raise ValueError("Hermes install provenance manifest ownership or mode is unsafe")
     # Keys are generated once during rendering and carried only by the
     # root-owned payload manifest.  They are never printed by the CLI.
@@ -7662,13 +7662,13 @@ def _atomic_artifact_write(path: Path, content: bytes, *, mode: int, uid: int, g
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("broker plan artifact path is unsafe")
     _ensure_directory_tree(
-        path.parent, mode=0o711, uid=os.geteuid(), gid=os.getegid(), apply_final=False
+        path.parent, mode=0o711, uid=os.geteuid(), gid=os.getegid(), apply_final=False  # windows-footgun: ok - macOS-only broker installer
     )
     parent_fd = _open_directory_fd(path.parent)
     parent_before = os.fstat(parent_fd)
     if (
         not stat.S_ISDIR(parent_before.st_mode)
-        or parent_before.st_uid != os.geteuid()
+        or parent_before.st_uid != os.geteuid()  # windows-footgun: ok - macOS-only broker installer
         or stat.S_IMODE(parent_before.st_mode) & 0o022
     ):
         os.close(parent_fd)
@@ -8487,8 +8487,8 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
                 plan[value_key], source_root=source_root, output_root=destination_root
             )
         content = _json_artifact_bytes(value)
-        owner_uid = os.geteuid()
-        owner_gid = os.getegid()
+        owner_uid = os.geteuid()  # windows-footgun: ok - macOS-only broker installer
+        owner_gid = os.getegid()  # windows-footgun: ok - macOS-only broker installer
         _atomic_artifact_write(target(raw_path), content, mode=0o600, uid=owner_uid, gid=owner_gid)
     return {"contract": BROKER_INSTALL_PLAN_CONTRACT, "output_root": str(destination_root)}
 
@@ -8506,7 +8506,7 @@ def seal_broker_installation_plan(
     ownership assumption can turn reviewer-controlled JSON into an installer
     authority document.
     """
-    if os.geteuid() != 0:
+    if os.geteuid() != 0:  # windows-footgun: ok - macOS-only broker installer
         raise PermissionError("broker plan sealing requires root")
     source_root = _validated_install_path(
         input_root, field="offline plan input root", allow_root=True
