@@ -6,6 +6,7 @@ import argparse
 import ast
 import base64
 import csv
+import dataclasses
 import grp
 import gzip
 import hashlib
@@ -20,11 +21,13 @@ import re
 import secrets
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
 import tomllib
+import urllib.parse
+import urllib.request
+import zipfile
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -67,7 +70,11 @@ OFFICIAL_RUNTIME_RELEASE = "20260602"
 OFFICIAL_RUNTIME_ASSET_ID = 436826623
 OFFICIAL_RUNTIME_VERSION = "3.11.15"
 OFFICIAL_RUNTIME_ARCHIVE_SHA256 = "01f0de017aacd7528084dbacd46c66cfe9a0b0cd1255be0c24854b7985dd130e"
+OFFICIAL_RUNTIME_ARCHIVE_SIZE = 27219892
 SEALED_RUNTIME_CONTRACT = "hermes.kanban_broker_sealed_runtime.v1"
+# Owner of the mutable runtime state attestation.  Root in production; tests
+# exercise the real replacement path under their own uid through this seam.
+RUNTIME_ATTESTATION_OWNER = (0, 0)
 RUNTIME_MANIFEST_CONTRACT = "hermes.kanban_broker_runtime_manifest.v1"
 HERMES_INSTALL_PROVENANCE_CONTRACT = "hermes.kanban_broker_hermes_install_provenance.v2"
 HERMES_INSTALL_BUILDER_CONTRACT = "hermes.kanban_broker_hermes_install_builder.v2"
@@ -85,6 +92,8 @@ HERMES_INSTALL_PROVENANCE_FIELDS = frozenset({
     "locked_packages",
     "installed_distributions",
     "uv_identity",
+    "uv_provenance",
+    "python_identity",
     "installer",
     "install_archive_sha256",
     "entries",
@@ -100,12 +109,77 @@ HERMES_INSTALL_PROVENANCE_SEAL_FIELDS = frozenset({
     "locked_package_count",
     "installed_distribution_count",
     "uv_identity",
+    "uv_provenance",
+    "python_identity",
 })
 HERMES_UV_IDENTITY_FIELDS = frozenset({
     "path", "uid", "gid", "mode", "nlink", "version", "sha256",
 })
-HERMES_UV_CANONICAL_PATH = Path("/opt/homebrew/bin/uv")
+# Production closure builds use only the separately staged, reviewed official
+# toolchain.  A mutable developer/Homebrew installation is never a trust root,
+# even when its version output happens to match.  Both tools are staged by
+# ``stage_toolchain`` from the exact pinned release archives below.
+HERMES_TOOLCHAIN_ROOT = Path("/Library/HermesBroker/libexec")
+HERMES_UV_CANONICAL_PATH = HERMES_TOOLCHAIN_ROOT / "uv"
+HERMES_UV_SOURCE_REPOSITORY = "astral-sh/uv"
+HERMES_UV_RELEASE_TAG = "0.11.5"
+HERMES_UV_COMMIT = "95eaa68c8df627eb915bc355831fd7d169d91fe3"
+HERMES_UV_COMMIT_DATE = "2026-04-08"
+HERMES_UV_RELEASE_ID = 306784698
+HERMES_UV_ASSET_ID = 391840962
+HERMES_UV_ASSET_NAME = "uv-aarch64-apple-darwin.tar.gz"
+HERMES_UV_ASSET_SIZE = 20734306
+HERMES_UV_RELEASE_URL = (
+    "https://github.com/astral-sh/uv/releases/download/"
+    f"{HERMES_UV_RELEASE_TAG}/{HERMES_UV_ASSET_NAME}"
+)
+# Outer release-asset digest (the .tar.gz) and inner executable digest are
+# deliberately separate pins; neither substitutes for the other.
+HERMES_UV_ARCHIVE_SHA256 = "470993e87503874c7c48861daa308b48a7c367e117235bbecf19368b9fdd35b2"
+HERMES_UV_CHECKSUM_ASSET_ID = 391840970
+HERMES_UV_CHECKSUM_SHA256 = "28070a829dfdad1c180595673374d2dc972c607704453605f8b6971d93e29d30"
+HERMES_UV_DIST_MANIFEST_ASSET_ID = 391840964
+HERMES_UV_DIST_MANIFEST_SHA256 = "5e6da154397f03da949de06219a2ff3bbf8d4486c5f9e24c9dd17c3f60a70c31"
+HERMES_UV_ARCHIVE_ROOT = "uv-aarch64-apple-darwin"
+HERMES_UV_ARCHIVE_MEMBERS = frozenset({
+    HERMES_UV_ARCHIVE_ROOT,
+    HERMES_UV_ARCHIVE_ROOT + "/uv",
+    HERMES_UV_ARCHIVE_ROOT + "/uvx",
+})
+HERMES_UV_EXECUTABLE_SIZE = 47497584
+HERMES_UV_SHA256 = "a6d2c78bbf4d676393bb6dd65adf654fbac489a4644a14d4c9af0868fe622b31"
+HERMES_UV_VERSION = "uv 0.11.5 (95eaa68c8 2026-04-08 aarch64-apple-darwin)"
+HERMES_UV_TARGET_TRIPLE = "aarch64-apple-darwin"
+HERMES_BUILDER_PYTHON_ROOT = HERMES_TOOLCHAIN_ROOT / "cpython-3.11.15"
+HERMES_BUILDER_PYTHON_IDENTITY_FIELDS = frozenset({
+    "root", "path", "uid", "gid", "mode", "nlink", "version", "sha256",
+    "tree_sha256", "marker_environment", "mac_version", "machine",
+})
+HERMES_MARKER_ENVIRONMENT_FIELDS = frozenset({
+    "implementation_name", "implementation_version", "os_name",
+    "platform_machine", "platform_release", "platform_system",
+    "platform_version", "python_full_version",
+    "platform_python_implementation", "python_version", "sys_platform",
+})
+HERMES_LOCKED_REGISTRY = "https://pypi.org/simple"
+HERMES_LOCKED_ARTIFACT_HOSTS = frozenset({"files.pythonhosted.org"})
+# Recursive manifest digest of the official CPython archive extracted with the
+# hardened sealed-tree modes (0555 directories/executables, 0444 files) and
+# bytecode caches excluded.  ``stage_toolchain`` and every later observation
+# of the builder interpreter must reproduce exactly this digest.
+OFFICIAL_RUNTIME_TREE_SHA256 = "a1c2b7ea1d526a02914d9847abdde754c269861760c7c0dec2384bed58d21c0f"
 PUBLISHER_PROBE_CONTRACT = "radulator.publisher_runtime_preflight.v1"
+# Radulator's publisher service installer builds its asset manifest from
+# exactly these reviewed files (``SOURCE_ASSETS`` in
+# ops/hermes/radulator/publisher_service_install.py).  The broker plan binds
+# the same manifest digest from the immutable Git blobs so both sides of the
+# publisher handoff must agree on every byte of the publisher's code.
+RADULATOR_PUBLISHER_ASSETS = (
+    "lifecycle_controller.py",
+    "publisher_service_install.py",
+    "trusted_publisher.py",
+    "trusted_publisher_cron.sh",
+)
 OFFICIAL_RUNTIME_SOURCE_REPOSITORY = "astral-sh/python-build-standalone"
 OFFICIAL_RUNTIME_RELEASE_TAG = "20260602"
 OFFICIAL_RUNTIME_ASSET_NAME = (
@@ -118,6 +192,77 @@ OFFICIAL_RUNTIME_RELEASE_URL = (
 OFFICIAL_RUNTIME_VERIFICATION_STATUS = "external-sha256-bound"
 OFFICIAL_RUNTIME_ATTESTATION_IDENTITY = "operator-supplied-sha256"
 OFFICIAL_RUNTIME_ATTESTATION_STATUS = "bound-no-signature"
+
+
+@dataclasses.dataclass(frozen=True)
+class HermesToolchainTrust:
+    """The exact staged uv and CPython that may build or seal a closure.
+
+    Production uses :data:`HERMES_PRODUCTION_TOOLCHAIN`, whose paths, owner
+    and digests are fixed in reviewed code and cannot be changed from the CLI.
+    Tests construct their own instance for a toolchain they staged from the
+    same official archives under their own uid; every pin except location and
+    owner is shared with production, so the same verification code runs.
+    """
+
+    uv_executable: Path
+    python_root: Path
+    owner_uid: int = 0
+    owner_gid: int = 0
+    executable_mode: int = 0o555
+    uv_sha256: str = HERMES_UV_SHA256
+    uv_size: int = HERMES_UV_EXECUTABLE_SIZE
+    uv_version: str = HERMES_UV_VERSION
+    uv_release: str = HERMES_UV_RELEASE_TAG
+    uv_commit: str = HERMES_UV_COMMIT
+    uv_commit_date: str = HERMES_UV_COMMIT_DATE
+    uv_target_triple: str = HERMES_UV_TARGET_TRIPLE
+    uv_archive_sha256: str = HERMES_UV_ARCHIVE_SHA256
+    uv_archive_size: int = HERMES_UV_ASSET_SIZE
+    python_version: str = OFFICIAL_RUNTIME_VERSION
+    python_tree_sha256: str = OFFICIAL_RUNTIME_TREE_SHA256
+    python_archive_sha256: str = OFFICIAL_RUNTIME_ARCHIVE_SHA256
+
+    @property
+    def python_executable(self) -> Path:
+        major, minor = self.python_version.split(".")[:2]
+        return Path(self.python_root) / "bin" / f"python{major}.{minor}"
+
+    @property
+    def python_library_dir(self) -> str:
+        major, minor = self.python_version.split(".")[:2]
+        return f"python{major}.{minor}"
+
+    @property
+    def uv_provenance(self) -> dict[str, object]:
+        """Immutable release identity recorded next to the uv identity."""
+        return {
+            "source_repository": HERMES_UV_SOURCE_REPOSITORY,
+            "release_tag": self.uv_release,
+            "commit": self.uv_commit,
+            "commit_date": self.uv_commit_date,
+            "release_id": HERMES_UV_RELEASE_ID,
+            "asset_id": HERMES_UV_ASSET_ID,
+            "asset_name": HERMES_UV_ASSET_NAME,
+            "asset_size": int(self.uv_archive_size),
+            "release_url": HERMES_UV_RELEASE_URL,
+            "archive_sha256": self.uv_archive_sha256,
+            "checksum_asset_id": HERMES_UV_CHECKSUM_ASSET_ID,
+            "checksum_sha256": HERMES_UV_CHECKSUM_SHA256,
+            "dist_manifest_asset_id": HERMES_UV_DIST_MANIFEST_ASSET_ID,
+            "dist_manifest_sha256": HERMES_UV_DIST_MANIFEST_SHA256,
+            "executable_sha256": self.uv_sha256,
+            "executable_size": int(self.uv_size),
+            "target_triple": self.uv_target_triple,
+            "version": self.uv_version,
+            "verification_status": "external-sha256-bound",
+        }
+
+
+HERMES_PRODUCTION_TOOLCHAIN = HermesToolchainTrust(
+    uv_executable=HERMES_UV_CANONICAL_PATH,
+    python_root=HERMES_BUILDER_PYTHON_ROOT,
+)
 
 # These contracts describe the reviewed, data-only provisioning edge.  The
 # existing v1 identity/filesystem/service contracts remain the apply boundary;
@@ -256,8 +401,11 @@ def render_broker_service_config(
     dispatcher_profile: str | None = None,
     dispatcher_routing_config_path: Path | None = None,
     dispatcher_profile_config_path: Path | None = None,
+    dispatcher_profile_owner_uid: int | None = None,
+    dispatcher_profile_owner_gid: int | None = None,
     publisher_probe_path: Path | None = None,
     publisher_probe_sha256: str | None = None,
+    publisher_asset_manifest_sha256: str | None = None,
     publisher_client_config: Path | None = None,
     controller_client_config: Path | None = None,
     operator_client_config: Path | None = None,
@@ -344,6 +492,8 @@ def render_broker_service_config(
         *([publisher_probe_path] if publisher_probe_path is not None else []),
         *([publisher_client_config] if publisher_client_config is not None else []),
         *([registration_file_path] if registration_file_path is not None else []),
+        *([dispatcher_routing_config_path] if dispatcher_routing_config_path is not None else []),
+        *([dispatcher_profile_config_path] if dispatcher_profile_config_path is not None else []),
     ):
         if not runtime_path.is_absolute():
             raise ValueError("broker runtime identity paths must be absolute")
@@ -369,6 +519,8 @@ def render_broker_service_config(
         *([publisher_probe_path] if publisher_probe_path is not None else []),
         *([publisher_client_config] if publisher_client_config is not None else []),
         *([registration_file_path] if registration_file_path is not None else []),
+        *([dispatcher_routing_config_path] if dispatcher_routing_config_path is not None else []),
+        *([dispatcher_profile_config_path] if dispatcher_profile_config_path is not None else []),
     ):
         if private_path == install_root or install_root not in private_path.parents:
             raise ValueError("broker private assets must be below the install root")
@@ -441,6 +593,12 @@ def render_broker_service_config(
         if not profile_config_path.is_absolute() or ".." in profile_config_path.parts:
             raise ValueError("dispatcher profile config path is invalid")
         payload["dispatcher_profile_config_path"] = str(profile_config_path)
+        payload["dispatcher_profile_owner_uid"] = int(
+            0 if dispatcher_profile_owner_uid is None else dispatcher_profile_owner_uid
+        )
+        payload["dispatcher_profile_owner_gid"] = int(
+            0 if dispatcher_profile_owner_gid is None else dispatcher_profile_owner_gid
+        )
     if publisher_probe_path is not None:
         publisher_probe_path = Path(publisher_probe_path)
         if not publisher_probe_path.is_absolute() or ".." in publisher_probe_path.parts:
@@ -452,7 +610,14 @@ def render_broker_service_config(
             publisher_probe_sha256, field="publisher preflight script SHA256", length=64
         )
         payload["publisher_probe_contract"] = PUBLISHER_PROBE_CONTRACT
-    elif publisher_probe_sha256 is not None:
+        if publisher_asset_manifest_sha256 is None:
+            raise ValueError("publisher asset manifest digest is required")
+        payload["radulator_publisher_asset_manifest_sha256"] = _validated_hex_sha(
+            publisher_asset_manifest_sha256,
+            field="Radulator publisher asset manifest SHA256",
+            length=64,
+        )
+    elif publisher_probe_sha256 is not None or publisher_asset_manifest_sha256 is not None:
         raise ValueError("publisher preflight script path is required for its digest")
     if publisher_client_config is not None:
         publisher_client_config = Path(publisher_client_config)
@@ -948,90 +1113,519 @@ def _read_archive_file_contents(
     return contents
 
 
-def _validate_uv_identity(
-    identity: object,
-    *,
-    executable: Path | None = None,
-) -> dict[str, object]:
-    """Validate the exact immutable uv binary bound to a closure build."""
-    if not isinstance(identity, dict) or set(identity) != HERMES_UV_IDENTITY_FIELDS:
-        raise ValueError("Hermes uv identity fields are not exact")
-    path_value = identity.get("path")
-    if (
-        not isinstance(path_value, str)
-        or not path_value
-        or not Path(path_value).is_absolute()
-        or ".." in Path(path_value).parts
-    ):
-        raise ValueError("Hermes uv identity path is invalid")
-    path = Path(path_value)
-    if executable is not None and Path(executable) != path:
-        raise ValueError("Hermes uv executable differs from its pinned identity")
+_TOOLCHAIN_COMMAND_ENV = {
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "UV_NO_PROGRESS": "1",
+}
+_PYTHON_IDENTITY_PROBE = """
+import json, os, platform, sys, sysconfig
+
+
+def _full_version(info):
+    version = "{0.major}.{0.minor}.{0.micro}".format(info)
+    if info.releaselevel != "final":
+        version += info.releaselevel[0] + str(info.serial)
+    return version
+
+
+environment = {
+    "implementation_name": sys.implementation.name,
+    "implementation_version": _full_version(sys.implementation.version),
+    "os_name": os.name,
+    "platform_machine": platform.machine(),
+    "platform_release": platform.release(),
+    "platform_system": platform.system(),
+    "platform_version": platform.version(),
+    "python_full_version": platform.python_version(),
+    "platform_python_implementation": platform.python_implementation(),
+    "python_version": ".".join(platform.python_version_tuple()[:2]),
+    "sys_platform": sys.platform,
+}
+print(json.dumps({
+    "version": platform.python_version(),
+    "marker_environment": environment,
+    "mac_version": platform.mac_ver()[0],
+    "machine": platform.machine(),
+    "soabi": sysconfig.get_config_var("SOABI"),
+}, sort_keys=True))
+"""
+
+
+def _run_toolchain_command(
+    argv: list[str], *, timeout: float = 30.0
+) -> subprocess.CompletedProcess[str]:
+    """Run one staged toolchain command with a fixed, credential-free env."""
     try:
-        info = path.lstat()
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError("Hermes uv executable is unavailable") from exc
-    if (
-        resolved != path
-        or stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_nlink != 1
-    ):
-        raise ValueError("Hermes uv executable must be a canonical regular file")
-    if os.geteuid() == 0 and info.st_uid != 0:
-        raise ValueError("Hermes uv executable must be root-owned")
-    expected_uid = identity.get("uid")
-    expected_gid = identity.get("gid")
-    expected_mode = identity.get("mode")
-    expected_nlink = identity.get("nlink")
-    if any(
-        isinstance(value, bool) or not isinstance(value, int)
-        for value in (expected_uid, expected_gid, expected_mode, expected_nlink)
-    ):
-        raise ValueError("Hermes uv identity metadata is invalid")
-    if (
-        info.st_uid != int(expected_uid)
-        or info.st_gid != int(expected_gid)
-        or stat.S_IMODE(info.st_mode) != int(expected_mode)
-        or info.st_nlink != int(expected_nlink)
-        or stat.S_IMODE(info.st_mode) & 0o022
-        or int(expected_nlink) != 1
-    ):
-        raise ValueError("Hermes uv executable metadata differs from its pinned identity")
-    version = identity.get("version")
-    if not isinstance(version, str) or not re.fullmatch(r"uv [^\r\n]{1,127}", version):
-        raise ValueError("Hermes uv version identity is invalid")
-    try:
-        result = subprocess.run(
-            [str(path), "--version"],
+        return subprocess.run(
+            argv,
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
-            env={
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                "PYTHONNOUSERSITE": "1",
-            },
+            timeout=timeout,
+            env=dict(_TOOLCHAIN_COMMAND_ENV),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError("Hermes uv version cannot be verified") from exc
-    if result.returncode != 0 or result.stderr or result.stdout.strip() != version:
-        raise ValueError("Hermes uv version differs from its pinned identity")
-    digest = _safe_file_sha256(path)
-    expected_digest = _validated_hex_sha(
-        identity.get("sha256"), field="Hermes uv SHA256", length=64
+        raise ValueError("Hermes toolchain command could not run") from exc
+
+
+def _require_trusted_toolchain_parents(path: Path, *, owner_uid: int, role: str) -> None:
+    """Every parent must be a real directory owned by root or the toolchain owner.
+
+    A writable or foreign-owned ancestor would let another identity rename
+    the staged tool away, so the whole chain to the filesystem root is part of
+    the tool's identity.
+    """
+    parent = Path(path).parent
+    while True:
+        try:
+            info = parent.lstat()
+        except OSError as exc:
+            raise ValueError(f"{role} parent is unavailable") from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, int(owner_uid)}
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ValueError(f"{role} path is not a trusted immutable tree")
+        if parent == Path(parent.anchor):
+            break
+        parent = parent.parent
+
+
+def _toolchain_node_info(path: Path, *, role: str) -> os.stat_result:
+    target = Path(path)
+    if not target.is_absolute() or ".." in target.parts:
+        raise ValueError(f"{role} path is invalid")
+    try:
+        info = target.lstat()
+        resolved = target.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{role} is unavailable") from exc
+    if resolved != target or stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"{role} must not be reached through a symlink")
+    return info
+
+
+def _observe_uv_identity(toolchain: HermesToolchainTrust) -> dict[str, object]:
+    """Observe the staged uv and prove it is the pinned official executable."""
+    path = Path(toolchain.uv_executable)
+    info = _toolchain_node_info(path, role="Hermes uv executable")
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != int(toolchain.owner_uid)
+        or info.st_gid != int(toolchain.owner_gid)
+        or stat.S_IMODE(info.st_mode) != int(toolchain.executable_mode)
+        or info.st_size != int(toolchain.uv_size)
+    ):
+        raise ValueError("Hermes uv executable must be the root-owned immutable staged tool")
+    _require_trusted_toolchain_parents(
+        path, owner_uid=toolchain.owner_uid, role="Hermes uv executable"
     )
-    if digest != expected_digest:
-        raise ValueError("Hermes uv executable digest differs from its pinned identity")
+    digest = _safe_file_sha256(path)
+    if digest != toolchain.uv_sha256:
+        raise ValueError("Hermes uv executable digest differs from the pinned release")
+    version = _run_toolchain_command([str(path), "--version"])
+    if version.returncode != 0 or version.stdout.strip() != toolchain.uv_version:
+        raise ValueError("Hermes uv version output differs from the pinned release")
+    detail = _run_toolchain_command(
+        [str(path), "self", "version", "--output-format", "json"]
+    )
+    try:
+        structured = json.loads(detail.stdout) if detail.returncode == 0 else None
+    except json.JSONDecodeError:
+        structured = None
+    commit_info = structured.get("commit_info") if isinstance(structured, dict) else None
+    if (
+        not isinstance(structured, dict)
+        or not isinstance(commit_info, dict)
+        or structured.get("package_name") != "uv"
+        or structured.get("version") != toolchain.uv_release
+        or structured.get("target_triple") != toolchain.uv_target_triple
+        or commit_info.get("commit_hash") != toolchain.uv_commit
+        or commit_info.get("commit_date") != toolchain.uv_commit_date
+        or commit_info.get("commits_since_last_tag") != 0
+    ):
+        raise ValueError("Hermes uv structured version differs from the pinned release")
     return {
         "path": str(path),
-        "uid": int(expected_uid),
-        "gid": int(expected_gid),
-        "mode": int(expected_mode),
-        "nlink": int(expected_nlink),
-        "version": version,
-        "sha256": expected_digest,
+        "uid": int(info.st_uid),
+        "gid": int(info.st_gid),
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": int(info.st_nlink),
+        "version": toolchain.uv_version,
+        "sha256": digest,
+    }
+
+
+def _validate_uv_identity(
+    identity: object, *, toolchain: HermesToolchainTrust
+) -> dict[str, object]:
+    """Check a recorded uv identity against the reviewed toolchain pins."""
+    if not isinstance(identity, dict) or set(identity) != HERMES_UV_IDENTITY_FIELDS:
+        raise ValueError("Hermes uv identity fields are not exact")
+    if any(
+        isinstance(identity.get(key), bool) or not isinstance(identity.get(key), int)
+        for key in ("uid", "gid", "mode", "nlink")
+    ):
+        raise ValueError("Hermes uv identity metadata is invalid")
+    if identity.get("path") != str(Path(toolchain.uv_executable)):
+        raise ValueError("Hermes uv executable is not the reviewed staged tool")
+    if (
+        int(identity["uid"]) != int(toolchain.owner_uid)
+        or int(identity["gid"]) != int(toolchain.owner_gid)
+        or int(identity["mode"]) != int(toolchain.executable_mode)
+        or int(identity["nlink"]) != 1
+    ):
+        raise ValueError("Hermes uv executable metadata differs from its pinned identity")
+    if identity.get("version") != toolchain.uv_version:
+        raise ValueError("Hermes uv version identity is invalid")
+    digest = _validated_hex_sha(identity.get("sha256"), field="Hermes uv SHA256", length=64)
+    if digest != toolchain.uv_sha256:
+        raise ValueError("Hermes uv executable digest differs from its pinned identity")
+    return {
+        "path": str(identity["path"]),
+        "uid": int(identity["uid"]),
+        "gid": int(identity["gid"]),
+        "mode": int(identity["mode"]),
+        "nlink": int(identity["nlink"]),
+        "version": str(identity["version"]),
+        "sha256": digest,
+    }
+
+
+def _validate_uv_provenance(
+    value: object, *, toolchain: HermesToolchainTrust
+) -> dict[str, object]:
+    expected = toolchain.uv_provenance
+    if not isinstance(value, dict) or value != expected:
+        raise ValueError("Hermes install uv provenance is not the reviewed release")
+    return dict(expected)
+
+
+def _runtime_tree_digest(entries: list[dict[str, object]]) -> str:
+    """Digest a tree manifest independent of traversal order.
+
+    A directory walk orders ``pip/`` before ``pip-1.0.dist-info/`` while a
+    path-string sort orders them the other way; hashing a path-sorted view
+    keeps archive-derived and observed manifests comparable.
+    """
+    ordered = sorted(entries, key=lambda item: str(item["path"]))
+    return hashlib.sha256(_canonical_json_bytes(ordered)).hexdigest()
+
+
+def _official_runtime_tree_entries(archive_entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Derive the expected staged-tree manifest from an archive manifest.
+
+    Tar archives may omit directory members and the hardened extraction
+    creates every implicit parent as 0555.  Bytecode caches are excluded on
+    both sides so a later interpreter run cannot change the identity.
+    """
+    merged: dict[str, dict[str, object]] = {}
+    for item in archive_entries:
+        path = str(item["path"])
+        parts = PurePosixPath(path.rstrip("/")).parts
+        if "__pycache__" in parts or path.endswith((".pyc", ".pyo")):
+            continue
+        merged[path] = dict(item)
+    for item in list(merged.values()):
+        parent = PurePosixPath(str(item["path"]).rstrip("/")).parent
+        while str(parent) not in {"", "."}:
+            directory = parent.as_posix() + "/"
+            prior = merged.get(directory)
+            if prior is not None and prior.get("type") != "directory":
+                raise ValueError("runtime tree has a file/directory collision")
+            merged.setdefault(directory, {"path": directory, "type": "directory", "mode": 0o555})
+            parent = parent.parent
+    return [merged[path] for path in sorted(merged)]
+
+
+def _observe_python_identity(toolchain: HermesToolchainTrust) -> dict[str, object]:
+    """Observe the staged standalone CPython tree and interpreter identity."""
+    root = Path(toolchain.python_root)
+    root_info = _toolchain_node_info(root, role="Hermes builder Python root")
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != int(toolchain.owner_uid)
+        or root_info.st_gid != int(toolchain.owner_gid)
+        or stat.S_IMODE(root_info.st_mode) & 0o022
+    ):
+        raise ValueError("Hermes builder Python root must be a root-owned immutable tree")
+    _require_trusted_toolchain_parents(
+        root, owner_uid=toolchain.owner_uid, role="Hermes builder Python root"
+    )
+    entries = _observe_runtime_tree(
+        root,
+        expected_owner_uid=toolchain.owner_uid,
+        expected_owner_gid=toolchain.owner_gid,
+        skip_bytecode=True,
+    )
+    tree_digest = _runtime_tree_digest(entries)
+    if tree_digest != toolchain.python_tree_sha256:
+        raise ValueError("Hermes builder Python tree differs from the pinned official runtime")
+    executable = toolchain.python_executable
+    relative = executable.relative_to(root).as_posix()
+    entry = next((item for item in entries if item.get("path") == relative), None)
+    if not isinstance(entry, dict) or entry.get("type") != "file":
+        raise ValueError("Hermes builder Python executable is not a regular runtime file")
+    info = _toolchain_node_info(executable, role="Hermes builder Python")
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != int(toolchain.executable_mode)
+        or int(entry.get("mode", -1)) != int(toolchain.executable_mode)
+    ):
+        raise ValueError("Hermes builder Python must be root-owned and immutable")
+    probe = _run_toolchain_command(
+        [str(executable), "-I", "-B", "-c", _PYTHON_IDENTITY_PROBE], timeout=30.0
+    )
+    try:
+        observed = json.loads(probe.stdout) if probe.returncode == 0 else None
+    except json.JSONDecodeError:
+        observed = None
+    if not isinstance(observed, dict):
+        raise ValueError("Hermes builder Python identity cannot be observed")
+    identity = {
+        "root": str(root),
+        "path": str(executable),
+        "uid": int(info.st_uid),
+        "gid": int(info.st_gid),
+        "mode": stat.S_IMODE(info.st_mode),
+        "nlink": int(info.st_nlink),
+        "version": observed.get("version"),
+        "sha256": str(entry.get("sha256")),
+        "tree_sha256": tree_digest,
+        "marker_environment": observed.get("marker_environment"),
+        "mac_version": observed.get("mac_version"),
+        "machine": observed.get("machine"),
+    }
+    return _validate_python_identity(identity, toolchain=toolchain)
+
+
+def _validate_python_identity(
+    identity: object, *, toolchain: HermesToolchainTrust
+) -> dict[str, object]:
+    """Check a recorded builder Python identity against the toolchain pins."""
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != HERMES_BUILDER_PYTHON_IDENTITY_FIELDS
+    ):
+        raise ValueError("Hermes builder Python identity fields are not exact")
+    if any(
+        isinstance(identity.get(key), bool) or not isinstance(identity.get(key), int)
+        for key in ("uid", "gid", "mode", "nlink")
+    ):
+        raise ValueError("Hermes builder Python identity metadata is invalid")
+    if identity.get("root") != str(Path(toolchain.python_root)) or identity.get(
+        "path"
+    ) != str(toolchain.python_executable):
+        raise ValueError("Hermes builder Python is not the reviewed staged interpreter")
+    if (
+        int(identity["uid"]) != int(toolchain.owner_uid)
+        or int(identity["gid"]) != int(toolchain.owner_gid)
+        or int(identity["mode"]) != int(toolchain.executable_mode)
+        or int(identity["nlink"]) != 1
+    ):
+        raise ValueError("Hermes builder Python metadata differs from its pinned identity")
+    if identity.get("version") != toolchain.python_version:
+        raise ValueError("Hermes builder Python version is unsupported")
+    digest = _validated_hex_sha(
+        identity.get("sha256"), field="Hermes builder Python SHA256", length=64
+    )
+    tree_digest = _validated_hex_sha(
+        identity.get("tree_sha256"), field="Hermes builder Python tree SHA256", length=64
+    )
+    if tree_digest != toolchain.python_tree_sha256:
+        raise ValueError("Hermes builder Python tree differs from the pinned official runtime")
+    environment = identity.get("marker_environment")
+    if (
+        not isinstance(environment, dict)
+        or set(environment) != HERMES_MARKER_ENVIRONMENT_FIELDS
+        or not all(isinstance(value, str) for value in environment.values())
+    ):
+        raise ValueError("Hermes builder Python marker environment is invalid")
+    major, minor = toolchain.python_version.split(".")[:2]
+    machine = identity.get("machine")
+    mac_version = identity.get("mac_version")
+    if (
+        environment["implementation_name"] != "cpython"
+        or environment["platform_python_implementation"] != "CPython"
+        or environment["python_full_version"] != toolchain.python_version
+        or environment["python_version"] != f"{major}.{minor}"
+        or environment["implementation_version"] != toolchain.python_version
+        or environment["os_name"] != "posix"
+        or environment["sys_platform"] != "darwin"
+        or environment["platform_system"] != "Darwin"
+        or environment["platform_machine"] != machine
+        or machine != "arm64"
+        or not isinstance(mac_version, str)
+        or re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?", mac_version) is None
+    ):
+        raise ValueError("Hermes builder Python platform identity is invalid")
+    return {
+        "root": str(identity["root"]),
+        "path": str(identity["path"]),
+        "uid": int(identity["uid"]),
+        "gid": int(identity["gid"]),
+        "mode": int(identity["mode"]),
+        "nlink": int(identity["nlink"]),
+        "version": str(identity["version"]),
+        "sha256": digest,
+        "tree_sha256": tree_digest,
+        "marker_environment": {key: str(environment[key]) for key in sorted(environment)},
+        "mac_version": mac_version,
+        "machine": str(machine),
+    }
+
+
+def _python_identity_supported_tags(python_identity: dict[str, object]) -> list[object]:
+    """Wheel tags for the recorded builder interpreter, most specific first.
+
+    The running interpreter's own tags are deliberately not consulted: wheel
+    selection must be a function of the recorded, pinned builder identity.
+    """
+    try:
+        from packaging import tags
+    except ImportError as exc:
+        raise ValueError("Hermes wheel tag verifier is unavailable") from exc
+    environment = python_identity["marker_environment"]
+    assert isinstance(environment, dict)
+    major, minor = (int(part) for part in str(environment["python_version"]).split(".")[:2])
+    mac_parts = [int(part) for part in str(python_identity["mac_version"]).split(".")[:2]]
+    mac_version = (mac_parts[0], mac_parts[1] if len(mac_parts) > 1 else 0)
+    platforms = list(tags.mac_platforms(mac_version, str(python_identity["machine"])))
+    interpreter = f"cp{major}{minor}"
+    supported: list[object] = list(
+        tags.cpython_tags(python_version=(major, minor), abis=[interpreter], platforms=platforms)
+    )
+    supported.extend(
+        tags.compatible_tags(python_version=(major, minor), interpreter=interpreter, platforms=platforms)
+    )
+    return supported
+
+
+def stage_toolchain(
+    *,
+    cpython_archive: Path,
+    uv_archive: Path,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
+) -> dict[str, object]:
+    """Stage the pinned official CPython tree and uv executable immutably.
+
+    Both archives are verified by exact outer digest and size before any byte
+    is written; the extracted tree and executable are then re-observed through
+    the same identity functions the builder and sealer use.
+    """
+    if os.geteuid() != int(toolchain.owner_uid):
+        raise PermissionError("toolchain staging must run as the toolchain owner")
+    python_root = Path(toolchain.python_root)
+    uv_path = Path(toolchain.uv_executable)
+    for target in (python_root, uv_path):
+        _validated_install_path(target, field="staged toolchain path")
+        if target == Path(target.anchor) or target.parent == Path(target.anchor):
+            raise ValueError("staged toolchain path must be bounded")
+        if target.exists() or target.is_symlink():
+            raise ValueError("staged toolchain destination already exists")
+    _read_sealed_file_bytes(
+        Path(cpython_archive),
+        max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+        expected_size=OFFICIAL_RUNTIME_ARCHIVE_SIZE,
+        expected_sha256=toolchain.python_archive_sha256,
+    )
+    python_manifest = _read_runtime_archive_manifest(
+        Path(cpython_archive),
+        expected_sha256=toolchain.python_archive_sha256,
+        strip_prefix="python",
+        required_paths={"bin/python3.11", "bin/python3", "lib/python3.11"},
+        role="CPython",
+    )
+    uv_bytes, uv_info = _read_sealed_file_bytes(
+        Path(uv_archive),
+        max_bytes=_MAX_RUNTIME_ARCHIVE_BYTES,
+        expected_size=int(toolchain.uv_archive_size),
+        expected_sha256=toolchain.uv_archive_sha256,
+    )
+    uv_executable: bytes | None = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(uv_bytes), mode="r:gz") as stream:
+            members = stream.getmembers()
+            names = {
+                (member.name.rstrip("/") if member.isdir() else member.name)
+                for member in members
+            }
+            if names != set(HERMES_UV_ARCHIVE_MEMBERS) or len(members) != len(HERMES_UV_ARCHIVE_MEMBERS):
+                raise ValueError("uv release archive members are not exact")
+            for member in members:
+                if member.name.rstrip("/") == HERMES_UV_ARCHIVE_ROOT:
+                    if not member.isdir():
+                        raise ValueError("uv release archive root is not a directory")
+                    continue
+                if not member.isfile() or member.issym() or member.islnk():
+                    raise ValueError("uv release archive contains an unsafe entry")
+                if member.name == HERMES_UV_ARCHIVE_ROOT + "/uv":
+                    if member.size != int(toolchain.uv_size):
+                        raise ValueError("uv release executable size differs from the pin")
+                    handle = stream.extractfile(member)
+                    if handle is None:
+                        raise ValueError("uv release executable cannot be read")
+                    uv_executable = handle.read(int(toolchain.uv_size) + 1)
+    except (tarfile.TarError, OSError) as exc:
+        raise ValueError("uv release archive is not a valid bounded tar.gz") from exc
+    if uv_executable is None or len(uv_executable) != int(toolchain.uv_size):
+        raise ValueError("uv release executable is incomplete")
+    if hashlib.sha256(uv_executable).hexdigest() != toolchain.uv_sha256:
+        raise ValueError("uv release executable digest differs from the pin")
+    expected_entries = _official_runtime_tree_entries(
+        cast(list[dict[str, object]], python_manifest["entries"])
+    )
+    if _runtime_tree_digest(expected_entries) != toolchain.python_tree_sha256:
+        raise ValueError("CPython archive tree digest differs from the pinned runtime")
+    contents = _read_archive_file_contents(Path(cpython_archive), strip_prefix="python")
+    owner_uid = int(toolchain.owner_uid)
+    owner_gid = int(toolchain.owner_gid)
+    _ensure_directory_tree(python_root.parent, mode=0o755, uid=owner_uid, gid=owner_gid)
+    _ensure_directory_tree(python_root, mode=0o711, uid=owner_uid, gid=owner_gid)
+    directories: set[Path] = {python_root}
+    for item in cast(list[dict[str, object]], python_manifest["entries"]):
+        relative = str(item["path"]).rstrip("/")
+        destination = python_root / relative
+        if item["type"] == "directory":
+            _ensure_directory_tree(destination, mode=0o711, uid=owner_uid, gid=owner_gid)
+            directories.add(destination)
+            continue
+        _ensure_directory_tree(destination.parent, mode=0o711, uid=owner_uid, gid=owner_gid)
+        parent = destination.parent
+        while parent != python_root and python_root in parent.parents:
+            directories.add(parent)
+            parent = parent.parent
+        if item["type"] == "file":
+            content = contents.get(relative)
+            if content is None or hashlib.sha256(content).hexdigest() != str(item["sha256"]):
+                raise ValueError("CPython archive changed during staging")
+            _runtime_extract_file(destination, content, mode=int(item["mode"]), uid=owner_uid, gid=owner_gid)
+        elif item["type"] == "symlink":
+            link_target = posixpath.relpath(
+                str(item["target"]), start=PurePosixPath(relative).parent.as_posix()
+            )
+            _runtime_extract_symlink(destination, link_target)
+        else:
+            raise ValueError("CPython archive manifest contains an unsupported entry")
+    for directory in sorted(directories, key=lambda value: len(value.parts)):
+        _ensure_directory_tree(directory, mode=0o555, uid=owner_uid, gid=owner_gid)
+    _ensure_directory_tree(uv_path.parent, mode=0o755, uid=owner_uid, gid=owner_gid)
+    _runtime_extract_file(
+        uv_path, uv_executable, mode=int(toolchain.executable_mode), uid=owner_uid, gid=owner_gid
+    )
+    return {
+        "uv_identity": _observe_uv_identity(toolchain),
+        "uv_provenance": toolchain.uv_provenance,
+        "python_identity": _observe_python_identity(toolchain),
+        "uv_archive_sha256": toolchain.uv_archive_sha256,
+        "uv_archive_size": int(uv_info.st_size),
+        "cpython_archive_sha256": toolchain.python_archive_sha256,
     }
 
 
@@ -1041,6 +1635,7 @@ def _read_hermes_install_provenance(
     expected_sha256: str,
     expected_archive_sha256: str,
     expected_source_sha: str,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> dict[str, object]:
     """Read the externally-built, complete Hermes install provenance record."""
     provenance_path = _validated_install_path(
@@ -1089,8 +1684,12 @@ def _read_hermes_install_provenance(
         field="Hermes first-party Git archive SHA256",
         length=64,
     )
-    uv_identity = value.get("uv_identity")
-    uv_identity = _validate_uv_identity(uv_identity)
+    uv_identity = _validate_uv_identity(value.get("uv_identity"), toolchain=toolchain)
+    uv_provenance = _validate_uv_provenance(value.get("uv_provenance"), toolchain=toolchain)
+    python_identity = _validate_python_identity(
+        value.get("python_identity"), toolchain=toolchain
+    )
+    supported_tags = _python_identity_supported_tags(python_identity)
     locked = value.get("locked_packages")
     if not isinstance(locked, list) or len(locked) < 2:
         raise ValueError("Hermes install provenance lock closure is incomplete")
@@ -1103,6 +1702,8 @@ def _read_hermes_install_provenance(
         )
         if not isinstance(name, str) or not isinstance(version, str) or not isinstance(source, dict) or not isinstance(artifacts, list) or not artifacts:
             raise ValueError("Hermes install provenance lock record is incomplete")
+        if source != {"registry": HERMES_LOCKED_REGISTRY}:
+            raise ValueError("Hermes install provenance lock record is not from the reviewed index")
         lock_key = (name.lower().replace("_", "-").replace(".", "-"), version)
         if previous_lock_key is not None and lock_key < previous_lock_key:
             raise ValueError("Hermes install provenance lock records are not ordered")
@@ -1114,6 +1715,7 @@ def _read_hermes_install_provenance(
             if not isinstance(artifact.get("url"), str) or isinstance(artifact.get("size"), bool) or not isinstance(artifact.get("size"), int) or int(artifact["size"]) <= 0:
                 raise ValueError("Hermes install provenance artifact record is incomplete")
             digest = _validated_hex_sha(artifact.get("sha256"), field="Hermes locked artifact SHA256", length=64)
+            _validated_locked_artifact_url(str(artifact["url"]))
             artifact_key = (str(artifact["url"]), digest)
             if previous_artifact is not None and artifact_key < previous_artifact:
                 raise ValueError("Hermes install provenance artifacts are not ordered")
@@ -1149,7 +1751,7 @@ def _read_hermes_install_provenance(
         ):
             raise ValueError("Hermes installed distribution artifact is incomplete")
         _validated_hex_sha(artifact.get("sha256"), field="Hermes installed artifact SHA256", length=64)
-        if artifact != _selected_locked_artifact(locked_by_key[key]):
+        if artifact != _selected_locked_artifact(locked_by_key[key], supported_tags=supported_tags):
             raise ValueError("Hermes installed distribution artifact differs from uv.lock")
     if installed_keys != set(locked_by_key):
         raise ValueError("Hermes installed distribution set differs from uv.lock")
@@ -1229,7 +1831,13 @@ def _read_hermes_install_provenance(
         for entry in normalized
     ):
         raise ValueError("Hermes install provenance has no dependency closure")
-    return {**value, "entries": normalized}
+    return {
+        **value,
+        "entries": normalized,
+        "uv_identity": uv_identity,
+        "uv_provenance": uv_provenance,
+        "python_identity": python_identity,
+    }
 
 
 def _validate_hermes_install_closure(
@@ -1239,6 +1847,8 @@ def _validate_hermes_install_closure(
     provenance_path: Path,
     provenance_sha256: str,
     hermes_source_sha: str,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
+    verify_artifacts: bool = False,
 ) -> dict[str, object]:
     archive = _read_runtime_archive_manifest(
         archive_path,
@@ -1264,6 +1874,7 @@ def _validate_hermes_install_closure(
         expected_sha256=provenance_sha256,
         expected_archive_sha256=archive_sha256,
         expected_source_sha=hermes_source_sha,
+        toolchain=toolchain,
     )
     archive_entries = cast(list[dict[str, object]], archive["entries"])
     provenance_entries = cast(list[dict[str, object]], provenance["entries"])
@@ -1331,7 +1942,11 @@ def _validate_hermes_install_closure(
         verified_installed = _verify_installed_distributions(
             site_packages,
             cast(list[dict[str, object]], provenance["locked_packages"]),
+            supported_tags=_python_identity_supported_tags(
+                cast(dict[str, object], provenance["python_identity"])
+            ),
             allow_external_record_targets=True,
+            wheel_bytes=_fetch_locked_artifact if verify_artifacts else None,
         )
     if verified_installed != provenance["installed_distributions"]:
         raise ValueError("Hermes install distribution records differ from the verified closure")
@@ -1453,14 +2068,29 @@ def _validate_radulator_publisher_source(
         raise ValueError("Radulator source checkout has no verifiable Git HEAD")
     if head != expected:
         raise ValueError("Radulator source SHA does not match Git HEAD")
-    # A clean HEAD alone does not bind the two executable inputs: a caller
-    # could replace a tracked file and then supply its replacement digest.
-    # Compare both bytes and executable mode with the immutable Git blobs.
+    # A clean HEAD alone does not bind the executable inputs: a caller could
+    # replace a tracked file and then supply its replacement digest.  Compare
+    # bytes and executable mode of every reviewed publisher asset with the
+    # immutable Git blobs, and derive Radulator's own asset manifest from
+    # those blobs so the broker plan and the publisher installer bind the
+    # identical digest.
     reviewed_probe_sha: str | None = None
-    for relative, actual in (
-        ("ops/hermes/radulator/trusted_publisher.py", probe),
-        ("ops/hermes/radulator/lifecycle_controller.py", lifecycle),
-    ):
+    manifest_entries: list[dict[str, object]] = []
+    for name in RADULATOR_PUBLISHER_ASSETS:
+        relative = "ops/hermes/radulator/" + name
+        actual = source / "ops" / "hermes" / "radulator" / name
+        try:
+            actual_info = actual.lstat()
+        except OSError as exc:
+            raise ValueError("Radulator publisher asset is unavailable") from exc
+        if (
+            stat.S_ISLNK(actual_info.st_mode)
+            or not stat.S_ISREG(actual_info.st_mode)
+            or actual_info.st_uid not in {0, os.geteuid()}
+            or actual_info.st_nlink != 1
+            or stat.S_IMODE(actual_info.st_mode) & 0o022
+        ):
+            raise ValueError("Radulator publisher asset is unsafe or unavailable")
         listing = subprocess.run(
             [str(git), "-C", str(source), "ls-tree", "-z", expected, "--", relative],
             check=False, capture_output=True, timeout=10, env=_git_command_environment(),
@@ -1488,8 +2118,18 @@ def _validate_radulator_publisher_source(
         executable = bool(stat.S_IMODE(actual_info.st_mode) & 0o111)
         if actual_bytes != blob.stdout or executable != (mode == b"100755"):
             raise ValueError("Radulator source file differs from the reviewed Git blob")
-        if relative == "ops/hermes/radulator/trusted_publisher.py":
+        if name == "trusted_publisher.py":
             reviewed_probe_sha = hashlib.sha256(blob.stdout).hexdigest()
+        manifest_entries.append({
+            "path": name,
+            "size": len(blob.stdout),
+            "sha256": hashlib.sha256(blob.stdout).hexdigest(),
+            "mode": 0o555 if name.endswith(".sh") else 0o444,
+        })
+    manifest_entries.sort(key=lambda item: str(item["path"]))
+    manifest_digest = hashlib.sha256(
+        json.dumps(manifest_entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     probe_info = _read_publisher_probe(
         probe, expected_sha256=publisher_probe_sha256
     )
@@ -1501,6 +2141,8 @@ def _validate_radulator_publisher_source(
         "source_path": str(source),
         "lifecycle_controller_path": str(lifecycle),
         "lifecycle_controller_sha256": _safe_file_sha256(lifecycle),
+        "publisher_asset_manifest": manifest_entries,
+        "publisher_asset_manifest_sha256": manifest_digest,
     }
 
 
@@ -1559,7 +2201,15 @@ def _validate_hermes_source_provenance(
     lock_digest = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
     if provenance.get("pyproject_lock_sha256") != lock_digest:
         raise ValueError("Hermes pyproject/lock digest differs from the checkout")
-    locked = _locked_uv_packages(uv_lock)
+    python_identity = provenance.get("python_identity")
+    if not isinstance(python_identity, dict) or not isinstance(
+        python_identity.get("marker_environment"), dict
+    ):
+        raise ValueError("Hermes install provenance has no builder marker environment")
+    locked = _locked_uv_packages(
+        uv_lock,
+        marker_environment=cast(dict[str, str], python_identity["marker_environment"]),
+    )
     if provenance.get("locked_packages") != locked:
         raise ValueError("Hermes install provenance lock records differ from uv.lock")
     _archive_bytes, _first_party_files = _git_archive_hermes_cli(
@@ -1581,6 +2231,7 @@ def render_sealed_runtime_plan(
     hermes_source_path: Path | None = None,
     runtime_root: Path,
     entrypoint_path: Path,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> dict[str, object]:
     """Bind official CPython and a complete staged Hermes install closure."""
     root = _validated_install_path(runtime_root, field="sealed runtime root", allow_root=True)
@@ -1602,6 +2253,7 @@ def render_sealed_runtime_plan(
         provenance_path=hermes_install_provenance_path,
         provenance_sha256=hermes_install_provenance_sha256,
         hermes_source_sha=hermes_source_sha,
+        toolchain=toolchain,
     )
     hermes = cast(dict[str, object], closure["archive"])
     provenance = cast(dict[str, object], closure["provenance"])
@@ -1726,6 +2378,8 @@ def render_sealed_runtime_plan(
         "hermes_source_sha": hermes_source_sha,
         "hermes_pyproject_lock_sha256": str(provenance["pyproject_lock_sha256"]),
         "hermes_uv_identity": provenance["uv_identity"],
+        "hermes_uv_provenance": provenance["uv_provenance"],
+        "hermes_python_identity": provenance["python_identity"],
         "hermes_provenance_path": str(Path(hermes_install_provenance_path)),
         "hermes_provenance_sha256": str(hermes_install_provenance_sha256),
         "archives": [python, hermes],
@@ -2725,6 +3379,35 @@ def render_filesystem_provision_plan(
         },
         {"path": str(Path(config["package_root"])), "uid": 0, "gid": 0, "mode": 0o555},
     ]
+    # The worker validator requires the HOME profile tree to be private and
+    # model-owned.  Keep the dispatcher routing overlay separate (and
+    # root-owned below), but always render the named model profile when the
+    # configuration binds one.  This also makes a filesystem-only render
+    # complete instead of relying on a caller to infer these parents.
+    dispatcher_profile = config.get("dispatcher_profile")
+    if dispatcher_profile is not None:
+        if (
+            not isinstance(dispatcher_profile, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", dispatcher_profile)
+        ):
+            raise ValueError("dispatcher profile name is invalid")
+        worker_root = Path(config["worker_hermes_root"])
+        profile_root = worker_root / "profiles"
+        model_uid = int(config["model_uid"])
+        directories.extend([
+            {
+                "path": str(profile_root),
+                "uid": model_uid,
+                "gid": workspace_gid,
+                "mode": 0o700,
+            },
+            {
+                "path": str(profile_root / dispatcher_profile),
+                "uid": model_uid,
+                "gid": workspace_gid,
+                "mode": 0o700,
+            },
+        ])
     directories.extend(runtime_directories)
     for surface, (uid, gid) in surface_ids.items():
         directories.extend([
@@ -2858,6 +3541,8 @@ def render_filesystem_provision_plan(
             "hermes_pyproject_lock_sha256": str(sealed_runtime_plan["hermes_pyproject_lock_sha256"]),
             "hermes_provenance_path": str(sealed_runtime_plan["hermes_provenance_path"]),
             "hermes_provenance_sha256": str(sealed_runtime_plan["hermes_provenance_sha256"]),
+            "hermes_uv_provenance": dict(sealed_runtime_plan["hermes_uv_provenance"]),
+            "hermes_python_identity": dict(sealed_runtime_plan["hermes_python_identity"]),
             "runtime_manifest_sha256": str(sealed_runtime_plan["runtime_manifest_sha256"]),
             "official_release": str(sealed_runtime_plan["official_release"]),
             "official_asset_id": int(sealed_runtime_plan["official_asset_id"]),
@@ -3332,14 +4017,20 @@ def _read_runtime_manifest_file(
     return manifest
 
 
-def _verify_runtime_tree_against_manifest(
+def _observe_runtime_tree(
     runtime_root: Path,
-    expected_entries: list[dict[str, object]],
     *,
     expected_owner_uid: int = 0,
     expected_owner_gid: int = 0,
-) -> None:
-    """Compare every installed runtime node with the sealed recursive manifest."""
+    skip_bytecode: bool = False,
+) -> list[dict[str, object]]:
+    """Walk an immutable owner-pinned tree descriptor-relatively and record it.
+
+    Every node must belong to the expected owner and be non-writable by
+    others; symlinks must stay inside the tree.  With ``skip_bytecode`` the
+    ``__pycache__`` directories and compiled files are ignored so that
+    running the interpreter cannot alter the tree's recorded identity.
+    """
     root = Path(runtime_root)
     root_fd = _open_directory_fd(root)
     try:
@@ -3369,6 +4060,11 @@ def _verify_runtime_tree_against_manifest(
                             raise ValueError("sealed runtime contains an unsafe path")
                         relative = prefix / name
                         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if skip_bytecode and (
+                            (stat.S_ISDIR(info.st_mode) and name == "__pycache__")
+                            or (not stat.S_ISDIR(info.st_mode) and name.endswith((".pyc", ".pyo")))
+                        ):
+                            continue
                         if stat.S_ISLNK(info.st_mode):
                             target = os.readlink(name, dir_fd=directory_fd)
                             if (
@@ -3397,6 +4093,8 @@ def _verify_runtime_tree_against_manifest(
                                 or info.st_gid != int(expected_owner_gid)
                             ):
                                 raise ValueError("sealed runtime directory ownership changed")
+                            if stat.S_IMODE(info.st_mode) & 0o022:
+                                raise ValueError("sealed runtime directory is mutable")
                             observed.append({
                                 "path": relative.as_posix() + "/",
                                 "type": "directory",
@@ -3421,6 +4119,8 @@ def _verify_runtime_tree_against_manifest(
                                 or info.st_nlink != 1
                             ):
                                 raise ValueError("sealed runtime file ownership changed")
+                            if stat.S_IMODE(info.st_mode) & 0o022:
+                                raise ValueError("sealed runtime file is mutable")
                             child_fd = os.open(
                                 name,
                                 os.O_RDONLY
@@ -3480,6 +4180,26 @@ def _verify_runtime_tree_against_manifest(
         visit(root_fd, PurePosixPath())
     finally:
         os.close(root_fd)
+    return observed
+
+
+def _verify_runtime_tree_against_manifest(
+    runtime_root: Path,
+    expected_entries: list[dict[str, object]],
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+) -> None:
+    """Compare every installed runtime node with the sealed recursive manifest."""
+    observed = sorted(
+        _observe_runtime_tree(
+            runtime_root,
+            expected_owner_uid=expected_owner_uid,
+            expected_owner_gid=expected_owner_gid,
+        ),
+        key=lambda item: str(item["path"]),
+    )
+    expected_entries = sorted(expected_entries, key=lambda item: str(item["path"]))
     if observed != expected_entries:
         expected_paths = {str(item.get("path")) for item in expected_entries}
         observed_paths = {str(item.get("path")) for item in observed}
@@ -3493,7 +4213,10 @@ def _verify_runtime_tree_against_manifest(
 
 
 def _materialize_sealed_runtime(
-    filesystem_plan: dict[str, object], *, runtime_probe=None
+    filesystem_plan: dict[str, object],
+    *,
+    runtime_probe=None,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> None:
     descriptor = filesystem_plan.get("sealed_runtime")
     if not isinstance(descriptor, dict) or descriptor.get("contract") != SEALED_RUNTIME_CONTRACT:
@@ -3524,10 +4247,11 @@ def _materialize_sealed_runtime(
         hermes_source_sha=str(descriptor.get("hermes_source_sha") or ""),
         runtime_root=runtime_root,
         entrypoint_path=entrypoint,
+        toolchain=toolchain,
     )
     for field in (
         "python_sha256", "package_manifest_sha256", "runtime_manifest_sha256",
-        "hermes_uv_identity",
+        "hermes_uv_identity", "hermes_uv_provenance", "hermes_python_identity",
     ):
         if str(descriptor.get(field)) != str(bound[field]):
             raise ValueError("sealed runtime manifest binding differs from archives")
@@ -3564,6 +4288,7 @@ def _materialize_sealed_runtime(
                 provenance_path=Path(str(descriptor.get("hermes_provenance_path") or "")),
                 provenance_sha256=str(descriptor.get("hermes_provenance_sha256") or ""),
                 hermes_source_sha=str(descriptor.get("hermes_source_sha") or ""),
+                toolchain=toolchain,
             )["archive"],
         ),
     ]
@@ -3663,6 +4388,7 @@ def provision_filesystem_plan(
     *,
     payloads: dict[str, bytes],
     runtime_probe=None,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> None:
     """Materialize one exact disabled plan without following symlinks."""
 
@@ -3696,7 +4422,7 @@ def provision_filesystem_plan(
     for item in files:
         _provision_file_asset(item, payloads.get(str(item["path"])))
     if "sealed_runtime" in plan:
-        _materialize_sealed_runtime(plan, runtime_probe=runtime_probe)
+        _materialize_sealed_runtime(plan, runtime_probe=runtime_probe, toolchain=toolchain)
 
 
 def provision_disabled_install(
@@ -3705,6 +4431,7 @@ def provision_disabled_install(
     payloads: dict[str, bytes],
     service_config_path: Path,
     runner=subprocess.run,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> None:
     """Provision exact assets only after proving both services are disabled.
 
@@ -3725,7 +4452,7 @@ def provision_disabled_install(
     if len(matching) != 1:
         raise ValueError("filesystem plan does not bind one exact service config")
     _disable_unloaded_launchd_services(runner)
-    provision_filesystem_plan(plan, payloads=payloads)
+    provision_filesystem_plan(plan, payloads=payloads, toolchain=toolchain)
     info = path.lstat()
     if info.st_uid <= 0:
         raise ValueError("broker service config must be owned by the broker UID")
@@ -4566,8 +5293,31 @@ def _source_git_identity(source: Path, *, expected: str, git: Path) -> tuple[str
     return head, tree
 
 
-def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
-    """Extract the active, non-editable package set from a real uv.lock."""
+def _validated_locked_artifact_url(url: object) -> str:
+    """Accept only https artifact URLs on the reviewed index file host."""
+    if not isinstance(url, str) or not url:
+        raise ValueError("Hermes uv.lock artifact URL is invalid")
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in HERMES_LOCKED_ARTIFACT_HOSTS
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/")
+    ):
+        raise ValueError("Hermes uv.lock artifact URL is not on the reviewed index host")
+    return url
+
+
+def _locked_uv_packages(
+    uv_lock: bytes, *, marker_environment: dict[str, str]
+) -> list[dict[str, object]]:
+    """Extract the active, non-editable package set from a real uv.lock.
+
+    Marker evaluation uses the recorded builder interpreter environment, never
+    the interpreter that happens to run this verifier.
+    """
     try:
         document = tomllib.loads(uv_lock.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -4575,11 +5325,16 @@ def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
     if document.get("version") != 1 or not isinstance(document.get("package"), list):
         raise ValueError("Hermes uv.lock has no supported package set")
     try:
-        from packaging.markers import Marker, default_environment
-
-        marker_environment = default_environment()
+        from packaging.markers import Marker
     except ImportError as exc:
         raise ValueError("Hermes lock marker verifier is unavailable") from exc
+    if (
+        not isinstance(marker_environment, dict)
+        or set(marker_environment) != HERMES_MARKER_ENVIRONMENT_FIELDS
+        or not all(isinstance(value, str) for value in marker_environment.values())
+    ):
+        raise ValueError("Hermes lock marker environment is invalid")
+    marker_environment = dict(marker_environment)
     records: dict[tuple[str, str], dict[str, object]] = {}
     root_package: dict[str, object] | None = None
 
@@ -4661,6 +5416,8 @@ def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
             continue
         if set(source) != {"registry"} or not isinstance(source.get("registry"), str) or not source["registry"].startswith("https://"):
             raise ValueError("Hermes uv.lock contains a local, VCS, or file dependency")
+        if source["registry"] != HERMES_LOCKED_REGISTRY:
+            raise ValueError("Hermes uv.lock uses an index other than the reviewed registry")
         artifacts: list[dict[str, object]] = []
         for key in ("sdist", "wheels"):
             values = package.get(key, []) if key == "wheels" else [package.get(key)]
@@ -4684,6 +5441,7 @@ def _locked_uv_packages(uv_lock: bytes) -> list[dict[str, object]]:
                     or size <= 0
                 ):
                     raise ValueError("Hermes uv.lock package has no complete artifact hash")
+                _validated_locked_artifact_url(url)
                 artifacts.append({"url": url, "sha256": digest[7:], "size": size})
         if not artifacts:
             raise ValueError("Hermes uv.lock package has no artifact hash")
@@ -4823,19 +5581,27 @@ def _record_path_is_first_party(path: str) -> bool:
     return path.startswith("hermes_cli/") or path in _HERMES_RECORD_ALLOWLIST
 
 
-def _selected_locked_artifact(package: dict[str, object]) -> dict[str, object]:
-    """Choose one lock-approved artifact for the active interpreter target."""
+def _selected_locked_artifact(
+    package: dict[str, object], *, supported_tags: list[object]
+) -> dict[str, object]:
+    """Choose the one lock-approved wheel for the recorded builder interpreter.
+
+    Source distributions are never selected: a build from source is not
+    reproducible from the lock digest alone and would let build-time code run
+    inside the closure builder.
+    """
     artifacts = package.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("Hermes lock package has no selectable artifact")
     try:
-        from packaging.tags import sys_tags
         from packaging.utils import parse_wheel_filename
-
-        supported = set(sys_tags())
     except ImportError as exc:
         raise ValueError("Hermes wheel tag verifier is unavailable") from exc
-    fallback: dict[str, object] | None = None
+    ranking: dict[object, int] = {}
+    for index, tag in enumerate(supported_tags):
+        ranking.setdefault(tag, index)
+    best: dict[str, object] | None = None
+    best_rank: int | None = None
     for artifact in artifacts:
         if not isinstance(artifact, dict):
             raise ValueError("Hermes lock artifact is malformed")
@@ -4843,18 +5609,197 @@ def _selected_locked_artifact(package: dict[str, object]) -> dict[str, object]:
         if not isinstance(url, str):
             raise ValueError("Hermes lock artifact URL is invalid")
         basename = url.rsplit("/", 1)[-1].split("?", 1)[0]
-        if basename.endswith(".whl"):
+        if not basename.endswith(".whl"):
+            continue
+        try:
+            _name, _version, _build, tags = parse_wheel_filename(basename)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Hermes lock wheel filename is invalid") from exc
+        rank = min((ranking[tag] for tag in tags if tag in ranking), default=None)
+        if rank is None:
+            continue
+        if best_rank is None or rank < best_rank:
+            best, best_rank = dict(artifact), rank
+    if best is None:
+        raise ValueError("Hermes lock has no wheel for the pinned builder interpreter")
+    return best
+
+
+def _fetch_locked_artifact(artifact: dict[str, object]) -> bytes:
+    """Download one hash-pinned lock artifact from the reviewed index host."""
+    url = _validated_locked_artifact_url(artifact.get("url"))
+    expected_digest = _validated_hex_sha(
+        artifact.get("sha256"), field="Hermes locked artifact SHA256", length=64
+    )
+    expected_size = artifact.get("size")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size <= 0
+        or expected_size > _MAX_RUNTIME_ARCHIVE_BYTES
+    ):
+        raise ValueError("Hermes locked artifact size is invalid")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "hermes-kanban-broker-installer"}
+    )
+    chunks: list[bytes] = []
+    try:
+        with opener.open(request, timeout=120) as response:
+            remaining = int(expected_size) + 1
+            while remaining > 0:
+                chunk = response.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+    except (OSError, ValueError) as exc:
+        raise ValueError("Hermes locked artifact could not be downloaded") from exc
+    content = b"".join(chunks)
+    if len(content) != int(expected_size) or hashlib.sha256(content).hexdigest() != expected_digest:
+        raise ValueError("Hermes locked artifact bytes differ from the lock digest")
+    return content
+
+
+_WHEEL_RELOCATED_DATA_CATEGORIES = frozenset({"purelib", "platlib"})
+
+
+def _parse_record_rows(raw: bytes, *, role: str) -> list[list[str]]:
+    try:
+        rows = list(csv.reader(raw.decode("utf-8").splitlines()))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError(f"{role} RECORD is invalid") from exc
+    for row in rows:
+        if len(row) != 3:
+            raise ValueError(f"{role} RECORD row is invalid")
+    return rows
+
+
+def _verify_wheel_record_binding(
+    *,
+    dist_info_name: str,
+    installed_rows: dict[str, tuple[str, str]],
+    wheel: bytes,
+) -> None:
+    """Tie the installed RECORD to the RECORD inside the hash-pinned wheel.
+
+    Every payload row the wheel declares must be installed with the same
+    hash and size, and the installed distribution may not contain anything
+    the wheel did not ship except the installer's own bookkeeping files and
+    the relocated console scripts, which are digest-verified separately.
+    """
+    record_name = f"{dist_info_name}/RECORD"
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+            if record_name not in archive.namelist():
+                raise ValueError("locked wheel does not carry the installed distribution")
+            with archive.open(record_name) as handle:
+                wheel_record = handle.read(_MAX_RUNTIME_FILE_BYTES + 1)
+    except (zipfile.BadZipFile, OSError, KeyError) as exc:
+        raise ValueError("locked wheel archive is invalid") from exc
+    if len(wheel_record) > _MAX_RUNTIME_FILE_BYTES:
+        raise ValueError("locked wheel RECORD exceeds the size limit")
+    data_prefix = dist_info_name[: -len(".dist-info")] + ".data/"
+    covered: set[str] = set()
+    for path, digest, size in _parse_record_rows(wheel_record, role="locked wheel"):
+        if path == record_name:
+            continue
+        if path.startswith(data_prefix):
+            category, _separator, remainder = path[len(data_prefix):].partition("/")
+            if category == "scripts":
+                continue
+            if category in _WHEEL_RELOCATED_DATA_CATEGORIES and remainder:
+                path = remainder
+            else:
+                raise ValueError("locked wheel installs data outside site-packages")
+        if installed_rows.get(path) != (digest, size):
+            raise ValueError("installed Hermes dependency bytes are not bound to the locked wheel")
+        covered.add(path)
+    allowed_extra = {
+        f"{dist_info_name}/INSTALLER",
+        f"{dist_info_name}/REQUESTED",
+        record_name,
+    }
+    for path in installed_rows:
+        if path in covered or path in allowed_extra:
+            continue
+        if _HERMES_EXTERNAL_RECORD_RE.fullmatch(path):
+            continue
+        raise ValueError("installed Hermes dependency contains files absent from the locked wheel")
+
+
+_UV_EXPORT_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9_.-]*)(\[[^\]]*\])?==([0-9A-Za-z][0-9A-Za-z.+!~-]*)\s*(?:;\s*(.+))?$"
+)
+
+
+def _parse_uv_export(text: str) -> dict[tuple[str, str], dict[str, object]]:
+    """Parse ``uv export --format requirements.txt`` into exact records."""
+    entries: dict[tuple[str, str], dict[str, object]] = {}
+    current: tuple[str, str] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("\\"):
+            stripped = stripped[:-1].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("--hash=sha256:"):
+            if current is None:
+                raise ValueError("Hermes locked export has a hash without a requirement")
+            digest = stripped[len("--hash=sha256:"):]
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("Hermes locked export hash is invalid")
+            cast(set[str], entries[current]["hashes"]).add(digest)
+            continue
+        if stripped.startswith("-"):
+            raise ValueError("Hermes locked export contains an unexpected option")
+        match = _UV_EXPORT_REQUIREMENT_RE.match(stripped)
+        if match is None:
+            raise ValueError("Hermes locked export contains an unsupported requirement")
+        key = (
+            match.group(1).lower().replace("_", "-").replace(".", "-"),
+            match.group(3),
+        )
+        if key in entries:
+            raise ValueError("Hermes locked export contains duplicate requirements")
+        entries[key] = {"marker": match.group(4), "hashes": set()}
+        current = key
+    return entries
+
+
+def _verify_uv_export_matches_lock(
+    text: str,
+    *,
+    locked: list[dict[str, object]],
+    marker_environment: dict[str, str],
+) -> None:
+    """Require the installer's own resolution to equal the parsed lock graph."""
+    try:
+        from packaging.markers import Marker
+    except ImportError as exc:
+        raise ValueError("Hermes lock marker verifier is unavailable") from exc
+    active: dict[tuple[str, str], set[str]] = {}
+    for key, entry in _parse_uv_export(text).items():
+        marker = entry.get("marker")
+        if marker:
             try:
-                _name, _version, _build, tags = parse_wheel_filename(basename)
+                if not Marker(str(marker)).evaluate(dict(marker_environment)):
+                    continue
             except (TypeError, ValueError) as exc:
-                raise ValueError("Hermes lock wheel filename is invalid") from exc
-            if supported.intersection(tags):
-                return dict(artifact)
-        elif fallback is None and basename.endswith((".tar.gz", ".zip")):
-            fallback = dict(artifact)
-    if fallback is None:
-        raise ValueError("Hermes lock has no artifact for the active interpreter")
-    return fallback
+                raise ValueError("Hermes locked export marker is invalid") from exc
+        hashes = cast(set[str], entry["hashes"])
+        if not hashes:
+            raise ValueError("Hermes locked export omits an artifact hash")
+        active[key] = set(hashes)
+    expected = {
+        (
+            str(package["name"]).lower().replace("_", "-").replace(".", "-"),
+            str(package["version"]),
+        ): {str(artifact["sha256"]) for artifact in cast(list[dict[str, object]], package["artifacts"])}
+        for package in locked
+    }
+    if active != expected:
+        raise ValueError("Hermes locked export differs from the active uv.lock graph")
 
 
 _HERMES_EXTERNAL_RECORD_RE = re.compile(r"\.\./\.\./\.\./bin/[A-Za-z0-9_.-]{1,128}")
@@ -4885,9 +5830,15 @@ def _verify_installed_distributions(
     site_packages: Path,
     locked: list[dict[str, object]],
     *,
+    supported_tags: list[object],
     allow_external_record_targets: bool = False,
+    wheel_bytes=None,
 ) -> list[dict[str, object]]:
-    """Verify exact locked distributions, RECORD coverage, and artifact hashes."""
+    """Verify exact locked distributions, RECORD coverage, and artifact hashes.
+
+    With ``wheel_bytes`` (a fetcher returning the hash-pinned wheel), every
+    installed payload row is additionally bound to the wheel's own RECORD.
+    """
     locked_by_key = {
         (str(item["name"]).lower().replace("_", "-").replace(".", "-"), str(item["version"])): item
         for item in locked
@@ -4917,7 +5868,7 @@ def _verify_installed_distributions(
             raise ValueError("installed Hermes dependency is not bound to the exact uv.lock resolution")
         actual_keys.add(key)
         package = locked_by_key[key]
-        selected_artifact = _selected_locked_artifact(package)
+        selected_artifact = _selected_locked_artifact(package, supported_tags=supported_tags)
         dist_info = metadata_path.parent
         record_path = dist_info / "RECORD"
         record_relative = record_path.relative_to(site_packages).as_posix()
@@ -4927,7 +5878,9 @@ def _verify_installed_distributions(
         except (UnicodeDecodeError, csv.Error) as exc:
             raise ValueError("installed Hermes dependency RECORD is invalid") from exc
         seen: set[str] = set()
+        installed_rows: dict[str, tuple[str, str]] = {}
         record_seen = False
+        payload_seen = False
         for row in rows:
             if len(row) != 3:
                 raise ValueError("installed Hermes dependency RECORD row is invalid")
@@ -4935,8 +5888,11 @@ def _verify_installed_distributions(
             if row_path in seen or row_path in record_owner:
                 raise ValueError("installed Hermes dependency RECORD contains duplicate paths")
             seen.add(row_path)
+            installed_rows[row_path] = (row[1], row[2])
             record_owner[row_path] = str(name)
             external_record = _HERMES_EXTERNAL_RECORD_RE.fullmatch(row_path) is not None
+            if not external_record and not row_path.startswith(dist_info.name + "/"):
+                payload_seen = True
             if external_record:
                 candidate = site_packages.parents[2] / "bin" / PurePosixPath(row_path).name
             else:
@@ -4979,19 +5935,20 @@ def _verify_installed_distributions(
                 raise ValueError("installed Hermes dependency RECORD digest differs")
         if not record_seen:
             raise ValueError("installed Hermes dependency RECORD does not record itself")
+        if not payload_seen:
+            raise ValueError("installed Hermes dependency has no installed payload")
         direct_url = dist_info / "direct_url.json"
-        if direct_url.exists():
-            direct_raw, _ = _read_sealed_file_bytes(direct_url, max_bytes=_MAX_RUNTIME_FILE_BYTES)
-            try:
-                direct = json.loads(direct_raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError("installed Hermes dependency direct_url is invalid") from exc
-            expected_direct = {
-                "url": selected_artifact["url"],
-                "archive_info": {"hash": "sha256=" + str(selected_artifact["sha256"])},
-            }
-            if direct != expected_direct:
-                raise ValueError("installed Hermes dependency direct_url is not lock-bound")
+        if direct_url.exists() or direct_url.is_symlink():
+            # uv records direct_url.json only for direct-URL, VCS, path, or
+            # editable installs.  A registry-locked closure never carries
+            # one; the hash-pinned wheel itself is the binding below.
+            raise ValueError("installed Hermes dependency is not a registry-locked install")
+        if wheel_bytes is not None:
+            _verify_wheel_record_binding(
+                dist_info_name=dist_info.name,
+                installed_rows=installed_rows,
+                wheel=wheel_bytes(selected_artifact),
+            )
         installed.append({
             "name": name,
             "version": version,
@@ -5046,8 +6003,7 @@ def build_hermes_install_archive(
     output_archive: Path,
     output_provenance: Path,
     git_executable: Path = Path("/usr/bin/git"),
-    uv_executable: Path = Path("/opt/homebrew/bin/uv"),
-    uv_identity: dict[str, object] | None = None,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> dict[str, str]:
     """Build a source-derived, locked, non-editable Hermes closure.
 
@@ -5056,7 +6012,14 @@ def build_hermes_install_archive(
     commit; third-party bytes come from a fresh ``uv sync --frozen`` using the
     real lockfile.  This keeps a caller from making an arbitrary directory
     look like a reviewed Hermes installation by merely self-attesting it.
+
+    The builder runs only as the owner of the reviewed staged toolchain and
+    resolves, installs, and tags wheels exclusively through that toolchain's
+    interpreter, so no ambient ``sys.executable`` or user-owned output ever
+    enters the closure's provenance.
     """
+    if os.geteuid() != int(toolchain.owner_uid):
+        raise PermissionError("Hermes closure builder must run as the staged toolchain owner")
     source = Path(source_root)
     install = Path(install_root)
     expected = _validated_hex_sha(source_sha, field="Hermes source SHA", length=40)
@@ -5067,9 +6030,12 @@ def build_hermes_install_archive(
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
             raise ValueError(f"{field} must be a real directory")
     git = Path(git_executable)
-    uv = Path(uv_executable)
-    if not uv.is_absolute() or ".." in uv.parts:
-        raise ValueError("Hermes locked installer path is invalid")
+    bound_uv_identity = _observe_uv_identity(toolchain)
+    bound_python_identity = _observe_python_identity(toolchain)
+    marker_environment = cast(dict[str, str], bound_python_identity["marker_environment"])
+    supported_tags = _python_identity_supported_tags(bound_python_identity)
+    uv = Path(toolchain.uv_executable)
+    python = toolchain.python_executable
     try:
         _head, tree = _source_git_identity(source, expected=expected, git=git)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -5080,14 +6046,13 @@ def build_hermes_install_archive(
     uv_lock, _ = _read_sealed_file_bytes(
         source / "uv.lock", max_bytes=_MAX_RUNTIME_FILE_BYTES
     )
-    locked_packages = _locked_uv_packages(uv_lock)
+    locked_packages = _locked_uv_packages(uv_lock, marker_environment=marker_environment)
     git_archive, first_party_files = _git_archive_hermes_cli(
         source, expected=expected, git=git
     )
     pyproject_sha = hashlib.sha256(pyproject).hexdigest()
     uv_lock_sha = hashlib.sha256(uv_lock).hexdigest()
     lock_sha = hashlib.sha256(pyproject + b"\0" + uv_lock).hexdigest()
-    bound_uv_identity = _validate_uv_identity(uv_identity, executable=uv)
 
     if install.exists():
         info = install.lstat()
@@ -5103,50 +6068,41 @@ def build_hermes_install_archive(
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-uv-cache-") as cache_dir:
             env = {
-                "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "UV_CACHE_DIR": cache_dir,
                 "UV_PROJECT_ENVIRONMENT": str(install),
                 "UV_NO_PROGRESS": "1",
                 "UV_PYTHON_DOWNLOADS": "never",
                 "PYTHONNOUSERSITE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
             }
             export = subprocess.run(
                 [
                     str(uv), "export", "--frozen", "--no-dev", "--no-emit-project",
-                    "--format", "requirements.txt", "--python", sys.executable,
+                    "--format", "requirements.txt", "--python", str(python),
                 ],
                 cwd=str(source), check=False, capture_output=True, timeout=600, env=env,
             )
             if export.returncode != 0 or not export.stdout:
                 raise ValueError("Hermes locked dependency export could not be verified")
-            requirement_seen = False
-            requirement_hashed = False
-            for line in export.stdout.decode("utf-8").splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                if stripped.startswith("--hash=sha256:"):
-                    requirement_hashed = True
-                    continue
-                if stripped.startswith("--"):
-                    continue
-                if re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*==", stripped):
-                    if requirement_seen and not requirement_hashed:
-                        raise ValueError("Hermes locked export omits an artifact hash")
-                    requirement_seen = True
-                    requirement_hashed = False
-            if not requirement_seen or not requirement_hashed:
-                raise ValueError("Hermes locked export has no complete hash requirements")
+            try:
+                export_text = export.stdout.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Hermes locked dependency export is not UTF-8") from exc
+            _verify_uv_export_matches_lock(
+                export_text, locked=locked_packages, marker_environment=marker_environment
+            )
             result = subprocess.run(
                 [str(uv), "sync", "--frozen", "--no-dev", "--no-install-project",
-                 "--no-editable", "--link-mode", "copy", "--python", sys.executable],
+                 "--no-editable", "--link-mode", "copy", "--python", str(python)],
                 cwd=str(source), check=False, capture_output=True, timeout=600, env=env,
             )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError("Hermes locked dependency build could not run") from exc
     if result.returncode != 0:
         raise ValueError("Hermes locked dependency build failed")
-    version_dir = install / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    python_version = str(bound_python_identity["version"])
+    version_dir = install / "lib" / toolchain.python_library_dir
     site_packages = version_dir / "site-packages"
     if not site_packages.is_dir() or site_packages.is_symlink():
         raise ValueError("Hermes locked dependency build did not produce site-packages")
@@ -5178,7 +6134,12 @@ def build_hermes_install_archive(
             target = Path(directory) / name
             if not target.is_symlink():
                 os.chmod(target, 0o555)
-    installed_distributions = _verify_installed_distributions(site_packages, locked_packages)
+    installed_distributions = _verify_installed_distributions(
+        site_packages,
+        locked_packages,
+        supported_tags=supported_tags,
+        wheel_bytes=_fetch_locked_artifact,
+    )
     entries: list[dict[str, object]] = []
     contents: dict[str, bytes] = {}
     links: dict[str, str] = {}
@@ -5275,7 +6236,9 @@ def build_hermes_install_archive(
         "locked_packages": locked_packages,
         "installed_distributions": installed_distributions,
         "uv_identity": bound_uv_identity,
-        "installer": {"name": "uv", "contract": "sync --frozen --no-dev --no-editable", "python": sys.version.split()[0]},
+        "uv_provenance": dict(toolchain.uv_provenance),
+        "python_identity": bound_python_identity,
+        "installer": {"name": "uv", "contract": "sync --frozen --no-dev --no-editable", "python": python_version},
         "install_archive_sha256": archive_sha,
         "entries": entries,
     }
@@ -5412,14 +6375,14 @@ def main(argv: list[str] | None = None) -> int:
     builder.add_argument("--output-archive", type=Path, required=True)
     builder.add_argument("--output-provenance", type=Path, required=True)
     builder.add_argument("--git", type=Path, default=Path("/usr/bin/git"))
-    builder.add_argument("--uv", type=Path, default=Path("/opt/homebrew/bin/uv"))
-    builder.add_argument("--uv-sha256", required=True)
-    builder.add_argument("--uv-version", required=True)
-    builder.add_argument("--uv-uid", type=int, required=True)
-    builder.add_argument("--uv-gid", type=int, required=True)
-    builder.add_argument("--uv-mode", type=lambda value: int(value, 0), required=True)
-    builder.add_argument("--uv-nlink", type=int, required=True)
     builder.add_argument("--json", action="store_true")
+    stage = subparsers.add_parser(
+        "stage-toolchain",
+        help="stage the pinned official uv and CPython immutably under the toolchain root",
+    )
+    stage.add_argument("--cpython-archive", type=Path, required=True)
+    stage.add_argument("--uv-archive", type=Path, required=True)
+    stage.add_argument("--json", action="store_true")
     identities = subparsers.add_parser("provision-identities")
     identities.add_argument("--plan", type=Path, required=True)
     assets = subparsers.add_parser("provision-assets")
@@ -5459,6 +6422,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatcher_profile=args.dispatcher_profile,
             git_executable=args.git,
             install_nonce=args.install_nonce,
+            toolchain=HERMES_PRODUCTION_TOOLCHAIN,
         )
         write_broker_installation_plan(
             plan,
@@ -5485,26 +6449,27 @@ def main(argv: list[str] | None = None) -> int:
             output_archive=args.output_archive,
             output_provenance=args.output_provenance,
             git_executable=args.git,
-            uv_executable=args.uv,
-            uv_identity={
-                "path": str(args.uv),
-                "uid": args.uv_uid,
-                "gid": args.uv_gid,
-                "mode": args.uv_mode,
-                "nlink": args.uv_nlink,
-                "version": args.uv_version,
-                "sha256": args.uv_sha256,
-            },
+            toolchain=HERMES_PRODUCTION_TOOLCHAIN,
         )
         # Only digests and reviewed source identity are emitted.  No archive
         # bytes or source contents are printed by this command.
         if args.json:
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 0
+    if args.command == "stage-toolchain":
+        staged = stage_toolchain(
+            cpython_archive=args.cpython_archive,
+            uv_archive=args.uv_archive,
+            toolchain=HERMES_PRODUCTION_TOOLCHAIN,
+        )
+        if args.json:
+            print(json.dumps(staged, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "seal-plan":
         seal_broker_installation_plan(
             input_root=args.input_root,
             output_root=args.output_root,
+            toolchain=HERMES_PRODUCTION_TOOLCHAIN,
         )
         return 0
     if os.geteuid() != 0:  # windows-footgun: ok - macOS launchd installer only
@@ -5561,6 +6526,7 @@ def main(argv: list[str] | None = None) -> int:
             plan,
             payloads=payloads,
             service_config_path=args.config,
+            toolchain=HERMES_PRODUCTION_TOOLCHAIN,
         )
         return 0
     info = args.config.lstat()
@@ -5797,6 +6763,7 @@ def render_worker_launchd_plist(
     runtime_entrypoint_sha256: str | None = None,
     runtime_manifest_path: Path | None = None,
     runtime_manifest_sha256: str | None = None,
+    routing_config_path: Path | None = None,
 ) -> str:
     """Render the persistent unprivileged reverse-worker listener."""
 
@@ -5827,6 +6794,10 @@ def render_worker_launchd_plist(
         r"[0-9a-f]{64}", str(package_manifest_sha256)
     ):
         raise ValueError("worker launchd runtime digests are invalid")
+    if routing_config_path is not None and (
+        not Path(routing_config_path).is_absolute() or ".." in Path(routing_config_path).parts
+    ):
+        raise ValueError("worker routing overlay path must be absolute")
     payload = {
         "Label": "ai.hermes.kanban-worker",
         "ProgramArguments": [
@@ -5861,6 +6832,8 @@ def render_worker_launchd_plist(
             *( ["--runtime-manifest-path", str(Path(runtime_manifest_path)),
                 "--runtime-manifest-sha256", str(runtime_manifest_sha256)]
                if runtime_manifest_path is not None else []),
+            *( ["--routing-config", str(Path(routing_config_path))]
+               if routing_config_path is not None else []),
         ],
         "UserName": _validated_account_name(model_user),
         "ProcessType": "Background",
@@ -5972,6 +6945,7 @@ def render_broker_installation_plan(
     dispatcher_profile: str,
     git_executable: Path = Path("/usr/bin/git"),
     install_nonce: str | None = None,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
 ) -> dict[str, object]:
     """Render every reviewed broker artifact without applying host changes.
 
@@ -6033,8 +7007,15 @@ def render_broker_installation_plan(
     workspace_root = root / "workspaces"
     worker_home = root / "worker-home"
     profile_root = worker_home / "profiles" / dispatcher_profile
-    dispatcher_routing_config_path = profile_root / "kanban-routing.json"
-    dispatcher_profile_config_path = profile_root / "config.yaml"
+    # The worker's HOME/profile tree is model-owned and private so the real
+    # worker credential-home validator can consume it.  Trusted routing flags
+    # live in a separate root-owned overlay; activation updates only that
+    # overlay beneath its immutable parent.
+    model_profile_routing_config_path = profile_root / "kanban-routing.json"
+    model_profile_config_path = profile_root / "config.yaml"
+    dispatcher_root = root / "routing" / dispatcher_profile
+    dispatcher_routing_config_path = dispatcher_root / "kanban-routing.json"
+    dispatcher_profile_config_path = dispatcher_root / "config.yaml"
     handoff_root = root / "publisher-handoffs"
     socket_root = root / "sockets"
     key_root = root / "keys"
@@ -6108,6 +7089,7 @@ def render_broker_installation_plan(
         hermes_source_path=hermes_source_path,
         runtime_root=sealed_runtime_root,
         entrypoint_path=entrypoint_path,
+        toolchain=toolchain,
     )
     # The sidecar is copied into the root-owned staged input tree; keep the
     # source path only in the offline external-input record, never in the
@@ -6226,8 +7208,11 @@ def render_broker_installation_plan(
         dispatcher_profile=dispatcher_profile,
         dispatcher_routing_config_path=dispatcher_routing_config_path,
         dispatcher_profile_config_path=dispatcher_profile_config_path,
+        dispatcher_profile_owner_uid=0,
+        dispatcher_profile_owner_gid=int(desired["workspace"]["gid"]),
         publisher_probe_path=runtime_publisher_probe_path,
         publisher_probe_sha256=str(publisher_probe["sha256"]),
+        publisher_asset_manifest_sha256=str(publisher_probe["publisher_asset_manifest_sha256"]),
         publisher_client_config=client_paths["publisher"],
         controller_client_config=client_paths["controller"],
         operator_client_config=client_paths["operator"],
@@ -6286,6 +7271,7 @@ def render_broker_installation_plan(
         workspace_gid=int(desired["workspace"]["gid"]),
         model_user=str(ids["model"]["user"]),
         worker_hermes_root=worker_home,
+        routing_config_path=dispatcher_profile_config_path,
         runtime_entrypoint_path=entrypoint_path,
         runtime_entrypoint_sha256=str(runtime_entrypoint["sha256"]),
         runtime_manifest_path=runtime_manifest_path,
@@ -6385,6 +7371,8 @@ def render_broker_installation_plan(
         )[0],
         str(dispatcher_routing_config_path): routing_config,
         str(dispatcher_profile_config_path): profile_config,
+        str(model_profile_routing_config_path): routing_config,
+        str(model_profile_config_path): profile_config,
     })
     for surface in ("controller", "publisher", "operator"):
         payload_bytes[str(surface_keys[surface])] = secrets.token_bytes(32)
@@ -6433,19 +7421,36 @@ def render_broker_installation_plan(
             "mode": 0o555,
             "kind": "publisher_preflight_script",
         },
+        # The overlay is root-owned so the model cannot replace it, and
+        # group-readable by the workspace group so the model-identity worker
+        # can consume it as its only routing authority.
         {
             "path": str(dispatcher_routing_config_path),
-            "uid": int(config["model_uid"]),
+            "uid": 0,
             "gid": int(config["workspace_gid"]),
-            "mode": 0o600,
+            "mode": 0o640,
             "kind": "dispatcher_routing_config",
         },
         {
             "path": str(dispatcher_profile_config_path),
+            "uid": 0,
+            "gid": int(config["workspace_gid"]),
+            "mode": 0o640,
+            "kind": "dispatcher_profile_config",
+        },
+        {
+            "path": str(model_profile_routing_config_path),
             "uid": int(config["model_uid"]),
             "gid": int(config["workspace_gid"]),
             "mode": 0o600,
-            "kind": "dispatcher_profile_config",
+            "kind": "worker_profile_routing_config",
+        },
+        {
+            "path": str(model_profile_config_path),
+            "uid": int(config["model_uid"]),
+            "gid": int(config["workspace_gid"]),
+            "mode": 0o600,
+            "kind": "worker_profile_config",
         },
         {
             "path": str(entrypoint_path),
@@ -6491,12 +7496,10 @@ def render_broker_installation_plan(
             {"path": str(runtime_input_root), "uid": 0, "gid": 0, "mode": 0o700},
             {"path": str(sealed_runtime_root), "uid": 0, "gid": 0, "mode": 0o711},
             {"path": str(entrypoint_path.parent), "uid": 0, "gid": 0, "mode": 0o711},
-            # The model owns the profile document, but the profile directory
-            # is a root-owned immutable activation boundary.  This lets a
-            # root writer replace the model-owned document without granting
-            # the model authority to swap the parent or its routing target.
-            {"path": str(Path(config["worker_hermes_root"]) / "profiles"), "uid": 0, "gid": 0, "mode": 0o555},
-            {"path": str(Path(config["worker_hermes_root"]) / "profiles" / dispatcher_profile), "uid": 0, "gid": 0, "mode": 0o555},
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles"), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
+            {"path": str(Path(config["worker_hermes_root"]) / "profiles" / dispatcher_profile), "uid": int(config["model_uid"]), "gid": int(config["workspace_gid"]), "mode": 0o700},
+            {"path": str(dispatcher_root.parent), "uid": 0, "gid": 0, "mode": 0o711},
+            {"path": str(dispatcher_root), "uid": 0, "gid": 0, "mode": 0o555},
         ],
     )
     filesystem_plan["sealed_runtime"]["archive_destinations"] = [
@@ -6560,6 +7563,8 @@ def render_broker_installation_plan(
             "locked_package_count": len(provenance_document["locked_packages"]),
             "installed_distribution_count": len(provenance_document["installed_distributions"]),
             "uv_identity": provenance_document["uv_identity"],
+            "uv_provenance": provenance_document["uv_provenance"],
+            "python_identity": provenance_document["python_identity"],
         },
         "files": [
             {
@@ -6756,6 +7761,99 @@ def _atomic_artifact_write(path: Path, content: bytes, *, mode: int, uid: int, g
         os.close(parent_fd)
 
 
+def _replace_runtime_attestation(
+    path: Path,
+    content: bytes,
+    *,
+    expected_sha256: str,
+    expected_info: os.stat_result,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> None:
+    """Replace only the mutable attestation, bound to its exact old inode.
+
+    Generic plan artifacts stay immutable (``_atomic_artifact_write`` refuses
+    to replace a differing file).  The runtime state attestation is the one
+    reviewed document whose ``active``/``revoked``/probe fields change at
+    activation and rollback, so this primitive replaces it crash-safely while
+    binding to the exact previous inode and digest and reading back owner,
+    mode and content afterwards.
+    """
+    path = Path(path)
+    expected_digest = _validated_hex_sha(
+        expected_sha256, field="runtime attestation previous SHA256", length=64
+    )
+    parent_fd = _open_directory_fd(path.parent)
+    parent_before = os.fstat(parent_fd)
+    temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    try:
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (current.st_dev, current.st_ino) != (expected_info.st_dev, expected_info.st_ino)
+            or current.st_uid != int(owner_uid)
+            or current.st_gid != int(owner_gid)
+            or current.st_nlink != 1
+            or stat.S_IMODE(current.st_mode) != 0o644
+        ):
+            raise ValueError("runtime attestation changed before update")
+        old_raw, _old_info = _read_sealed_file_bytes(
+            path, max_bytes=1024 * 1024, expected_sha256=expected_digest
+        )
+        if hashlib.sha256(old_raw).hexdigest() != expected_digest:
+            raise ValueError("runtime attestation previous digest differs")
+        fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchown(fd, int(owner_uid), int(owner_gid))
+            os.fchmod(fd, 0o644)
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent_after = os.fstat(parent_fd)
+        if (parent_before.st_dev, parent_before.st_ino) != (
+            parent_after.st_dev,
+            parent_after.st_ino,
+        ):
+            raise ValueError("runtime attestation parent changed during update")
+        current_after = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current_after.st_dev, current_after.st_ino) != (
+            expected_info.st_dev,
+            expected_info.st_ino,
+        ):
+            raise ValueError("runtime attestation changed during update")
+        os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except (FileNotFoundError, OSError):
+            pass
+        raise
+    finally:
+        os.close(parent_fd)
+    reread, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
+    if (
+        reread != content
+        or info.st_uid != int(owner_uid)
+        or info.st_gid != int(owner_gid)
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o644
+    ):
+        raise ValueError("runtime attestation update readback failed")
+
+
 def _update_runtime_attestation(
     config: dict[str, object],
     *,
@@ -6774,10 +7872,11 @@ def _update_runtime_attestation(
     # The configured path is never opened directly.  This descriptor-relative
     # reader checks every parent component with O_NOFOLLOW and records the
     # target inode before/after reading, closing the final-path race window.
+    owner_uid, owner_gid = (int(value) for value in RUNTIME_ATTESTATION_OWNER)
     raw, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
     if (
-        info.st_uid != 0
-        or info.st_gid != 0
+        info.st_uid != owner_uid
+        or info.st_gid != owner_gid
         or info.st_nlink != 1
         or stat.S_IMODE(info.st_mode) != 0o644
     ):
@@ -6900,28 +7999,34 @@ def _update_runtime_attestation(
             service_config_sha256, field="service config SHA256", length=64
         )
     updated["service_config_sha256"] = service_digest
-    _atomic_artifact_write(path, _json_artifact_bytes(updated), mode=0o644, uid=0, gid=0)
+    _replace_runtime_attestation(
+        path,
+        _json_artifact_bytes(updated),
+        expected_sha256=hashlib.sha256(raw).hexdigest(),
+        expected_info=info,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
 
 
 def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bool) -> None:
     """Atomically update the named profile's real routing configuration.
 
-    The profile is model-owned, so the broker never edits it through a model
-    process or an ambient absolute-path open.  The descriptor-bound read and
-    writer ensure activation cannot silently replace a symlinked profile.
+    The profile document consumed by routing is a root-owned activation
+    overlay.  The worker's model-owned HOME copy is never edited here.
     """
     raw_path = config.get("dispatcher_profile_config_path")
     if raw_path is None:
         return
     path = Path(str(raw_path))
-    expected_owner = int(config["model_uid"])
-    expected_group = int(config["workspace_gid"])
+    expected_owner = int(config.get("dispatcher_profile_owner_uid", config["model_uid"]))
+    expected_group = int(config.get("dispatcher_profile_owner_gid", config["workspace_gid"]))
     raw, info = _read_sealed_file_bytes(path, max_bytes=1024 * 1024)
     if (
         info.st_uid != expected_owner
         or info.st_gid != expected_group
         or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) != 0o600
+        or stat.S_IMODE(info.st_mode) != 0o640
     ):
         raise ValueError("dispatcher profile config ownership or mode is unsafe")
     parent = path.parent
@@ -6985,7 +8090,7 @@ def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bo
         )
         try:
             os.fchown(fd, expected_owner, expected_group)
-            os.fchmod(fd, 0o600)
+            os.fchmod(fd, 0o640)
             view = memoryview(replacement)
             while view:
                 written = os.write(fd, view)
@@ -7011,7 +8116,7 @@ def _set_dispatcher_profile_activation(config: dict[str, object], *, enabled: bo
         reread != replacement
         or read_info.st_uid != expected_owner
         or read_info.st_gid != expected_group
-        or stat.S_IMODE(read_info.st_mode) != 0o600
+        or stat.S_IMODE(read_info.st_mode) != 0o640
     ):
         raise ValueError("dispatcher profile config activation readback failed")
 
@@ -7388,7 +8493,12 @@ def write_broker_installation_plan(plan: dict[str, object], *, output_root: Path
     return {"contract": BROKER_INSTALL_PLAN_CONTRACT, "output_root": str(destination_root)}
 
 
-def seal_broker_installation_plan(*, input_root: Path, output_root: Path) -> dict[str, str]:
+def seal_broker_installation_plan(
+    *,
+    input_root: Path,
+    output_root: Path,
+    toolchain: HermesToolchainTrust = HERMES_PRODUCTION_TOOLCHAIN,
+) -> dict[str, str]:
     """Re-emit an offline render as root-owned apply inputs.
 
     Rendering intentionally remains usable by an unprivileged reviewer.  The
@@ -7475,8 +8585,16 @@ def seal_broker_installation_plan(*, input_root: Path, output_root: Path) -> dic
         provenance_path=Path(str(provenance_ref["source_path"])),
         provenance_sha256=str(provenance_ref["sha256"]),
         hermes_source_sha=str(embedded_provenance["hermes_source_sha"]),
+        toolchain=toolchain,
+        verify_artifacts=True,
     )
     verified_provenance = cast(dict[str, object], closure["provenance"])
+    # The seal is the trust edge: re-observe the staged toolchain on this host
+    # and require it to be byte-identical to what the recorded builder used.
+    if _observe_uv_identity(toolchain) != verified_provenance["uv_identity"]:
+        raise ValueError("staged uv differs from the closure's recorded builder toolchain")
+    if _observe_python_identity(toolchain) != verified_provenance["python_identity"]:
+        raise ValueError("staged CPython differs from the closure's recorded builder toolchain")
     expected_seal = {
         "contract": HERMES_INSTALL_PROVENANCE_CONTRACT,
         "schema_version": HERMES_INSTALL_PROVENANCE_SCHEMA_VERSION,
@@ -7488,6 +8606,8 @@ def seal_broker_installation_plan(*, input_root: Path, output_root: Path) -> dic
         "locked_package_count": len(verified_provenance["locked_packages"]),
         "installed_distribution_count": len(verified_provenance["installed_distributions"]),
         "uv_identity": verified_provenance["uv_identity"],
+        "uv_provenance": verified_provenance["uv_provenance"],
+        "python_identity": verified_provenance["python_identity"],
     }
     if embedded_provenance != expected_seal:
         raise ValueError("offline plan Hermes provenance seal differs from the verified closure")

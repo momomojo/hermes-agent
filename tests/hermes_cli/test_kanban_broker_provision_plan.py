@@ -19,6 +19,89 @@ from pathlib import Path
 import pytest
 
 
+# The provisioning plan renderer, builder and toolchain staging are macOS-only:
+# they pin the aarch64 Apple Darwin uv/CPython release artifacts and Apple git.
+pytestmark = pytest.mark.macos_only
+
+_OFFICIAL_TOOLCHAIN_CACHE = Path.home() / "Library/Caches/hermes-broker-tests"
+_TEST_TOOLCHAIN = None
+
+
+def _fetch_official_archive(name: str, url: str, sha256: str, size: int) -> Path:
+    """Return the exact pinned release asset, downloading it once per host."""
+    archives = _OFFICIAL_TOOLCHAIN_CACHE / "archives"
+    archives.mkdir(parents=True, exist_ok=True)
+    target = archives / name
+    if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == sha256:
+        return target
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=600) as response:  # noqa: S310 - pinned https release asset
+        data = response.read(size + 1)
+    if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
+        raise RuntimeError(f"official toolchain asset {name} did not match its pinned identity")
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(target)
+    return target
+
+
+def _test_toolchain():
+    """Stage the pinned official uv and CPython once per host under the test uid.
+
+    Every pin except location and owner is shared with production, so the
+    same observation and validation code runs against genuine release bytes.
+    """
+    global _TEST_TOOLCHAIN
+    if _TEST_TOOLCHAIN is not None:
+        return _TEST_TOOLCHAIN
+    import dataclasses
+
+    from hermes_cli import kanban_broker_install as installer
+
+    root = _OFFICIAL_TOOLCHAIN_CACHE / "toolchain"
+    trust = dataclasses.replace(
+        installer.HERMES_PRODUCTION_TOOLCHAIN,
+        uv_executable=root / "uv",
+        python_root=root / "cpython-3.11.15",
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    try:
+        installer._observe_uv_identity(trust)
+        installer._observe_python_identity(trust)
+    except ValueError:
+        if root.exists():
+            for dirpath, _dirnames, _filenames in os.walk(root):
+                os.chmod(dirpath, 0o700)
+            shutil.rmtree(root)
+        cpython = _fetch_official_archive(
+            installer.OFFICIAL_RUNTIME_ASSET_NAME,
+            installer.OFFICIAL_RUNTIME_RELEASE_URL,
+            installer.OFFICIAL_RUNTIME_ARCHIVE_SHA256,
+            installer.OFFICIAL_RUNTIME_ARCHIVE_SIZE,
+        )
+        uv = _fetch_official_archive(
+            installer.HERMES_UV_ASSET_NAME,
+            installer.HERMES_UV_RELEASE_URL,
+            installer.HERMES_UV_ARCHIVE_SHA256,
+            installer.HERMES_UV_ASSET_SIZE,
+        )
+        installer.stage_toolchain(cpython_archive=cpython, uv_archive=uv, toolchain=trust)
+    _TEST_TOOLCHAIN = trust
+    return trust
+
+
+def _fixture_tags() -> list:
+    from hermes_cli import kanban_broker_install as installer
+
+    return installer._python_identity_supported_tags({
+        "marker_environment": {"python_version": "3.11"},
+        "mac_version": "26.3",
+        "machine": "arm64",
+    })
+
+
 def _inventory() -> dict:
     return {
         "contract": "hermes.kanban_broker_host_inventory.v1",
@@ -86,8 +169,6 @@ def _real_hermes_builder() -> tuple[Path, Path, Path, str]:
     global _REAL_HERMES_BUILDER
     if _REAL_HERMES_BUILDER is not None:
         return _REAL_HERMES_BUILDER
-    import hashlib
-
     from hermes_cli import kanban_broker_install as installer
 
     checkout_root = Path(tempfile.mkdtemp(prefix="hermes-real-builder-", dir="/private/tmp"))
@@ -123,28 +204,13 @@ def _real_hermes_builder() -> tuple[Path, Path, Path, str]:
     install_root = checkout_root / "install"
     package_archive = checkout_root / "hermes-install.tar.gz"
     provenance_path = checkout_root / "hermes-install.provenance.json"
-    uv = Path("/opt/homebrew/bin/uv").resolve(strict=True)
-    uv_info = uv.lstat()
-    uv_version = subprocess.run(
-        [str(uv), "--version"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    uv_identity = {
-        "path": str(uv),
-        "uid": uv_info.st_uid,
-        "gid": uv_info.st_gid,
-        "mode": stat.S_IMODE(uv_info.st_mode),
-        "nlink": uv_info.st_nlink,
-        "version": uv_version,
-        "sha256": hashlib.sha256(uv.read_bytes()).hexdigest(),
-    }
     installer.build_hermes_install_archive(
         source_root=source,
         install_root=install_root,
         source_sha=source_sha,
         output_archive=package_archive,
         output_provenance=provenance_path,
-        uv_executable=uv,
-        uv_identity=uv_identity,
+        toolchain=_test_toolchain(),
     )
     _REAL_HERMES_BUILDER = (source, install_root, package_archive, source_sha)
     return _REAL_HERMES_BUILDER
@@ -241,6 +307,12 @@ def _publisher_probe(tmp_path: Path) -> tuple[Path, str]:
     (script_dir / "lifecycle_controller.py").write_text(
         "def main():\n    return 0\n", encoding="utf-8"
     )
+    (script_dir / "publisher_service_install.py").write_text(
+        "def build_service_plan():\n    return {}\n", encoding="utf-8"
+    )
+    cron = script_dir / "trusted_publisher_cron.sh"
+    cron.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    cron.chmod(0o755)
     path = script_dir / "trusted_publisher.py"
     path.write_text(
         "import argparse, json, platform, sys\n"
@@ -311,6 +383,7 @@ def _render(tmp_path: Path):
         radulator_source_path=tmp_path / "radulator-checkout",
         radulator_source_sha=_radulator_source_sha(tmp_path),
         dispatcher_profile="radulator",
+        toolchain=_test_toolchain(),
     )
 
 
@@ -334,6 +407,7 @@ def _runtime_kwargs(tmp_path: Path) -> dict:
         "publisher_probe_path": publisher_probe,
         "publisher_probe_sha256": publisher_probe_sha,
         "hermes_source_path": tmp_path / "hermes-source",
+        "toolchain": _test_toolchain(),
     }
 
 
@@ -535,8 +609,14 @@ def test_writer_is_atomic_and_does_not_print_secret_payloads(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_cli_accepts_reviewed_inputs_and_writes_the_disabled_plan(tmp_path, capsys):
+def test_cli_accepts_reviewed_inputs_and_writes_the_disabled_plan(tmp_path, capsys, monkeypatch):
+    from hermes_cli import kanban_broker_install as installer
     from hermes_cli.kanban_broker_install import main
+
+    # The CLI has no toolchain flag; production trust is fixed in code and the
+    # module attribute is the only seam, used here to point at the staged
+    # official toolchain owned by the test uid.
+    monkeypatch.setattr(installer, "HERMES_PRODUCTION_TOOLCHAIN", _test_toolchain())
 
     inventory_path = tmp_path / "inventory.json"
     desired_path = tmp_path / "desired.json"
@@ -876,6 +956,7 @@ def test_renderer_requires_complete_hermes_provenance_manifest(tmp_path):
             hermes_source_path=tmp_path / "hermes-source",
             radulator_source_path=tmp_path / "radulator-checkout",
             radulator_source_sha=_radulator_source_sha(tmp_path),
+            toolchain=_test_toolchain(),
             dispatcher_profile="radulator",
         )
 
@@ -948,8 +1029,11 @@ def test_renderer_rejects_missing_every_modern_provenance_field(tmp_path, field)
 
 
 @pytest.mark.parametrize("field", MODERN_PROVENANCE_FIELDS)
-def test_cli_rejects_missing_every_modern_provenance_field(tmp_path, field):
+def test_cli_rejects_missing_every_modern_provenance_field(tmp_path, field, monkeypatch):
+    from hermes_cli import kanban_broker_install as installer
     from hermes_cli.kanban_broker_install import main
+
+    monkeypatch.setattr(installer, "HERMES_PRODUCTION_TOOLCHAIN", _test_toolchain())
 
     inventory_path = tmp_path / "inventory.json"
     desired_path = tmp_path / "desired.json"
@@ -1013,6 +1097,7 @@ def test_seal_rejects_missing_every_modern_provenance_field(tmp_path, field, mon
         installer.seal_broker_installation_plan(
             input_root=offline,
             output_root=tmp_path / "sealed",
+            toolchain=_test_toolchain(),
         )
 
 
@@ -1088,7 +1173,7 @@ def test_runtime_tree_manifest_compares_regular_file_mode_exactly(tmp_path):
         expected_owner_gid=runtime.stat().st_gid,
     )
     payload.chmod(0o666)
-    with pytest.raises(ValueError, match="metadata"):
+    with pytest.raises(ValueError, match="metadata|mutable"):
         _verify_runtime_tree_against_manifest(
             runtime,
             entries,
@@ -1132,6 +1217,7 @@ def test_hermes_install_builder_rejects_arbitrary_toy_closure(tmp_path):
             source_sha=source_sha,
             output_archive=tmp_path / "closure.tar.gz",
             output_provenance=tmp_path / "closure.provenance.json",
+            toolchain=_test_toolchain(),
         )
 
 
@@ -1193,30 +1279,251 @@ def test_renderer_rejects_installed_distribution_not_in_locked_resolution(tmp_pa
 
 
 def test_hermes_builder_requires_pinned_uv_identity(tmp_path):
+    """A look-alike uv is rejected even when its version output matches."""
+    import dataclasses
+
     from hermes_cli import kanban_broker_install as installer
 
     source, _env, _archive, source_sha = _real_hermes_builder()
     fake_uv = tmp_path / "fake-uv"
-    fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_uv.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'uv 0.11.5 (95eaa68c8 2026-04-08 aarch64-apple-darwin)'\n",
+        encoding="utf-8",
+    )
     fake_uv.chmod(0o555)
-    uv_identity = {
-        "path": str(fake_uv),
-        "uid": os.geteuid(),
-        "gid": os.getegid(),
-        "mode": 0o555,
-        "nlink": 1,
-        "version": "uv 0.11.5",
-        "sha256": hashlib.sha256(fake_uv.read_bytes()).hexdigest(),
-    }
-    with pytest.raises(ValueError, match="uv.*identity|canonical"):
+    trust = dataclasses.replace(_test_toolchain(), uv_executable=fake_uv)
+    with pytest.raises(ValueError, match="staged tool|immutable|digest|pinned"):
         installer.build_hermes_install_archive(
             source_root=source,
             install_root=tmp_path / "install",
             source_sha=source_sha,
             output_archive=tmp_path / "closure.tar.gz",
             output_provenance=tmp_path / "closure.provenance.json",
-            uv_executable=fake_uv,
-            uv_identity=uv_identity,
+            toolchain=trust,
+        )
+
+
+def test_uv_identity_rejects_user_owned_fake_even_when_metadata_matches(tmp_path):
+    """Owner is part of the trust root: a matching digest, size and version
+    under the wrong uid must still be rejected by the production pins."""
+    import dataclasses
+
+    from hermes_cli import kanban_broker_install as installer
+
+    fake_uv = tmp_path / "fake-uv"
+    fake_uv.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'uv 0.11.5 (95eaa68c8 2026-04-08 aarch64-apple-darwin)'\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o555)
+    content = fake_uv.read_bytes()
+    trust = dataclasses.replace(
+        installer.HERMES_PRODUCTION_TOOLCHAIN,
+        uv_executable=fake_uv,
+        uv_sha256=hashlib.sha256(content).hexdigest(),
+        uv_size=len(content),
+    )
+    assert os.getuid() != 0
+    with pytest.raises(ValueError, match="root-owned"):
+        installer._observe_uv_identity(trust)
+
+
+def test_builder_refuses_to_run_as_a_uid_other_than_the_toolchain_owner(tmp_path):
+    import dataclasses
+
+    from hermes_cli import kanban_broker_install as installer
+
+    source, _env, _archive, source_sha = _real_hermes_builder()
+    trust = dataclasses.replace(_test_toolchain(), owner_uid=os.getuid() + 1)
+    with pytest.raises(PermissionError, match="toolchain owner"):
+        installer.build_hermes_install_archive(
+            source_root=source,
+            install_root=tmp_path / "install",
+            source_sha=source_sha,
+            output_archive=tmp_path / "closure.tar.gz",
+            output_provenance=tmp_path / "closure.provenance.json",
+            toolchain=trust,
+        )
+
+
+def test_staged_toolchain_matches_the_official_release_pins():
+    from hermes_cli import kanban_broker_install as installer
+
+    trust = _test_toolchain()
+    uv_identity = installer._observe_uv_identity(trust)
+    assert uv_identity["sha256"] == installer.HERMES_UV_SHA256
+    assert uv_identity["version"] == installer.HERMES_UV_VERSION
+    assert uv_identity["mode"] == 0o555 and uv_identity["nlink"] == 1
+    python_identity = installer._observe_python_identity(trust)
+    assert python_identity["version"] == installer.OFFICIAL_RUNTIME_VERSION
+    assert python_identity["tree_sha256"] == installer.OFFICIAL_RUNTIME_TREE_SHA256
+    assert python_identity["machine"] == "arm64"
+    assert python_identity["marker_environment"]["python_full_version"] == "3.11.15"
+    assert trust.uv_provenance["archive_sha256"] == installer.HERMES_UV_ARCHIVE_SHA256
+    assert trust.uv_provenance["executable_sha256"] == installer.HERMES_UV_SHA256
+    assert trust.uv_provenance["archive_sha256"] != trust.uv_provenance["executable_sha256"]
+
+
+def test_wheel_selection_uses_the_recorded_builder_identity_and_never_sdists():
+    from hermes_cli import kanban_broker_install as installer
+
+    tags = _fixture_tags()
+    assert any(str(tag) == "cp311-cp311-macosx_11_0_arm64" for tag in tags)
+    assert not any("x86_64" in str(tag) for tag in tags)
+    package = {
+        "name": "sample",
+        "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [
+            {"url": "https://files.pythonhosted.org/packages/a/sample-1.0.tar.gz", "sha256": "a" * 64, "size": 1},
+            {"url": "https://files.pythonhosted.org/packages/b/sample-1.0-cp311-cp311-manylinux_2_17_x86_64.whl", "sha256": "b" * 64, "size": 1},
+            {"url": "https://files.pythonhosted.org/packages/c/sample-1.0-py3-none-any.whl", "sha256": "c" * 64, "size": 1},
+            {"url": "https://files.pythonhosted.org/packages/d/sample-1.0-cp311-cp311-macosx_11_0_arm64.whl", "sha256": "d" * 64, "size": 1},
+        ],
+    }
+    selected = installer._selected_locked_artifact(package, supported_tags=tags)
+    assert selected["sha256"] == "d" * 64
+    sdist_only = {**package, "artifacts": package["artifacts"][:1]}
+    with pytest.raises(ValueError, match="no wheel"):
+        installer._selected_locked_artifact(sdist_only, supported_tags=tags)
+
+
+def test_lock_parser_requires_the_reviewed_index_and_builder_markers():
+    from hermes_cli import kanban_broker_install as installer
+
+    environment = {
+        "implementation_name": "cpython", "implementation_version": "3.11.15",
+        "os_name": "posix", "platform_machine": "arm64", "platform_release": "25.3.0",
+        "platform_system": "Darwin", "platform_version": "Darwin Kernel Version 25.3.0",
+        "python_full_version": "3.11.15", "platform_python_implementation": "CPython",
+        "python_version": "3.11", "sys_platform": "darwin",
+    }
+
+    def lock(registry: str, url: str, marker: str = "") -> bytes:
+        marker_line = f'resolution-markers = ["{marker}"]\n' if marker else ""
+        return (
+            "version = 1\n"
+            "[[package]]\nname = \"hermes\"\nversion = \"0.1\"\nsource = { editable = \".\" }\n"
+            "dependencies = [{ name = \"sample\" }]\n"
+            f"[[package]]\nname = \"sample\"\nversion = \"1.0\"\nsource = {{ registry = \"{registry}\" }}\n"
+            + marker_line
+            + f"wheels = [{{ url = \"{url}\", hash = \"sha256:{'a' * 64}\", size = 1 }}]\n"
+        ).encode("utf-8")
+
+    good = lock("https://pypi.org/simple", "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl")
+    assert [item["name"] for item in installer._locked_uv_packages(good, marker_environment=environment)] == ["sample"]
+    with pytest.raises(ValueError, match="reviewed registry"):
+        installer._locked_uv_packages(
+            lock("https://mirror.example/simple", "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl"),
+            marker_environment=environment,
+        )
+    with pytest.raises(ValueError, match="index host"):
+        installer._locked_uv_packages(
+            lock("https://pypi.org/simple", "https://files.example/sample-1.0-py3-none-any.whl"),
+            marker_environment=environment,
+        )
+    with pytest.raises(ValueError, match="one active package"):
+        installer._locked_uv_packages(
+            lock("https://pypi.org/simple", "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl", "sys_platform == 'win32'"),
+            marker_environment=environment,
+        )
+    with pytest.raises(ValueError, match="marker environment"):
+        installer._locked_uv_packages(good, marker_environment={"python_version": "3.11"})
+
+
+def test_uv_export_must_reproduce_the_active_lock_graph():
+    from hermes_cli import kanban_broker_install as installer
+
+    environment = {
+        "implementation_name": "cpython", "implementation_version": "3.11.15",
+        "os_name": "posix", "platform_machine": "arm64", "platform_release": "25.3.0",
+        "platform_system": "Darwin", "platform_version": "Darwin Kernel Version 25.3.0",
+        "python_full_version": "3.11.15", "platform_python_implementation": "CPython",
+        "python_version": "3.11", "sys_platform": "darwin",
+    }
+    locked = [{
+        "name": "sample", "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [
+            {"url": "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1},
+            {"url": "https://files.pythonhosted.org/packages/s/sample-1.0.tar.gz", "sha256": "b" * 64, "size": 1},
+        ],
+    }]
+    export = (
+        "# This file was autogenerated by uv\n"
+        "sample==1.0 \\\n"
+        f"    --hash=sha256:{'a' * 64} \\\n"
+        f"    --hash=sha256:{'b' * 64}\n"
+        "    # via hermes\n"
+        "colorama==0.4.6 ; sys_platform == 'win32' \\\n"
+        f"    --hash=sha256:{'c' * 64}\n"
+    )
+    installer._verify_uv_export_matches_lock(export, locked=locked, marker_environment=environment)
+    with pytest.raises(ValueError, match="differs from the active uv.lock graph"):
+        installer._verify_uv_export_matches_lock(
+            export.replace("a" * 64, "f" * 64), locked=locked, marker_environment=environment
+        )
+    with pytest.raises(ValueError, match="differs from the active uv.lock graph"):
+        installer._verify_uv_export_matches_lock(
+            export + f"extra==2.0 \\\n    --hash=sha256:{'e' * 64}\n",
+            locked=locked, marker_environment=environment,
+        )
+    with pytest.raises(ValueError, match="omits an artifact hash"):
+        installer._verify_uv_export_matches_lock(
+            "sample==1.0\n", locked=locked, marker_environment=environment
+        )
+
+
+def test_installed_distribution_rejects_direct_url_and_wheel_record_mismatch(tmp_path):
+    import zipfile
+
+    from hermes_cli import kanban_broker_install as installer
+
+    def row(path: str, content: bytes) -> str:
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+        return f"{path},sha256={digest},{len(content)}\n"
+
+    payload = b"VALUE = 1\n"
+    metadata = b"Metadata-Version: 2.3\nName: sample\nVersion: 1.0\n\n"
+    site_packages = _record_fixture(
+        tmp_path,
+        row("sample/__init__.py", payload)
+        + row("sample-1.0.dist-info/METADATA", metadata)
+        + "sample-1.0.dist-info/RECORD,,\n",
+    )
+    (site_packages / "sample/__init__.py").write_bytes(payload)
+    (site_packages / "sample-1.0.dist-info/METADATA").write_bytes(metadata)
+
+    def wheel(record_payload: bytes) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("sample/__init__.py", record_payload)
+            archive.writestr("sample-1.0.dist-info/METADATA", metadata)
+            archive.writestr(
+                "sample-1.0.dist-info/RECORD",
+                row("sample/__init__.py", record_payload)
+                + row("sample-1.0.dist-info/METADATA", metadata)
+                + "sample-1.0.dist-info/RECORD,,\n",
+            )
+        return buffer.getvalue()
+
+    locked = [{
+        "name": "sample", "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [{"url": "https://files.pythonhosted.org/packages/s/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+    }]
+    installed = installer._verify_installed_distributions(
+        site_packages, locked, supported_tags=_fixture_tags(), wheel_bytes=lambda artifact: wheel(payload)
+    )
+    assert installed[0]["artifact"]["sha256"] == "a" * 64
+    with pytest.raises(ValueError, match="not bound to the locked wheel"):
+        installer._verify_installed_distributions(
+            site_packages, locked, supported_tags=_fixture_tags(), wheel_bytes=lambda artifact: wheel(b"VALUE = 2\n")
+        )
+    (site_packages / "sample-1.0.dist-info/direct_url.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="registry-locked"):
+        installer._verify_installed_distributions(
+            site_packages, locked, supported_tags=_fixture_tags()
         )
 
 
@@ -1247,10 +1554,10 @@ def test_installed_distribution_rejects_blank_record_digest(tmp_path):
         "name": "sample",
         "version": "1.0",
         "source": {"registry": "https://pypi.org/simple"},
-        "artifacts": [{"url": "https://files.example/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+        "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     with pytest.raises(ValueError, match="RECORD|sha256|digest"):
-        installer._verify_installed_distributions(site_packages, locked)
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
 
 
 def test_installed_distribution_rejects_unrecorded_file(tmp_path):
@@ -1265,10 +1572,110 @@ def test_installed_distribution_rejects_unrecorded_file(tmp_path):
         "name": "sample",
         "version": "1.0",
         "source": {"registry": "https://pypi.org/simple"},
-        "artifacts": [{"url": "https://files.example/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+        "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
     }]
     with pytest.raises(ValueError, match="unrecorded|coverage|RECORD"):
-        installer._verify_installed_distributions(site_packages, locked)
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
+
+
+def test_installed_distribution_rejects_metadata_only_closure(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    site_packages = tmp_path / "env/lib/python3.11/site-packages"
+    dist_info = site_packages / "sample-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    metadata = b"Metadata-Version: 2.3\nName: sample\nVersion: 1.0\n\n"
+    (dist_info / "METADATA").write_bytes(metadata)
+
+    def row(path: str, content: bytes) -> str:
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+        return f"{path},sha256={digest},{len(content)}\n"
+
+    (dist_info / "RECORD").write_text(
+        row("sample-1.0.dist-info/METADATA", metadata)
+        + "sample-1.0.dist-info/RECORD,,\n",
+        encoding="utf-8",
+    )
+    locked = [{
+        "name": "sample",
+        "version": "1.0",
+        "source": {"registry": "https://pypi.org/simple"},
+        "artifacts": [{"url": "https://files.pythonhosted.org/packages/py3/s/sample/sample-1.0-py3-none-any.whl", "sha256": "a" * 64, "size": 1}],
+    }]
+    with pytest.raises(ValueError, match="payload|complete|closure"):
+        installer._verify_installed_distributions(site_packages, locked, supported_tags=_fixture_tags())
+
+
+def test_rendered_worker_profile_directories_pass_real_worker_validation(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+    from hermes_cli.kanban_broker_worker import validate_worker_credential_home
+
+    runtime_root = tmp_path / "runtime/hermes_cli"
+    runtime_assets = installer.render_runtime_package_assets(
+        source_root=Path(__file__).resolve().parents[2] / "hermes_cli",
+        destination_root=runtime_root,
+    )
+    owner = os.getuid()
+    group = os.getgid()
+    config = {
+        "install_root": str(tmp_path),
+        "state_dir": str(tmp_path / "state"),
+        "workspace_root": str(tmp_path / "workspaces"),
+        "worker_hermes_root": str(tmp_path / "worker-home"),
+        "publisher_handoff_root": str(tmp_path / "handoff"),
+        "controller_socket": str(tmp_path / "sockets/controller/controller.sock"),
+        "publisher_socket": str(tmp_path / "sockets/publisher/publisher.sock"),
+        "operator_socket": str(tmp_path / "sockets/operator/operator.sock"),
+        "worker_socket": str(tmp_path / "sockets/worker/worker.sock"),
+        "controller_key_path": str(tmp_path / "keys/controller/controller.key"),
+        "publisher_key_path": str(tmp_path / "keys/publisher/publisher.key"),
+        "operator_key_path": str(tmp_path / "keys/operator/operator.key"),
+        "broker_uid": 401,
+        "broker_gid": 701,
+        "model_uid": owner,
+        "controller_uid": 402,
+        "controller_gid": 702,
+        "publisher_uid": 403,
+        "publisher_gid": 703,
+        "operator_uid": 0,
+        "operator_gid": 0,
+        "workspace_gid": group,
+        "canary_key_path": str(tmp_path / "canary/canary.key"),
+        "package_root": str(runtime_root),
+        "package_manifest_sha256": runtime_assets["package_manifest_sha256"],
+        "dispatcher_profile": "radulator",
+    }
+    filesystem = installer.render_filesystem_provision_plan(
+        config=config,
+        service_config_path=tmp_path / "config/service.json",
+        seatbelt_profile_path=tmp_path / "config/broker.sb",
+        launchd_plist_path=tmp_path / "launchd/broker.plist",
+        worker_launchd_plist_path=tmp_path / "launchd/worker.plist",
+        client_config_paths={
+            "controller": tmp_path / "clients/controller/client.json",
+            "publisher": tmp_path / "clients/publisher/client.json",
+            "operator": tmp_path / "clients/operator/client.json",
+        },
+        sequence_paths={
+            "controller": tmp_path / "sequences/controller/sequence",
+            "publisher": tmp_path / "sequences/publisher/sequence",
+            "operator": tmp_path / "sequences/operator/sequence",
+        },
+        runtime_assets=runtime_assets,
+    )
+    directory_plan = {
+        item["path"]: item for item in filesystem["directories"]
+    }
+    for relative in ("worker-home", "worker-home/profiles", "worker-home/profiles/radulator"):
+        item = directory_plan[str(tmp_path / relative)]
+        assert (item["uid"], item["gid"], item["mode"]) == (owner, group, 0o700)
+        path = Path(item["path"])
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(item["mode"])
+    validated = validate_worker_credential_home(
+        tmp_path / "worker-home", profile="radulator", expected_owner_uid=owner
+    )
+    assert validated["profile_home"] == str(tmp_path / "worker-home/profiles/radulator")
 
 
 def test_radulator_source_replacement_after_commit_is_rejected(tmp_path):
@@ -1466,7 +1873,7 @@ def test_profile_activation_descriptor_write_and_model_owner_readback(tmp_path, 
         "  dedicated_broker_dispatcher_profile: radulator\n",
         encoding="utf-8",
     )
-    profile_path.chmod(0o600)
+    profile_path.chmod(0o640)
     os.chown(profile_path, uid, gid)
     original_lstat = Path.lstat
 
@@ -1484,7 +1891,9 @@ def test_profile_activation_descriptor_write_and_model_owner_readback(tmp_path, 
     monkeypatch.setattr(Path, "lstat", reviewed_parent_lstat)
     config = {
         "dispatcher_profile_config_path": str(profile_path),
-        "model_uid": uid,
+        "dispatcher_profile_owner_uid": uid,
+        "dispatcher_profile_owner_gid": gid,
+        "model_uid": uid + 1,
         "workspace_gid": gid,
     }
     installer._set_dispatcher_profile_activation(config, enabled=True)
@@ -1492,8 +1901,235 @@ def test_profile_activation_descriptor_write_and_model_owner_readback(tmp_path, 
     assert "dedicated_broker_enabled: true" in enabled
     assert "trusted_publisher_enabled: true" in enabled
     info = profile_path.stat()
-    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (uid, gid, 0o600)
+    assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (uid, gid, 0o640)
     installer._set_dispatcher_profile_activation(config, enabled=False)
     disabled = profile_path.read_text(encoding="utf-8")
     assert "dedicated_broker_enabled: false" in disabled
     assert "trusted_publisher_enabled: false" in disabled
+
+
+def test_rendered_routing_overlay_is_root_owned_group_readable_and_worker_bound(tmp_path):
+    """The routing authority lives outside the model-owned profile home."""
+    plan = _render(tmp_path)
+    files = {item["path"]: item for item in plan["filesystem_plan"]["files"]}
+    directories = {item["path"]: item for item in plan["filesystem_plan"]["directories"]}
+    overlay_root = tmp_path / "install/routing/radulator"
+    workspace_gid = int(_desired()["workspace"]["gid"])
+    for name, kind in (("kanban-routing.json", "dispatcher_routing_config"), ("config.yaml", "dispatcher_profile_config")):
+        record = files[str(overlay_root / name)]
+        assert (record["uid"], record["gid"], record["mode"], record["kind"]) == (0, workspace_gid, 0o640, kind)
+    assert (directories[str(overlay_root)]["uid"], directories[str(overlay_root)]["mode"]) == (0, 0o555)
+    model_profile = tmp_path / "install/worker-home/profiles/radulator"
+    model_uid = int(_desired()["model"]["uid"])
+    assert (directories[str(model_profile)]["uid"], directories[str(model_profile)]["mode"]) == (model_uid, 0o700)
+    assert files[str(model_profile / "config.yaml")]["uid"] == model_uid
+    payloads = plan["asset_payload_manifest"]["payloads"]
+    service_config = json.loads(base64.b64decode(next(
+        value for path, value in payloads.items() if path.endswith("/config/service.json")
+    )))
+    assert service_config["dispatcher_profile_config_path"] == str(overlay_root / "config.yaml")
+    assert service_config["dispatcher_profile_owner_uid"] == 0
+    assert service_config["dispatcher_profile_owner_gid"] == workspace_gid
+    worker_plist = plistlib.loads(base64.b64decode(next(
+        value for path, value in payloads.items() if path.endswith("ai.hermes.kanban-worker.plist")
+    )))
+    arguments = worker_plist["ProgramArguments"]
+    assert arguments[arguments.index("--routing-config") + 1] == str(overlay_root / "config.yaml")
+
+
+def test_runtime_attestation_replacement_is_inode_and_digest_bound(tmp_path):
+    """Finding 3: activation/rollback replace the attestation only when the
+    exact previous inode and digest still hold, then read back the result."""
+    from hermes_cli import kanban_broker_install as installer
+
+    path = tmp_path / "runtime-attestation.json"
+    initial = b'{"active": false}\n'
+    path.write_bytes(initial)
+    path.chmod(0o644)
+    info = path.lstat()
+    # macOS gives new files the parent directory's group, which need not be
+    # the process's primary group; the owner seam binds to the real values.
+    uid, gid = info.st_uid, info.st_gid
+    replacement = b'{"active": true}\n'
+    installer._replace_runtime_attestation(
+        path, replacement,
+        expected_sha256=hashlib.sha256(initial).hexdigest(),
+        expected_info=info, owner_uid=uid, owner_gid=gid,
+    )
+    assert path.read_bytes() == replacement
+    assert stat.S_IMODE(path.lstat().st_mode) == 0o644
+    assert not list(tmp_path.glob(".runtime-attestation.json.*.tmp"))
+    # stale digest: caller believes the old bytes are still present
+    with pytest.raises(ValueError, match="differs|changed"):
+        installer._replace_runtime_attestation(
+            path, b'{"active": false}\n',
+            expected_sha256=hashlib.sha256(initial).hexdigest(),
+            expected_info=path.lstat(), owner_uid=uid, owner_gid=gid,
+        )
+    # stale inode: the file was replaced underneath the caller
+    stale_info = path.lstat()
+    path.unlink()
+    path.write_bytes(replacement)
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="changed before update"):
+        installer._replace_runtime_attestation(
+            path, b'{"active": false}\n',
+            expected_sha256=hashlib.sha256(replacement).hexdigest(),
+            expected_info=stale_info, owner_uid=uid, owner_gid=gid,
+        )
+    # symlink swap and wrong owner expectation both fail closed
+    real = tmp_path / "real.json"
+    real.write_bytes(replacement)
+    real.chmod(0o644)
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    with pytest.raises(ValueError):
+        installer._replace_runtime_attestation(
+            link, b'{"active": false}\n',
+            expected_sha256=hashlib.sha256(replacement).hexdigest(),
+            expected_info=real.lstat(), owner_uid=uid, owner_gid=gid,
+        )
+    with pytest.raises(ValueError, match="changed before update"):
+        installer._replace_runtime_attestation(
+            path, b'{"active": false}\n',
+            expected_sha256=hashlib.sha256(replacement).hexdigest(),
+            expected_info=path.lstat(),
+        )
+    assert path.read_bytes() == replacement
+
+
+def test_runtime_attestation_state_transitions_through_the_replacement_primitive(tmp_path, monkeypatch):
+    """Render -> stage -> activate -> rollback attestation updates succeed on a
+    rendered attestation with runtime_attestation_path present, where the
+    previous immutable writer refused every changed state."""
+    from hermes_cli import kanban_broker_install as installer
+
+    plan = _render(tmp_path)
+    payloads = plan["asset_payload_manifest"]["payloads"]
+    attestation_raw = next(
+        base64.b64decode(value) for path, value in payloads.items()
+        if path.endswith("runtime-attestation.json")
+    )
+    attestation_path = tmp_path / "runtime-attestation.json"
+    attestation_path.write_bytes(attestation_raw)
+    attestation_path.chmod(0o644)
+    uid, gid = attestation_path.lstat().st_uid, attestation_path.lstat().st_gid
+    service_config = json.loads(base64.b64decode(next(
+        value for path, value in payloads.items() if path.endswith("/config/service.json")
+    )))
+    config = {**service_config, "runtime_attestation_path": str(attestation_path)}
+    service_config_path = tmp_path / "service.json"
+    service_config_path.write_text(json.dumps(config), encoding="utf-8")
+    # The unprivileged runner cannot create root-owned files: the attestation
+    # owner seam points at the test uid while the real descriptor-relative
+    # replacement, digest/inode binding and readback run unchanged.  The
+    # root-owned runtime manifest and publisher probe observations are the
+    # only pieces represented rather than executed here.
+    monkeypatch.setattr(installer, "RUNTIME_ATTESTATION_OWNER", (uid, gid))
+    monkeypatch.setattr(installer, "_read_runtime_manifest_file", lambda *args, **kwargs: {"entries": []})
+    config.pop("publisher_probe_path", None)
+    installer._update_runtime_attestation(config, service_config_path=service_config_path, active=False, revoked=True)
+    staged = json.loads(attestation_path.read_bytes())
+    assert (staged["active"], staged["revoked"], staged["isolated_probe"]["outcome"]) == (False, True, "PENDING")
+    probe = {"command": [config["python_executable"], "-I", "-B", str(Path(config["python_executable"]).parent.parent / "runtime-probe.py")], "outcome": "PASS"}
+    installer._update_runtime_attestation(
+        config, service_config_path=service_config_path, active=True, revoked=False,
+        isolated_probe=probe, publisher_probe_status="PASS",
+    )
+    active = json.loads(attestation_path.read_bytes())
+    assert (active["active"], active["revoked"], active["publisher_probe_status"]) == (True, False, "PASS")
+    assert active["isolated_probe"] == probe
+    installer._update_runtime_attestation(config, service_config_path=service_config_path, active=False, revoked=True)
+    rolled_back = json.loads(attestation_path.read_bytes())
+    assert (rolled_back["active"], rolled_back["revoked"]) == (False, True)
+    assert rolled_back["isolated_probe"] == probe
+    with pytest.raises(ValueError, match="cannot activate"):
+        installer._update_runtime_attestation(
+            config, service_config_path=service_config_path, active=True, revoked=False,
+            isolated_probe={**probe, "outcome": "PENDING"}, publisher_probe_status="PASS",
+        )
+
+
+def _radulator_style_manifest(script_dir: Path) -> tuple[list[dict], str]:
+    """Radulator's ``_source_manifest`` algorithm, restated for the fixture."""
+    entries = []
+    for name in ("lifecycle_controller.py", "publisher_service_install.py", "trusted_publisher.py", "trusted_publisher_cron.sh"):
+        content = (script_dir / name).read_bytes()
+        entries.append({"path": name, "size": len(content), "sha256": hashlib.sha256(content).hexdigest(), "mode": 0o555 if name.endswith(".sh") else 0o444})
+    entries.sort(key=lambda item: item["path"])
+    digest = hashlib.sha256(json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return entries, digest
+
+
+def test_renderer_binds_the_radulator_publisher_asset_manifest(tmp_path):
+    from hermes_cli import kanban_broker_install as installer
+
+    plan = _render(tmp_path)
+    payloads = plan["asset_payload_manifest"]["payloads"]
+    service_config = json.loads(base64.b64decode(next(
+        value for path, value in payloads.items() if path.endswith("/config/service.json")
+    )))
+    entries, digest = _radulator_style_manifest(tmp_path / "radulator-checkout/ops/hermes/radulator")
+    assert service_config["radulator_publisher_asset_manifest_sha256"] == digest
+    probe, probe_sha = _publisher_probe(tmp_path)
+    bound = installer._validate_radulator_publisher_source(
+        tmp_path / "radulator-checkout",
+        expected_source_sha=_radulator_source_sha(tmp_path),
+        publisher_probe=probe,
+        publisher_probe_sha256=probe_sha,
+        git_executable=Path("/usr/bin/git"),
+    )
+    assert bound["publisher_asset_manifest"] == entries
+    assert bound["publisher_asset_manifest_sha256"] == digest
+    # Replacing any reviewed asset after the commit is rejected, not re-hashed.
+    cron = tmp_path / "radulator-checkout/ops/hermes/radulator/trusted_publisher_cron.sh"
+    original = cron.read_bytes()
+    cron.write_bytes(original + b"echo tampered\n")
+    try:
+        with pytest.raises(ValueError, match="clean|reviewed Git blob"):
+            installer._validate_radulator_publisher_source(
+                tmp_path / "radulator-checkout",
+                expected_source_sha=_radulator_source_sha(tmp_path),
+                publisher_probe=probe,
+                publisher_probe_sha256=probe_sha,
+                git_executable=Path("/usr/bin/git"),
+            )
+    finally:
+        cron.write_bytes(original)
+
+
+def test_publisher_asset_manifest_matches_radulators_own_installer_when_available():
+    """Digest parity with the real Radulator installer on a real clean checkout."""
+    import importlib.util
+
+    from hermes_cli import kanban_broker_install as installer
+
+    checkout = Path.home() / "Documents/Codex-works/Radulator-source"
+    module_path = checkout / "ops/hermes/radulator/publisher_service_install.py"
+    if not module_path.is_file():
+        pytest.skip("real Radulator checkout is not available on this host")
+    status = subprocess.run(
+        ["/usr/bin/git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if status:
+        pytest.skip("real Radulator checkout is not clean")
+    head = subprocess.run(
+        ["/usr/bin/git", "-C", str(checkout), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    probe = module_path.parent / "trusted_publisher.py"
+    bound = installer._validate_radulator_publisher_source(
+        checkout,
+        expected_source_sha=head,
+        publisher_probe=probe,
+        publisher_probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
+        git_executable=Path("/usr/bin/git"),
+    )
+    spec = importlib.util.spec_from_file_location("radulator_publisher_service_install", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    assert tuple(module.SOURCE_ASSETS) == installer.RADULATOR_PUBLISHER_ASSETS
+    entries, digest = module._source_manifest(module_path.parent, expected_uid=os.getuid())
+    assert bound["publisher_asset_manifest"] == entries
+    assert bound["publisher_asset_manifest_sha256"] == digest

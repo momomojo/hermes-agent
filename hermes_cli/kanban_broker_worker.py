@@ -328,7 +328,10 @@ def validate_worker_runtime(
 
 
 def _safe_worker_env(
-    envelope: dict[str, Any], *, worker_hermes_root: Path
+    envelope: dict[str, Any],
+    *,
+    worker_hermes_root: Path,
+    routing_config: Path | None = None,
 ) -> dict[str, str]:
     task = envelope["task"]
     workspace = Path(envelope["workspace_path"])
@@ -380,7 +383,27 @@ def _safe_worker_env(
     if task.get("goal_mode") is True:
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(task["goal_max_turns"])
+    if routing_config is not None:
+        from hermes_cli.kanban_broker_routing import ROUTING_OVERLAY_ENV
+
+        env[ROUTING_OVERLAY_ENV] = str(Path(routing_config))
     return env
+
+
+def validate_routing_overlay(routing_config: Path, *, profile: str) -> dict[str, Any]:
+    """Require the dispatcher's root-owned routing overlay for this profile."""
+    from hermes_cli.kanban_broker_routing import (
+        DedicatedBrokerRouteError,
+        load_trusted_routing_overlay,
+    )
+
+    try:
+        overlay = load_trusted_routing_overlay(Path(routing_config))
+    except DedicatedBrokerRouteError as exc:
+        raise WorkerServiceError(f"routing overlay rejected: {exc}") from exc
+    if overlay.get("dedicated_broker_dispatcher_profile") != profile:
+        raise WorkerServiceError("routing overlay is bound to a different profile")
+    return overlay
 
 
 def _validated_envelope(value: Any, *, workspace_root: Path) -> dict[str, Any]:
@@ -436,6 +459,7 @@ def run_hermes_worker(
     python_executable: Path,
     worker_hermes_root: Path,
     runtime_entrypoint: Path | None = None,
+    routing_config: Path | None = None,
 ) -> dict[str, Any]:
     """Run the ordinary Hermes worker with only credential-free sealed inputs."""
 
@@ -448,6 +472,8 @@ def run_hermes_worker(
         profile=profile,
         expected_owner_uid=_effective_uid(),
     )
+    if routing_config is not None:
+        validate_routing_overlay(Path(routing_config), profile=profile)
     runtime = task.get("max_runtime_seconds")
     if isinstance(runtime, bool) or not isinstance(runtime, int) or runtime <= 0:
         raise WorkerServiceError("sealed worker runtime is invalid")
@@ -491,7 +517,9 @@ def run_hermes_worker(
             command,
             cwd=envelope["workspace_path"],
             env=_safe_worker_env(
-                envelope, worker_hermes_root=Path(worker_hermes_root)
+                envelope,
+                worker_hermes_root=Path(worker_hermes_root),
+                routing_config=routing_config,
             ),
             capture_output=True,
             text=True,
@@ -597,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-entrypoint-sha256")
     parser.add_argument("--runtime-manifest-path", type=Path)
     parser.add_argument("--runtime-manifest-sha256")
+    parser.add_argument("--routing-config", type=Path)
     args = parser.parse_args(argv)
     validate_worker_runtime(
         python_executable=args.python,
@@ -618,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
             python_executable=args.python,
             worker_hermes_root=args.worker_hermes_root,
             runtime_entrypoint=args.runtime_entrypoint,
+            routing_config=args.routing_config,
         ),
     )
     service.start()

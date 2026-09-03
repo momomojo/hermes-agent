@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import ctypes
 import platform
 import re
@@ -211,6 +210,10 @@ class BrokerRPCServer:
     def _invoke(
         self, *, peer_uid: int, method: str, body: dict[str, Any]
     ) -> dict[str, Any]:
+        if self.surface == "publisher" and method != "list_publish_obligations":
+            observe = getattr(self.broker, "observe_publisher_rpc", None)
+            if observe is not None:
+                observe(method=method, peer_uid=peer_uid)
         if self.surface == "controller" and method == "trusted_create":
             result = self.broker.trusted_create(peer_uid=peer_uid, request=body)
         elif self.surface == "controller" and method == "request_publish_correction":
@@ -339,6 +342,21 @@ class BrokerRPCServer:
                 "contract": "hermes.kanban_broker_quiesce_status.v1",
                 **self.quiesce_status_callback(),
             }
+        elif self.surface == "operator" and method == "open_publisher_preflight_window":
+            if body:
+                raise ProtocolError(
+                    "open_publisher_preflight_window accepts no body fields"
+                )
+            result = self.broker.open_publisher_preflight_window(peer_uid=peer_uid)
+        elif self.surface == "operator" and method == "close_publisher_preflight_window":
+            if set(body) != {"window_id"}:
+                raise ProtocolError(
+                    "close_publisher_preflight_window requires exactly window_id"
+                )
+            result = self.broker.close_publisher_preflight_window(
+                peer_uid=peer_uid,
+                window_id=str(body.get("window_id") or ""),
+            )
         else:
             raise ProtocolError("method is unavailable on this broker surface")
         return result

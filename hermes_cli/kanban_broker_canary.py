@@ -347,36 +347,82 @@ def _credential_scrub_check(config: dict[str, Any]) -> bool:
 
 
 def _routing_profile_check(config: dict[str, Any]) -> bool:
-    """Load the named dispatcher profile and verify its real client routes."""
+    """Verify the root-owned routing overlay and the model's private profile.
+
+    Routing authority is the dispatcher overlay below ``<install>/routing``:
+    root-owned, group-readable by the workspace group, beneath a root-owned
+    immutable directory, so the model cannot replace it.  The model's own
+    Hermes profile home must exist as a private model-owned tree so the real
+    worker credential-home validator accepts it; that copy is never routing
+    authority.
+    """
     routing_path = Path(str(config.get("dispatcher_routing_config_path") or ""))
     profile = str(config.get("dispatcher_profile") or "")
     if not profile or routing_path.name != "kanban-routing.json":
         return False
-    if routing_path.parent.name != profile:
+    try:
+        install_root = Path(str(config["install_root"]))
+        model_uid = int(config["model_uid"])
+        workspace_gid = int(config["workspace_gid"])
+        owner_uid = int(config.get("dispatcher_profile_owner_uid", 0))
+        owner_gid = int(config.get("dispatcher_profile_owner_gid", workspace_gid))
+    except (KeyError, TypeError, ValueError):
         return False
-    expected_profile_root = (
-        Path(str(config.get("worker_hermes_root") or ""))
-        / "profiles"
-        / profile
-    )
-    if routing_path.parent != expected_profile_root:
+    if owner_uid != 0 or owner_gid != workspace_gid:
+        return False
+    overlay_root = install_root / "routing" / profile
+    if routing_path.parent != overlay_root:
         return False
     profile_config_path = Path(str(config.get("dispatcher_profile_config_path") or ""))
-    if profile_config_path != expected_profile_root / "config.yaml":
+    if profile_config_path != overlay_root / "config.yaml":
         return False
     try:
-        profile_info = profile_config_path.lstat()
-        if (
-            stat.S_ISLNK(profile_info.st_mode)
-            or not stat.S_ISREG(profile_info.st_mode)
-            or profile_info.st_uid != int(config["model_uid"])
-            or profile_info.st_gid != int(config["workspace_gid"])
-            or profile_info.st_nlink != 1
-            or stat.S_IMODE(profile_info.st_mode) != 0o600
-        ):
-            return False
-        profile_lines = profile_config_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        overlay_info = overlay_root.lstat()
+        overlay_parent_info = overlay_root.parent.lstat()
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(overlay_info.st_mode)
+        or not stat.S_ISDIR(overlay_info.st_mode)
+        or overlay_info.st_uid != 0
+        or overlay_info.st_gid != 0
+        or stat.S_IMODE(overlay_info.st_mode) != 0o555
+        or stat.S_ISLNK(overlay_parent_info.st_mode)
+        or not stat.S_ISDIR(overlay_parent_info.st_mode)
+        or overlay_parent_info.st_uid != 0
+        or stat.S_IMODE(overlay_parent_info.st_mode) & 0o022
+    ):
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+    def read_overlay_file(path: Path) -> bytes | None:
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != workspace_gid
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o640
+            ):
+                return None
+            raw = os.read(fd, 1024 * 1024 + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > 1024 * 1024:
+            return None
+        return raw
+
+    profile_raw = read_overlay_file(profile_config_path)
+    if profile_raw is None:
+        return False
+    try:
+        profile_lines = profile_raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
         return False
     if not profile_lines or profile_lines[0] != "kanban:":
         return False
@@ -400,31 +446,23 @@ def _routing_profile_check(config: dict[str, Any]) -> bool:
     }
     if profile_values != expected_profile_values:
         return False
-    profile_info = routing_path.parent.lstat()
-    if (
-        stat.S_ISLNK(profile_info.st_mode)
-        or not stat.S_ISDIR(profile_info.st_mode)
-        or profile_info.st_uid != 0
-        or profile_info.st_gid != 0
-        or stat.S_IMODE(profile_info.st_mode) != 0o555
-    ):
+    # The real worker validator must accept the model's private profile home
+    # exactly as provisioned; the overlay never lives inside it.
+    worker_root = Path(str(config.get("worker_hermes_root") or ""))
+    if not worker_root.is_absolute() or worker_root in overlay_root.parents:
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(routing_path, flags)
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != int(config["model_uid"])
-            or info.st_gid != int(config["workspace_gid"])
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            return False
-        raw = os.read(fd, 1024 * 1024 + 1)
-    finally:
-        os.close(fd)
-    if len(raw) > 1024 * 1024:
+        from hermes_cli.kanban_broker_worker import validate_worker_credential_home
+
+        validated = validate_worker_credential_home(
+            worker_root, profile=profile, expected_owner_uid=model_uid
+        )
+    except Exception:
+        return False
+    if validated.get("profile_home") != str(worker_root / "profiles" / profile):
+        return False
+    raw = read_overlay_file(routing_path)
+    if raw is None:
         return False
     try:
         routing = json.loads(raw)
@@ -485,8 +523,24 @@ def _routing_profile_check(config: dict[str, Any]) -> bool:
     )
 
 
-def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
-    """Run Radulator's exact direct isolated publisher preflight contract."""
+def _publisher_runtime_preflight_check(
+    config: dict[str, Any],
+    _operator_broker: Any = None,
+) -> bool:
+    """Run Radulator's exact direct isolated publisher preflight contract.
+
+    The function opens a broker-side preflight window through the operator
+    surface before launching the publisher subprocess, then closes the window
+    after the subprocess exits.  The broker's own observation of exactly one
+    ``list_publish_obligations(limit=1)`` RPC during the window is required in
+    addition to the child's JSON self-report.  This prevents a shell process
+    from satisfying the gate by printing forged output.
+
+    ``_operator_broker`` is an internal parameter for tests that inject a
+    direct broker reference instead of loading a client from a config file.
+    Production callers leave it as ``None`` and the function loads the operator
+    client from ``config["operator_client_config"]``.
+    """
     probe = Path(str(config.get("publisher_probe_path") or ""))
     python = Path(str(config.get("python_executable") or ""))
     manifest = Path(str(config.get("runtime_manifest_path") or ""))
@@ -522,6 +576,40 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
             return False
     except (OSError, ValueError):
         return False
+
+    # Resolve the operator broker interface.  In tests an in-process broker is
+    # injected; in production the operator client is loaded from the config.
+    operator = _operator_broker
+    if operator is None:
+        operator_config_path = Path(str(config.get("operator_client_config") or ""))
+        if (
+            not operator_config_path.is_absolute()
+            or ".." in operator_config_path.parts
+        ):
+            return False
+        try:
+            from hermes_cli.kanban_broker_client import load_broker_client
+
+            operator = load_broker_client(
+                operator_config_path, expected_surface="operator"
+            )
+        except Exception:
+            return False
+
+    # Open the broker-side observation window before spawning the child so
+    # every publisher RPC during the subprocess lifetime is captured.
+    try:
+        window_resp = operator.call(
+            "open_publisher_preflight_window", {}
+        ) if hasattr(operator, "call") else operator.open_publisher_preflight_window(
+            peer_uid=os.geteuid()
+        )
+        window_id = str(window_resp.get("window_id") or "")
+        if not window_id:
+            return False
+    except Exception:
+        return False
+
     command = [
         str(python), "-I", "-B", str(probe),
         "--runtime-preflight",
@@ -542,10 +630,32 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
             timeout=15,
             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         )
-        if result.returncode != 0 or result.stderr:
-            return False
-        response = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, UnicodeDecodeError, json.JSONDecodeError):
+        child_ok = result.returncode == 0 and not result.stderr
+        stdout = result.stdout
+    except (OSError, subprocess.SubprocessError):
+        child_ok = False
+        stdout = ""
+
+    # Close the window regardless of child outcome to prevent window leaks.
+    try:
+        evidence_resp = (
+            operator.call("close_publisher_preflight_window", {"window_id": window_id})
+            if hasattr(operator, "call")
+            else operator.close_publisher_preflight_window(
+                peer_uid=os.geteuid(), window_id=window_id
+            )
+        )
+        broker_calls = list(evidence_resp.get("calls") or [])
+    except Exception:
+        return False
+
+    if not child_ok:
+        return False
+
+    # Validate child JSON (exact key set: finding 5 requirement).
+    try:
+        response = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     expected = {
         "contract": "radulator.publisher_runtime_preflight.v1",
@@ -566,7 +676,7 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
     expected.update({"broker_client_module": str(module_resolved)})
-    return bool(
+    child_json_ok = bool(
         response.get("contract") == expected["contract"]
         and response.get("status") == expected["status"]
         and response.get("python_executable") == expected["python_executable"]
@@ -577,6 +687,27 @@ def _publisher_runtime_preflight_check(config: dict[str, Any]) -> bool:
         and module_resolved == package_root / "kanban_broker_client.py"
         and module_resolved.is_file()
     )
+    if not child_json_ok:
+        return False
+
+    # Broker-side evidence: exactly one list_publish_obligations call with
+    # limit=1 must have been made during the preflight window, and no other
+    # calls may appear in the log.
+    if len(broker_calls) != 1:
+        return False
+    single = broker_calls[0]
+    try:
+        publisher_uid = int(config["publisher_uid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        not isinstance(single, dict)
+        or single.get("method") != "list_publish_obligations"
+        or single.get("limit") != 1
+        or single.get("peer_uid") != publisher_uid
+    ):
+        return False
+    return True
 
 
 def cross_uid_process_read_denied(

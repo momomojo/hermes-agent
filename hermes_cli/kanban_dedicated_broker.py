@@ -774,6 +774,10 @@ class DedicatedKanbanBroker:
         self._mutation_lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         self._key: bytes | None = None
+        # In-memory bounded ledger used by the operator to observe publisher
+        # list_publish_obligations calls during a preflight window.  Not
+        # persisted: a window lives only for one canary preflight check.
+        self._publisher_preflight_windows: dict[str, list[dict[str, Any]]] = {}
 
     @contextmanager
     def serialized_transaction(self):
@@ -1464,16 +1468,19 @@ class DedicatedKanbanBroker:
         default_branch: str,
         project_id: str | None,
         remote_repository: dict[str, Any],
-        expected_source_sha: str | None = None,
+        expected_source_sha: str,
     ) -> dict[str, Any]:
         self._authorize(peer_uid, self.operator_uid, "repository registration")
         repository_id = _safe_identifier(repository_id, field="repository_id")
         default_branch = _safe_identifier(default_branch, field="default branch")
-        if expected_source_sha is not None and (
+        if (
             not isinstance(expected_source_sha, str)
+            or not expected_source_sha
             or re.fullmatch(r"[0-9a-f]{40}", expected_source_sha) is None
         ):
-            raise BrokerSecurityError("expected source SHA is invalid")
+            raise BrokerSecurityError(
+                "expected_source_sha must be a nonempty 40-hex lowercase source SHA"
+            )
         canonical_remote = _normalize_github_repository(remote_repository)
         if (
             canonical_remote["publication_policy"]["pull_request_base"]
@@ -1496,8 +1503,10 @@ class DedicatedKanbanBroker:
             "SELECT * FROM repositories WHERE repository_id=?", (repository_id,)
         ).fetchone()
         if existing is not None:
-            if expected_source_sha is not None and existing["base_sha"] != expected_source_sha:
-                raise BrokerConflict("registered repository source SHA does not match")
+            if existing["base_sha"] != expected_source_sha:
+                raise BrokerConflict(
+                    "registered repository source SHA does not match the reviewed input"
+                )
             expected_fingerprint = _repository_fingerprint(
                 repository_id=repository_id,
                 source_path=str(source),
@@ -1578,7 +1587,7 @@ class DedicatedKanbanBroker:
                 .decode()
                 .strip()
             )
-            if expected_source_sha is not None and base_sha != expected_source_sha:
+            if base_sha != expected_source_sha:
                 raise BrokerConflict("repository source SHA does not match the reviewed input")
         except Exception:
             if private.exists() and private.parent == self.state_dir / "repositories":
@@ -3363,13 +3372,92 @@ class DedicatedKanbanBroker:
             if items
             else None
         )
-        return {
+        result = {
             "contract": PUBLISH_OBLIGATION_QUERY_CONTRACT,
             "broker_boundary": KANBAN_BROKER_SECURITY_BOUNDARY,
             "items": items,
             "has_more": has_more,
             "next_cursor": next_cursor,
         }
+        # Record into every open preflight window so the operator can verify
+        # that exactly one read-only obligations RPC was made by the publisher.
+        record = {
+            "method": "list_publish_obligations",
+            "peer_uid": int(peer_uid),
+            "limit": int(limit),
+            "after_created_at": int(after_created_at),
+            "after_receipt_id": str(after_receipt_id),
+            "repository_id": repository_id,
+        }
+        self._record_preflight_window_call(record)
+        return result
+
+    def _record_preflight_window_call(self, record: dict[str, Any]) -> None:
+        for window_calls in self._publisher_preflight_windows.values():
+            if len(window_calls) < 256:  # bounded to prevent unbounded growth
+                window_calls.append(dict(record))
+
+    def observe_publisher_rpc(self, *, method: str, peer_uid: int) -> None:
+        """Record any other publisher-surface RPC seen while a window is open.
+
+        The wire server calls this for every publisher-surface method except
+        ``list_publish_obligations`` (which records its own bounded query
+        fields), so a preflight window proves not only that the one expected
+        read-only call happened but also that nothing else was attempted.
+        """
+        with self._mutation_lock:
+            self._record_preflight_window_call({
+                "method": str(method),
+                "peer_uid": int(peer_uid),
+            })
+
+    @_serialized_broker_method
+    def open_publisher_preflight_window(
+        self,
+        *,
+        peer_uid: int,
+    ) -> dict[str, Any]:
+        """Open a bounded in-memory window to observe publisher RPC calls.
+
+        The operator opens a window before launching the publisher preflight
+        subprocess, then closes it afterwards to retrieve the broker-side
+        evidence.  Only ``list_publish_obligations`` calls made by the
+        publisher identity during the window are recorded.  At most one open
+        window per broker instance is supported; opening a second window while
+        one is already open is rejected to prevent ambiguous evidence.
+        """
+        self._authorize(peer_uid, self.operator_uid, "publisher preflight window")
+        if self._publisher_preflight_windows:
+            raise BrokerConflict(
+                "a publisher preflight window is already open; close it first"
+            )
+        window_id = secrets.token_hex(16)
+        self._publisher_preflight_windows[window_id] = []
+        return {"window_id": window_id}
+
+    @_serialized_broker_method
+    def close_publisher_preflight_window(
+        self,
+        *,
+        peer_uid: int,
+        window_id: str,
+    ) -> dict[str, Any]:
+        """Close a preflight window and return the RPC calls observed in it.
+
+        Returns ``{"window_id": ..., "calls": [...]}`` where each call entry
+        is a dict with keys ``method``, ``limit``, ``after_created_at``,
+        ``after_receipt_id``, and ``repository_id``.
+        """
+        self._authorize(peer_uid, self.operator_uid, "publisher preflight window")
+        if (
+            not isinstance(window_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", window_id) is None
+        ):
+            raise BrokerConflict("publisher preflight window_id is invalid")
+        calls = self._publisher_preflight_windows.pop(window_id, None)
+        if calls is None:
+            raise BrokerConflict("publisher preflight window not found or already closed")
+        return {"window_id": window_id, "calls": list(calls)}
 
     def _cleanup_superseded_export(self, receipt_id: str) -> None:
         export = self.conn.execute(

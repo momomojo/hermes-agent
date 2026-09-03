@@ -113,6 +113,7 @@ def broker_fixture(tmp_path):
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base_sha,
     )
     yield broker, source, base_sha
     broker.close()
@@ -1386,7 +1387,7 @@ def test_broker_restart_sweeps_post_claim_orphan_to_retryable_state(tmp_path):
     from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
 
     source = tmp_path / "source"
-    _init_repo(source)
+    base_sha = _init_repo(source)
     kwargs = {
         "state_dir": tmp_path / "state",
         "workspace_root": tmp_path / "workspaces",
@@ -1408,6 +1409,7 @@ def test_broker_restart_sweeps_post_claim_orphan_to_retryable_state(tmp_path):
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base_sha,
     )
     created = broker.trusted_create(
         peer_uid=os.geteuid(),
@@ -1710,7 +1712,7 @@ def test_restart_recovers_journaled_commit_without_mutable_workspace(tmp_path):
     from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
 
     source = tmp_path / "source"
-    _init_repo(source)
+    base_sha = _init_repo(source)
     kwargs = {
         "state_dir": tmp_path / "state",
         "workspace_root": tmp_path / "workspaces",
@@ -1732,6 +1734,7 @@ def test_restart_recovers_journaled_commit_without_mutable_workspace(tmp_path):
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base_sha,
     )
     created = broker.trusted_create(
         peer_uid=os.geteuid(),
@@ -1861,6 +1864,7 @@ def test_repository_registration_rejects_replace_refs_before_materialization(
             default_branch="main",
             project_id=None,
             remote_repository=_remote_repository(),
+            expected_source_sha=base_sha,
         )
     assert not (tmp_path / "state" / "repositories" / "radulator.git").exists()
     broker.close()
@@ -1877,6 +1881,7 @@ def test_repository_registration_replays_exact_result_after_response_loss(
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base,
     )
     assert replay["repository_id"] == "radulator"
     assert replay["base_sha"] == base
@@ -1889,7 +1894,7 @@ def test_repository_registration_rejects_model_mutable_trusted_checkout(tmp_path
     from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
 
     source = tmp_path / "source"
-    _init_repo(source)
+    base_sha = _init_repo(source)
     mutable = source / ".git" / "config"
     mutable.chmod(0o666)
     broker = DedicatedKanbanBroker(
@@ -1912,6 +1917,7 @@ def test_repository_registration_rejects_model_mutable_trusted_checkout(tmp_path
                 default_branch="main",
                 project_id=None,
                 remote_repository=_remote_repository(),
+                expected_source_sha=base_sha,
             )
     finally:
         broker.close()
@@ -1922,7 +1928,7 @@ def test_repository_registration_neutralizes_source_pack_objects_hook(tmp_path):
     from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
 
     source = tmp_path / "source"
-    _init_repo(source)
+    base_sha = _init_repo(source)
     marker = tmp_path / "source-hook-executed-as-broker"
     hook = tmp_path / "hostile-pack-objects"
     hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 97\n", encoding="utf-8")
@@ -1946,6 +1952,7 @@ def test_repository_registration_neutralizes_source_pack_objects_hook(tmp_path):
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base_sha,
     )
     assert registered["base_sha"] == _git("rev-parse", "HEAD", cwd=source)
     assert not marker.exists()
@@ -1979,6 +1986,7 @@ def test_repository_registration_rejects_grafts_and_object_alternates(tmp_path):
             default_branch="main",
             project_id=None,
             remote_repository=_remote_repository(),
+            expected_source_sha=base_sha,
         )
     (git_dir / "info" / "grafts").unlink()
     (git_dir / "objects" / "info" / "alternates").write_text(
@@ -1992,6 +2000,7 @@ def test_repository_registration_rejects_grafts_and_object_alternates(tmp_path):
             default_branch="main",
             project_id=None,
             remote_repository=_remote_repository(),
+            expected_source_sha=base_sha,
         )
     broker.close()
 
@@ -2081,7 +2090,7 @@ def test_publisher_receives_receipt_bound_read_only_bundle_not_private_git(
     from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
 
     source = tmp_path / "source"
-    _init_repo(source)
+    base_sha = _init_repo(source)
     handoff_root = tmp_path / "publisher-handoffs"
     broker = DedicatedKanbanBroker(
         state_dir=tmp_path / "private-state",
@@ -2104,6 +2113,7 @@ def test_publisher_receives_receipt_bound_read_only_bundle_not_private_git(
         default_branch="main",
         project_id=None,
         remote_repository=_remote_repository(),
+        expected_source_sha=base_sha,
     )
     created = broker.trusted_create(
         peer_uid=os.geteuid(),
@@ -5110,3 +5120,156 @@ def test_cross_uid_publisher_bundle_and_socket_matrix():
     finally:
         listener.close()
         shutil.rmtree(staging)
+
+
+# ---------------------------------------------------------------------------
+# Finding 6 — register_repository must require a nonempty 40-hex source SHA
+# ---------------------------------------------------------------------------
+
+def _make_bare_broker(tmp_path):
+    """Return an initialized broker with no registered repository."""
+    from hermes_cli.kanban_dedicated_broker import DedicatedKanbanBroker
+
+    broker = DedicatedKanbanBroker(
+        state_dir=tmp_path / "state",
+        workspace_root=tmp_path / "workspaces",
+        broker_uid=os.geteuid(),
+        controller_uid=os.geteuid(),
+        publisher_uid=os.geteuid(),
+        operator_uid=os.geteuid(),
+        worker_uid=os.geteuid(),
+        workspace_gid=os.getegid(),
+    )
+    broker.initialize()
+    return broker
+
+
+def test_register_repository_missing_expected_source_sha_raises(tmp_path):
+    """Calling without expected_source_sha must fail (missing positional/kwarg)."""
+    from hermes_cli.kanban_dedicated_broker import BrokerSecurityError
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        with pytest.raises((TypeError, BrokerSecurityError)):
+            broker.register_repository(
+                peer_uid=os.geteuid(),
+                repository_id="radulator",
+                source_path=source,
+                default_branch="main",
+                project_id=None,
+                remote_repository=_remote_repository(),
+                # expected_source_sha intentionally omitted
+            )
+    finally:
+        broker.close()
+
+
+def test_register_repository_none_expected_source_sha_raises(tmp_path):
+    """Passing None for expected_source_sha must be rejected."""
+    from hermes_cli.kanban_dedicated_broker import BrokerSecurityError
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        with pytest.raises(BrokerSecurityError, match="source SHA"):
+            broker.register_repository(
+                peer_uid=os.geteuid(),
+                repository_id="radulator",
+                source_path=source,
+                default_branch="main",
+                project_id=None,
+                remote_repository=_remote_repository(),
+                expected_source_sha=None,
+            )
+    finally:
+        broker.close()
+
+
+def test_register_repository_empty_expected_source_sha_raises(tmp_path):
+    """An empty string for expected_source_sha must be rejected."""
+    from hermes_cli.kanban_dedicated_broker import BrokerSecurityError
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        with pytest.raises(BrokerSecurityError, match="source SHA"):
+            broker.register_repository(
+                peer_uid=os.geteuid(),
+                repository_id="radulator",
+                source_path=source,
+                default_branch="main",
+                project_id=None,
+                remote_repository=_remote_repository(),
+                expected_source_sha="",
+            )
+    finally:
+        broker.close()
+
+
+def test_register_repository_malformed_expected_source_sha_raises(tmp_path):
+    """A SHA that is not 40 lowercase hex characters must be rejected."""
+    from hermes_cli.kanban_dedicated_broker import BrokerSecurityError
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        for bad in ("ABCDEF1234567890ABCDEF1234567890ABCDEF12", "deadbeef", "x" * 40, "z" * 39 + "0"):
+            with pytest.raises(BrokerSecurityError, match="source SHA"):
+                broker.register_repository(
+                    peer_uid=os.geteuid(),
+                    repository_id="radulator",
+                    source_path=source,
+                    default_branch="main",
+                    project_id=None,
+                    remote_repository=_remote_repository(),
+                    expected_source_sha=bad,
+                )
+    finally:
+        broker.close()
+
+
+def test_register_repository_mismatched_expected_source_sha_raises(tmp_path):
+    """A valid-format SHA that does not match the repo HEAD must be rejected."""
+    from hermes_cli.kanban_dedicated_broker import BrokerConflict
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        with pytest.raises(BrokerConflict, match="source SHA"):
+            broker.register_repository(
+                peer_uid=os.geteuid(),
+                repository_id="radulator",
+                source_path=source,
+                default_branch="main",
+                project_id=None,
+                remote_repository=_remote_repository(),
+                expected_source_sha="a" * 40,  # valid format, wrong value
+            )
+    finally:
+        broker.close()
+
+
+def test_register_repository_matching_expected_source_sha_succeeds(tmp_path):
+    """A correct 40-hex lowercase SHA matching the repo HEAD must succeed."""
+    source = tmp_path / "source"
+    base_sha = _init_repo(source)
+    broker = _make_bare_broker(tmp_path)
+    try:
+        result = broker.register_repository(
+            peer_uid=os.geteuid(),
+            repository_id="radulator",
+            source_path=source,
+            default_branch="main",
+            project_id=None,
+            remote_repository=_remote_repository(),
+            expected_source_sha=base_sha,
+        )
+        assert result["base_sha"] == base_sha
+    finally:
+        broker.close()
