@@ -19,10 +19,18 @@ async function activeConnection(): Promise<{ connection: HermesConnection; key: 
       ? await getConnectionFor({ connectionId, profile })
       : await window.hermesDesktop.getConnection(profile)
 
-  // Name the backend by the (connection, profile) it was resolved for, never
-  // by its address: local backends bind port 0, so a respawn changes baseUrl
-  // while the board database behind it stays the same.
-  return { connection, key: `${connectionId ?? ''}|${profile ?? ''}` }
+  // Name the backend by the identity it RESOLVED to, never by its address:
+  // local backends bind port 0, so a respawn changes baseUrl while the board
+  // database behind it stays the same. The request scope is no identity either:
+  // every primary route has a null connection id, even when the primary moves
+  // from local to a remote, so read the descriptor's own connection identity.
+  const identity =
+    connection.connectionId ??
+    (connection.mode === 'remote'
+      ? `remote:${connection.remoteIdentity ?? connection.remoteHost ?? connection.baseUrl}`
+      : 'local')
+
+  return { connection, key: `${identity}|${connection.profile ?? profile ?? ''}` }
 }
 
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`

@@ -608,7 +608,11 @@ describe('pluginSocket', () => {
   it('re-evaluates a function path on every reconnect with a stable backend key', async () => {
     getConnection.mockResolvedValue({ authMode: 'token', baseUrl: 'http://127.0.0.1:9119', token: 'tok' })
     const urls: string[] = []
-    const sockets: Array<{ onclose: (() => void) | null }> = []
+
+    const sockets: Array<{
+      onclose: (() => void) | null
+      onmessage: ((event: { data: string }) => void) | null
+    }> = []
 
     class FakeWebSocket {
       onmessage: ((event: { data: string }) => void) | null = null
@@ -620,6 +624,12 @@ describe('pluginSocket', () => {
       }
 
       close() {}
+    }
+
+    // A delivered frame resets the backoff, keeping each redial quick.
+    const drop = (index: number) => {
+      sockets[index].onmessage?.({ data: '{}' })
+      sockets[index].onclose?.()
     }
 
     vi.stubGlobal('WebSocket', FakeWebSocket)
@@ -640,17 +650,30 @@ describe('pluginSocket', () => {
     // A local backend respawn binds a new port (port 0): same backend, same key.
     getConnection.mockResolvedValue({ authMode: 'token', baseUrl: 'http://127.0.0.1:9120', token: 'tok' })
     since = '57'
-    sockets[0].onclose?.()
+    drop(0)
     await vi.waitFor(() => expect(urls).toHaveLength(2), { timeout: 3000 })
     // A live profile switch is a different backend: the key changes.
     setApiRequestProfile('work')
-    sockets[1].onclose?.()
-    await vi.waitFor(() => expect(urls).toHaveLength(3), { timeout: 6000 })
+    drop(1)
+    await vi.waitFor(() => expect(urls).toHaveLength(3), { timeout: 3000 })
+    // The primary route moving to a remote has no request-scope connection id;
+    // the resolved descriptor's identity must still change the key.
+    setApiRequestProfile(null)
+    getConnection.mockResolvedValue({
+      authMode: 'token',
+      baseUrl: 'https://homelab.invalid',
+      connectionId: 'homelab',
+      mode: 'remote',
+      token: 'tok3'
+    })
+    drop(2)
+    await vi.waitFor(() => expect(urls).toHaveLength(4), { timeout: 3000 })
 
     expect(urls[0]).toBe('ws://127.0.0.1:9119/api/plugins/kanban/events?since=42&token=tok')
     expect(urls[1]).toBe('ws://127.0.0.1:9120/api/plugins/kanban/events?since=57&token=tok')
-    expect(backends).toEqual(['|', '|', '|work'])
-    expect(getConnection).toHaveBeenLastCalledWith('work')
+    expect(urls[3]).toBe('wss://homelab.invalid/api/plugins/kanban/events?since=57&token=tok3')
+    expect(backends).toEqual(['local|', 'local|', 'local|work', 'homelab|'])
+    expect(getConnection).toHaveBeenCalledWith('work')
 
     dispose()
   })
