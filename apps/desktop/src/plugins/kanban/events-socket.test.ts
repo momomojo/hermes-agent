@@ -7,7 +7,8 @@
  * reconnect sends the last cursor it saw as `?since=`, or every event raised
  * while the socket was down (completions, blockers) would be skipped. Event ids
  * are local to one backend, so a reconnect that lands on another profile or
- * connection starts that backend's own stream. A board switch starts fresh.
+ * connection starts that backend's own stream. Cursors outlive a board switch:
+ * returning to a board resumes it rather than skipping what happened meanwhile.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -169,18 +170,27 @@ describe('bindApi events socket', () => {
     dispose()
   })
 
-  it('starts a fresh stream when the board changes', async () => {
+  it('resumes each board from its own cursor across board switches', async () => {
     const { $boardSlug, bindApi } = await import('./api')
     const { opened, socket } = fakeSocketDoor()
     const dispose = bindApi(rest, storage(), socket)
 
     expect(opened[0].path('backend-a')).toBe('/events?since=latest')
     opened[0].onMessage({ events: [], cursor: 42 })
-    $boardSlug.set('ops')
 
+    // A board never seen on this backend starts at the current event.
+    $boardSlug.set('ops')
     expect(opened).toHaveLength(2)
     expect(opened[0].closed).toBe(true)
     expect(opened[1].path('backend-a')).toBe('/events?board=ops&since=latest')
+    opened[1].onMessage({ events: [], cursor: 900 })
+
+    // Returning resumes the first board where it left off, so events raised
+    // there while another board was selected are replayed, not skipped.
+    $boardSlug.set('')
+    expect(opened[2].path('backend-a')).toBe('/events?since=42')
+    $boardSlug.set('ops')
+    expect(opened[3].path('backend-a')).toBe('/events?board=ops&since=900')
 
     dispose()
   })

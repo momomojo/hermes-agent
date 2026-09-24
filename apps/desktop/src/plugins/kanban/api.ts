@@ -137,28 +137,31 @@ export function bindApi(
   persist($collapsedLanes, COLLAPSED_KEY, {})
 
   let close: (() => void) | null = null
+  // Every frame (including the server's opening one) carries the stream
+  // cursor; reconnects resume from it. Event ids are local to one backend's
+  // board, so cursors are keyed by backend (a reconnect can land on another
+  // profile or connection) and board, and outlive a board switch: returning
+  // to a board resumes its stream instead of skipping what happened meanwhile.
+  const cursors = new Map<string, number>()
 
   const open = (slug: string) => {
     close?.()
-    // Every frame (including the server's opening one) carries the stream
-    // cursor; reconnects resume from it. Event ids are local to one backend,
-    // so cursors are kept per backend key (a reconnect can land on another
-    // profile or connection). A board switch starts fresh.
-    const cursorByBackend = new Map<string, number>()
     let backend = ''
+    const cursorFor = (key: string) => `${key}\n${slug}`
 
     close = socket(
       key => {
         backend = key
 
-        return eventsPath(slug, cursorByBackend.get(key) ?? null)
+        return eventsPath(slug, cursors.get(cursorFor(key)) ?? null)
       },
       data => {
         const frame = data as { cursor?: unknown; events?: unknown[] } | null
         const next = frame?.cursor
 
         if (typeof next === 'number' && Number.isFinite(next)) {
-          cursorByBackend.set(backend, Math.max(cursorByBackend.get(backend) ?? next, next))
+          const key = cursorFor(backend)
+          cursors.set(key, Math.max(cursors.get(key) ?? next, next))
 
           // The opening frame (no events) marks where a fresh stream starts:
           // notifications count from there, so the first live terminal event
