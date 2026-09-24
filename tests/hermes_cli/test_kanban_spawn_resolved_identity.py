@@ -103,30 +103,156 @@ def test_spawn_hook_receives_resolved_identity(
     assert [t.branch_name for t in hooked] == [f"wt/{tid}"]
 
 
-def test_claim_drift_before_spawn_fails_closed(
+# field -> (mutation applied after resolution but before spawn, claim still ours?)
+_DRIFTS = {
+    "assignee": ("UPDATE tasks SET assignee = 'someone-else' WHERE id = ?", True),
+    "project_id": ("UPDATE tasks SET project_id = 'other-project' WHERE id = ?", True),
+    "workspace_path": ("UPDATE tasks SET workspace_path = '/elsewhere' WHERE id = ?", True),
+    "branch_name": ("UPDATE tasks SET branch_name = 'wt/elsewhere' WHERE id = ?", True),
+    "workspace_kind": ("UPDATE tasks SET workspace_kind = 'scratch' WHERE id = ?", True),
+    "claim_lock": ("UPDATE tasks SET claim_lock = 'someone-else' WHERE id = ?", False),
+    "current_run_id": ("UPDATE tasks SET current_run_id = current_run_id + 1000 WHERE id = ?", False),
+    "status": ("UPDATE tasks SET status = 'blocked' WHERE id = ?", False),
+}
+
+
+def _kinds(conn, tid):
+    return [
+        r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+        )
+    ]
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("field", sorted(_DRIFTS))
+def test_drift_before_spawn_fails_closed(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch, lane, field,
+):
+    sql, still_ours = _DRIFTS[field]
+    repo = _make_repo(tmp_path)
+    captured: list = []
+    seen = {}
+    real_tip = kb._maybe_emit_scratch_tip
+
+    def drift_then_tip(conn, task_id, kind):
+        row = conn.execute(
+            "SELECT current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        seen["run_id"], seen["claim_lock"] = row["current_run_id"], row["claim_lock"]
+        conn.execute(sql, (task_id,))
+        conn.commit()
+        seen["after"] = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        return real_tip(conn, task_id, kind)
+
+    monkeypatch.setattr(kb, "_maybe_emit_scratch_tip", drift_then_tip)
+    with kb.connect() as conn:
+        tid = _first_claim_worktree_task(conn, repo, status=lane)
+        kb.dispatch_once(conn, spawn_fn=_capturing_spawn(captured))
+        task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        run = conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id = ?", (seen["run_id"],)
+        ).fetchone()
+        kinds = _kinds(conn, tid)
+
+    assert captured == [], f"{field} drift in the {lane} lane must launch nothing"
+    assert "spawn_identity_drift" in kinds
+    if still_ours:
+        # Our own claim is released at once (not left to the TTL) and counted.
+        assert task["status"] == lane
+        assert task["claim_lock"] is None
+        assert task["consecutive_failures"] == 1
+        assert run["outcome"] == "spawn_failed" and run["ended_at"] is not None
+    else:
+        # Someone else's claim, run or deliberate status is left untouched.
+        for name in ("status", "claim_lock", "current_run_id"):
+            assert task[name] == seen["after"][name]
+        assert task["consecutive_failures"] == 0
+        assert "spawn_failed" not in kinds
+
+
+def test_real_reclaim_before_spawn_leaves_the_new_owner_alone(
     kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
 ):
     repo = _make_repo(tmp_path)
     captured: list = []
+    new_owner = {}
     real_tip = kb._maybe_emit_scratch_tip
 
     def reclaim_then_tip(conn, task_id, kind):
-        # Another dispatcher reclaims the row after resolution, before spawn.
-        conn.execute("UPDATE tasks SET claim_lock = 'someone-else' WHERE id = ?", (task_id,))
+        # Our claim expires, the reaper resets it, and another worker claims it.
+        conn.execute("UPDATE tasks SET claim_expires = 0 WHERE id = ?", (task_id,))
         conn.commit()
+        kb.release_stale_claims(conn)
+        other = kb.claim_task(conn, task_id, claimer="other:1")
+        assert other is not None
+        new_owner["claim_lock"], new_owner["run_id"] = other.claim_lock, other.current_run_id
         return real_tip(conn, task_id, kind)
 
     monkeypatch.setattr(kb, "_maybe_emit_scratch_tip", reclaim_then_tip)
     with kb.connect() as conn:
         tid = _first_claim_worktree_task(conn, repo)
         kb.dispatch_once(conn, spawn_fn=_capturing_spawn(captured))
-        kinds = [
-            r["kind"] for r in conn.execute(
-                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
-            )
-        ]
-    assert captured == [], "no worker may launch after identity drift"
+        task = kb.get_task(conn, tid)
+        new_run = conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id = ?", (new_owner["run_id"],)
+        ).fetchone()
+        kinds = _kinds(conn, tid)
+
+    assert captured == []
     assert "spawn_identity_drift" in kinds
+    assert task.status == "running"
+    assert task.claim_lock == new_owner["claim_lock"]
+    assert task.current_run_id == new_owner["run_id"]
+    assert new_run["ended_at"] is None, "the new owner's run must stay open"
+
+
+def test_first_claim_worker_env_passes_the_worker_boundary(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
+):
+    """End to end: the environment the real _default_spawn gives a first-claim
+    worktree worker must satisfy the worker boundary that refused it before."""
+    import os
+
+    from tools import kanban_worker_boundary as boundary
+
+    import subprocess
+
+    repo = _make_repo(tmp_path)
+    captured = {}
+    real_popen = subprocess.Popen
+
+    class _WorkerLaunch:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        # Intercept only the worker launch; let git (worktree creation) run.
+        env = kwargs.get("env")
+        if env and "HERMES_KANBAN_TASK" in env:
+            captured["env"] = dict(env)
+            return _WorkerLaunch()
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    with kb.connect() as conn:
+        tid = _first_claim_worktree_task(conn, repo)
+        kb.dispatch_once(conn, spawn_fn=kb._default_spawn)
+        task = kb.get_task(conn, tid)
+
+    env = captured["env"]
+    assert env.get("HERMES_KANBAN_BRANCH") == f"wt/{tid}"
+    for key in [k for k in os.environ if k.startswith("HERMES_KANBAN_") or k == "TERMINAL_CWD"]:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        if key.startswith("HERMES_KANBAN_") or key == "TERMINAL_CWD":
+            monkeypatch.setenv(key, value)
+    live = boundary._live_assignment(
+        task_id=tid,
+        run_id=task.current_run_id,
+        claim_lock=task.claim_lock,
+        env_workspace=Path(env["HERMES_KANBAN_WORKSPACE"]).resolve(),
+    )
+    assert live is not None, "the worker boundary must accept the spawned identity"
 
 
 def test_default_spawn_does_not_inherit_a_stale_branch_pin(kanban_home, tmp_path, monkeypatch):
