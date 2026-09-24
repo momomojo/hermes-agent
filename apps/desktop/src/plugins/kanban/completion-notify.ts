@@ -119,6 +119,23 @@ async function ensureBaseline(slug: string, key: string): Promise<void> {
   }
 }
 
+/** Seed a board's baseline from a stream's opening cursor (the server's
+ *  `since=latest` frame). Without it the baseline would be fetched lazily when
+ *  the first live event arrives, by which time /board already counts that
+ *  event, and the first terminal transition would be suppressed as history.
+ *  An existing cursor (a resumed stream) is never moved. */
+export function seedKanbanEventsBaseline(slug: string, cursor: number, backend = ''): void {
+  if (slug === '' || !Number.isFinite(cursor)) {
+    return
+  }
+
+  const key = cursorKey(slug, backend)
+
+  if (!seenEventIdByBoard.has(key)) {
+    seenEventIdByBoard.set(key, cursor)
+  }
+}
+
 function trimmed(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }

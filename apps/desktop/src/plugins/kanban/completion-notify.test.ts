@@ -22,6 +22,7 @@ interface OsDoor {
 interface Mod {
   bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): void
   onKanbanEventsFrame(slug: string, events?: CompletionEvent[], backend?: string): Promise<boolean>
+  seedKanbanEventsBaseline(slug: string, cursor: number, backend?: string): void
 }
 
 const { hostMock } = vi.hoisted(() => ({
@@ -110,6 +111,23 @@ describe('authoritative baseline', () => {
     // Back on backend A its cursor was kept: history stays suppressed.
     await m.onKanbanEventsFrame('smoke', [ev(101, 'completed'), ev(102, 'completed')], 'backend-a')
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
+  })
+
+  it('a stream opening cursor seeds the baseline, so the first live event notifies', async () => {
+    // /board already counts event 101 by the time the lazy baseline is fetched.
+    const unseeded = await loadModule()
+    unseeded.bindCompletionNotify(makeRest(() => 101) as never)
+    expect(await unseeded.onKanbanEventsFrame('smoke', [ev(101, 'completed')], 'b')).toBe(false)
+
+    vi.clearAllMocks()
+    const seeded = await loadModule()
+    seeded.bindCompletionNotify(makeRest(() => 101) as never)
+    seeded.seedKanbanEventsBaseline('smoke', 100, 'b')
+    expect(await seeded.onKanbanEventsFrame('smoke', [ev(101, 'completed')], 'b')).toBe(true)
+
+    // A resumed stream's cursor is never moved back by a later seed.
+    seeded.seedKanbanEventsBaseline('smoke', 50, 'b')
+    expect(await seeded.onKanbanEventsFrame('smoke', [ev(101, 'completed')], 'b')).toBe(false)
   })
 
   it('post-baseline completion notifies exactly once', async () => {

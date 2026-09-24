@@ -605,7 +605,7 @@ describe('pluginSocket', () => {
     dispose()
   })
 
-  it('re-evaluates a function path on every reconnect', async () => {
+  it('re-evaluates a function path on every reconnect with a stable backend key', async () => {
     getConnection.mockResolvedValue({ authMode: 'token', baseUrl: 'http://127.0.0.1:9119', token: 'tok' })
     const urls: string[] = []
     const sockets: Array<{ onclose: (() => void) | null }> = []
@@ -637,21 +637,20 @@ describe('pluginSocket', () => {
     )
 
     await vi.waitFor(() => expect(urls).toHaveLength(1))
-    // The reconnect resolves another backend (e.g. a live profile switch).
-    getConnection.mockResolvedValue({
-      authMode: 'token',
-      baseUrl: 'http://127.0.0.1:9120',
-      profile: 'work',
-      token: 'tok2'
-    })
+    // A local backend respawn binds a new port (port 0): same backend, same key.
+    getConnection.mockResolvedValue({ authMode: 'token', baseUrl: 'http://127.0.0.1:9120', token: 'tok' })
     since = '57'
     sockets[0].onclose?.()
     await vi.waitFor(() => expect(urls).toHaveLength(2), { timeout: 3000 })
+    // A live profile switch is a different backend: the key changes.
+    setApiRequestProfile('work')
+    sockets[1].onclose?.()
+    await vi.waitFor(() => expect(urls).toHaveLength(3), { timeout: 6000 })
 
     expect(urls[0]).toBe('ws://127.0.0.1:9119/api/plugins/kanban/events?since=42&token=tok')
-    expect(urls[1]).toBe('ws://127.0.0.1:9120/api/plugins/kanban/events?since=57&token=tok2')
-    // The path function learns which backend each dial targets.
-    expect(backends).toEqual(['http://127.0.0.1:9119|', 'http://127.0.0.1:9120|work'])
+    expect(urls[1]).toBe('ws://127.0.0.1:9120/api/plugins/kanban/events?since=57&token=tok')
+    expect(backends).toEqual(['|', '|', '|work'])
+    expect(getConnection).toHaveBeenLastCalledWith('work')
 
     dispose()
   })

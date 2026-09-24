@@ -100,6 +100,7 @@ describe('bindApi events socket', () => {
   beforeEach(() => {
     vi.resetModules()
     invalidateQueries.mockClear()
+    hostMock.notify.mockClear()
   })
 
   it('reconnects from the last cursor it saw, including the opening frame', async () => {
@@ -142,6 +143,28 @@ describe('bindApi events socket', () => {
 
     // Returning to A resumes A's own stream.
     expect(opened[0].path('backend-a')).toBe('/events?since=500')
+
+    dispose()
+  })
+
+  it('counts notifications from the opening cursor, so the first live event notifies', async () => {
+    // /board already counts event 101 when a lazy baseline would be fetched.
+    const restAt101 = vi.fn(async () => ({ latest_event_id: 101 })) as unknown as <T>(path: string) => Promise<T>
+    const { $boardSlug, bindApi } = await import('./api')
+    const { opened, socket } = fakeSocketDoor()
+    const dispose = bindApi(restAt101, storage(), socket)
+
+    $boardSlug.set('ops')
+    const live = opened[1]
+
+    expect(live.path('backend-a')).toBe('/events?board=ops&since=latest')
+    live.onMessage({ events: [], cursor: 100 })
+    live.onMessage({
+      cursor: 101,
+      events: [{ id: 101, kind: 'completed', payload: { summary: 'Done' }, task_id: 't1' }]
+    })
+
+    await vi.waitFor(() => expect(hostMock.notify).toHaveBeenCalledTimes(1))
 
     dispose()
   })

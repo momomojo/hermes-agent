@@ -19,7 +19,12 @@ import {
 } from '@hermes/plugin-sdk'
 
 // Native completion notification.
-import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
+import {
+  bindCompletionNotify,
+  type CompletionEvent,
+  onKanbanEventsFrame,
+  seedKanbanEventsBaseline
+} from './completion-notify'
 import type {
   BoardMeta,
   BoardsResponse,
@@ -149,10 +154,18 @@ export function bindApi(
         return eventsPath(slug, cursorByBackend.get(key) ?? null)
       },
       data => {
-        const next = (data as { cursor?: unknown })?.cursor
+        const frame = data as { cursor?: unknown; events?: unknown[] } | null
+        const next = frame?.cursor
 
         if (typeof next === 'number' && Number.isFinite(next)) {
           cursorByBackend.set(backend, Math.max(cursorByBackend.get(backend) ?? next, next))
+
+          // The opening frame (no events) marks where a fresh stream starts:
+          // notifications count from there, so the first live terminal event
+          // is not mistaken for history.
+          if (!frame?.events?.length) {
+            seedKanbanEventsBaseline(slug, next, backend)
+          }
         }
 
         onEventsFrame(slug, data, backend)
