@@ -1,11 +1,13 @@
 /**
- * The Kanban events socket resumes from its last stream cursor on reconnect.
+ * The Kanban events socket starts at the current event and resumes from its
+ * last stream cursor on reconnect, per backend.
  *
- * The server starts a cursorless socket at the current event (a full replay of
- * `task_events` saturated the backend), and announces that starting cursor in
- * an opening frame. A reconnect must send the last cursor it saw as `?since=`,
- * or every event raised while the socket was down (completions, blockers) would
- * be skipped. A board switch opens a fresh stream with no cursor.
+ * A fresh stream asks for `since=latest` (a full replay of `task_events`
+ * saturated the backend); the server answers with an opening cursor frame. A
+ * reconnect sends the last cursor it saw as `?since=`, or every event raised
+ * while the socket was down (completions, blockers) would be skipped. Event ids
+ * are local to one backend, so a reconnect that lands on another profile or
+ * connection starts that backend's own stream. A board switch starts fresh.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -46,19 +48,19 @@ vi.mock('@hermes/plugin-sdk', () => {
 type OnMessage = (data: unknown) => void
 
 interface OpenedSocket {
-  path: () => string
-  onMessage: OnMessage
   closed: boolean
+  onMessage: OnMessage
+  path: (backend: string) => string
 }
 
 function fakeSocketDoor() {
   const opened: OpenedSocket[] = []
 
-  const socket = (path: string | (() => string), onMessage: OnMessage) => {
+  const socket = (path: string | ((backend: string) => string), onMessage: OnMessage) => {
     const entry: OpenedSocket = {
-      path: typeof path === 'function' ? path : () => path,
+      closed: false,
       onMessage,
-      closed: false
+      path: typeof path === 'function' ? path : () => path
     }
 
     opened.push(entry)
@@ -84,11 +86,11 @@ const storage = () => {
 const rest = vi.fn(async () => ({ latest_event_id: 0 })) as unknown as <T>(path: string) => Promise<T>
 
 describe('eventsPath', () => {
-  it('adds the board and the resume cursor only when present', async () => {
+  it('asks for the latest event without a cursor, and resumes with one', async () => {
     const { eventsPath } = await import('./api')
 
-    expect(eventsPath('', null)).toBe('/events')
-    expect(eventsPath('main board', null)).toBe('/events?board=main+board')
+    expect(eventsPath('', null)).toBe('/events?since=latest')
+    expect(eventsPath('main board', null)).toBe('/events?board=main+board&since=latest')
     expect(eventsPath('ops', 42)).toBe('/events?board=ops&since=42')
     expect(eventsPath('', 0)).toBe('/events?since=0')
   })
@@ -106,36 +108,56 @@ describe('bindApi events socket', () => {
     const dispose = bindApi(rest, storage(), socket)
 
     expect(opened).toHaveLength(1)
-    // First connection: no cursor yet, so the server baselines at "now".
-    expect(opened[0].path()).toBe('/events')
+    // First connection: no cursor yet, so start at the current event.
+    expect(opened[0].path('backend-a')).toBe('/events?since=latest')
 
     // The server's opening frame announces where the stream starts.
     opened[0].onMessage({ events: [], cursor: 42 })
-    expect(opened[0].path()).toBe('/events?since=42')
+    expect(opened[0].path('backend-a')).toBe('/events?since=42')
 
     // Later frames advance it; a reconnect re-evaluates the path.
-    opened[0].onMessage({ events: [{ id: 43, task_id: 't1', kind: 'created' }], cursor: 43 })
-    expect(opened[0].path()).toBe('/events?since=43')
+    opened[0].onMessage({ events: [{ id: 43, kind: 'created', task_id: 't1' }], cursor: 43 })
+    expect(opened[0].path('backend-a')).toBe('/events?since=43')
 
     // A stale or malformed cursor never moves it backwards.
     opened[0].onMessage({ events: [], cursor: 7 })
     opened[0].onMessage({ events: [], cursor: 'x' })
-    expect(opened[0].path()).toBe('/events?since=43')
+    expect(opened[0].path('backend-a')).toBe('/events?since=43')
 
     dispose()
   })
 
-  it('starts a fresh stream (no cursor) when the board changes', async () => {
+  it('keeps one cursor per backend across a profile or connection switch', async () => {
+    const { bindApi } = await import('./api')
+    const { opened, socket } = fakeSocketDoor()
+    const dispose = bindApi(rest, storage(), socket)
+
+    expect(opened[0].path('backend-a')).toBe('/events?since=latest')
+    opened[0].onMessage({ events: [], cursor: 500 })
+
+    // A reconnect that lands on another backend must not send A's cursor.
+    expect(opened[0].path('backend-b')).toBe('/events?since=latest')
+    opened[0].onMessage({ events: [], cursor: 7 })
+    expect(opened[0].path('backend-b')).toBe('/events?since=7')
+
+    // Returning to A resumes A's own stream.
+    expect(opened[0].path('backend-a')).toBe('/events?since=500')
+
+    dispose()
+  })
+
+  it('starts a fresh stream when the board changes', async () => {
     const { $boardSlug, bindApi } = await import('./api')
     const { opened, socket } = fakeSocketDoor()
     const dispose = bindApi(rest, storage(), socket)
 
+    expect(opened[0].path('backend-a')).toBe('/events?since=latest')
     opened[0].onMessage({ events: [], cursor: 42 })
     $boardSlug.set('ops')
 
     expect(opened).toHaveLength(2)
     expect(opened[0].closed).toBe(true)
-    expect(opened[1].path()).toBe('/events?board=ops')
+    expect(opened[1].path('backend-a')).toBe('/events?board=ops&since=latest')
 
     dispose()
   })

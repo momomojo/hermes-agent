@@ -17,9 +17,10 @@
  *    desktop shell fires only while the user is AWAY from Hermes. This is the
  *    door that covers "walked away and the worker hit a blocker".
  *
- * Cursor contract: first observation of a board baselines
- * seen[board] = GET /board latest_event_id (MAX task_events.id for that
- * board). Events id <= seen are historical/replay — never notified, no
+ * Cursor contract: first observation of a board on a backend baselines
+ * seen[backend, board] = GET /board latest_event_id (MAX task_events.id for
+ * that board; ids are local to one backend, so a profile or connection switch
+ * never mixes cursors). Events id <= seen are historical/replay — never notified, no
  * cursor change. id > seen advances cursor for EVERY kind; only terminal
  * kinds emit. A reconnect resumes from the socket's last stream cursor
  * (api.ts `eventsPath`); this cursor still filters any overlap. Board switch never
@@ -92,23 +93,29 @@ export function bindCompletionNotify(r: Rest, pluginTranslate?: PluginTranslate,
   osDoor = os ?? null
 }
 
-async function ensureBaseline(slug: string): Promise<void> {
-  if (seenEventIdByBoard.has(slug) || baselinePending.has(slug)) {
+/** Cursor key: event ids are local to one backend's board DB, so a board seen
+ *  on two backends (a profile or connection switch) keeps two cursors. */
+function cursorKey(slug: string, backend: string): string {
+  return backend ? `${backend}\n${slug}` : slug
+}
+
+async function ensureBaseline(slug: string, key: string): Promise<void> {
+  if (seenEventIdByBoard.has(key) || baselinePending.has(key)) {
     return
   }
 
-  baselinePending.add(slug)
+  baselinePending.add(key)
 
   try {
     const board = (await rest!<{ latest_event_id?: unknown }>(`/board?board=${encodeURIComponent(slug)}`)) as {
       latest_event_id?: unknown
     }
 
-    seenEventIdByBoard.set(slug, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
+    seenEventIdByBoard.set(key, typeof board.latest_event_id === 'number' ? board.latest_event_id : 0)
   } catch {
     // Fail-closed: unknown baseline → notifications stay suppressed.
   } finally {
-    baselinePending.delete(slug)
+    baselinePending.delete(key)
   }
 }
 
@@ -177,14 +184,16 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
 
 /** Consume one /events frame for a board. Returns true when a terminal-event
  *  notification was fired. Never throws: notification failure cannot
- *  interfere with api.ts cache invalidation. */
-export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean> {
+ *  interfere with api.ts cache invalidation. `backend` is the socket's opaque
+ *  backend key; cursors are kept per backend and board. */
+export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent[], backend = ''): Promise<boolean> {
   if (!events?.length || slug === '' || !rest) {
     return false
   }
 
-  await ensureBaseline(slug)
-  const seen = seenEventIdByBoard.get(slug)
+  const key = cursorKey(slug, backend)
+  await ensureBaseline(slug, key)
+  const seen = seenEventIdByBoard.get(key)
 
   if (seen === undefined) {
     return false
@@ -199,7 +208,7 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
     }
 
     cursor = ev.id
-    seenEventIdByBoard.set(slug, cursor)
+    seenEventIdByBoard.set(key, cursor)
     const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
 
     if (spec) {

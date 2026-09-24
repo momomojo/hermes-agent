@@ -74,22 +74,25 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
  *  keep their polling fallback — every consumer must have one anyway, since a
  *  socket can drop). Auto-reconnects with backoff until disposed. Pass `path`
  *  as a function to recompute it on every (re)connect, e.g. to resume from the
- *  last cursor the stream delivered so a reconnect neither replays nor skips. */
+ *  last cursor the stream delivered so a reconnect neither replays nor skips.
+ *  It receives an opaque key for the backend being dialed: stream cursors are
+ *  local to one backend, so a resume cursor must never cross a profile or
+ *  connection switch. */
 export function pluginSocket(
   pluginId: string,
-  path: string | (() => string),
+  path: string | ((backend: string) => string),
   onMessage: (data: unknown) => void
 ): () => void {
   // A static path is validated at the call site, as before.
   const staticSuffix = typeof path === 'string' ? pluginPathSuffix('pluginSocket', path) : null
 
-  const currentSuffix = (): null | string => {
+  const suffixFor = (connection: HermesConnection): null | string => {
     if (typeof path === 'string') {
       return staticSuffix
     }
 
     try {
-      return pluginPathSuffix('pluginSocket', path())
+      return pluginPathSuffix('pluginSocket', path(`${connection.baseUrl}|${connection.profile ?? ''}`))
     } catch {
       // A dynamic path that turns illegal stops the socket; polling remains.
       return null
@@ -109,7 +112,7 @@ export function pluginSocket(
       return
     }
 
-    const suffix = currentSuffix()
+    const suffix = suffixFor(connection)
 
     if (suffix === null) {
       return

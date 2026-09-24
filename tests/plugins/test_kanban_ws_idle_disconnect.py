@@ -81,13 +81,19 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
 
     assert ws.accepted
     assert ws.receive_calls == 1
-    # Only the opening cursor frame; returned before any poll, no zombie loop.
-    assert ws.sent == [{"events": [], "cursor": 0}]
+    assert ws.sent == []  # returned before any poll, no zombie loop
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("since, expected_cursor", [(None, 42), ("0", 0)])
-async def test_stream_events_baselines_only_when_since_is_omitted(monkeypatch, since, expected_cursor):
+@pytest.mark.parametrize(
+    "since, expected_cursor",
+    [
+        (None, 0),  # older clients keep the historical full replay
+        ("0", 0),
+        ("latest", 42),  # opt-in: start at the current event, no backlog
+    ],
+)
+async def test_stream_events_baselines_only_when_latest_is_requested(monkeypatch, since, expected_cursor):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
     monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
@@ -130,10 +136,10 @@ async def test_stream_events_baselines_only_when_since_is_omitted(monkeypatch, s
 
     assert ws.accepted
     assert queried_after == [expected_cursor]
-    # A cursorless client learns where its stream starts, so a reconnect can
+    # A "latest" client learns where its stream starts, so a reconnect can
     # resume with ?since= instead of skipping events raised while it was down.
-    # A client that sent its own cursor already knows it.
-    if since is None:
+    # A client that sent a numeric cursor, or none, already knows its start.
+    if since == "latest":
         assert ws.sent == [{"events": [], "cursor": 42}]
     else:
         assert ws.sent == []

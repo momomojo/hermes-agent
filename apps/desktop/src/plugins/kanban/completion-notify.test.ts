@@ -21,7 +21,7 @@ interface OsDoor {
 }
 interface Mod {
   bindCompletionNotify(r: Rest, t?: Translate, os?: OsDoor): void
-  onKanbanEventsFrame(slug: string, events?: CompletionEvent[]): Promise<boolean>
+  onKanbanEventsFrame(slug: string, events?: CompletionEvent[], backend?: string): Promise<boolean>
 }
 
 const { hostMock } = vi.hoisted(() => ({
@@ -91,6 +91,25 @@ describe('authoritative baseline', () => {
     expect(fired).toBe(false)
     expect(hostMock.notify).not.toHaveBeenCalled()
     expect(rest).toHaveBeenCalledWith('/board?board=smoke')
+  })
+
+  it('keeps a separate cursor per backend for the same board', async () => {
+    let latest = 100
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => latest) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed')], 'backend-a')
+    expect(hostMock.notify).toHaveBeenCalledTimes(1)
+
+    // Another backend's board DB has its own, lower ids: its new events notify
+    // against its own baseline, not backend A's high-water mark.
+    latest = 5
+    await m.onKanbanEventsFrame('smoke', [ev(6, 'completed')], 'backend-b')
+    expect(hostMock.notify).toHaveBeenCalledTimes(2)
+
+    // Back on backend A its cursor was kept: history stays suppressed.
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed'), ev(102, 'completed')], 'backend-a')
+    expect(hostMock.notify).toHaveBeenCalledTimes(3)
   })
 
   it('post-baseline completion notifies exactly once', async () => {

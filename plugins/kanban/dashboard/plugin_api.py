@@ -2911,14 +2911,13 @@ async def stream_events(ws: WebSocket):
         except ValueError:
             ws_board = None
 
-        since_raw = ws.query_params.get("since")
-        if since_raw is None:
-            # Desktop's plugin socket has no replay cursor. Starting it at 0
-            # replays the entire task_events table and invalidates the full
-            # board query for every 200-event frame. Large boards can then
-            # saturate the backend and time out unrelated settings requests.
-            # Explicit ?since=0 retains the historical replay contract for
-            # clients that track their own cursor (the web dashboard does).
+        since_raw = ws.query_params.get("since", "0")
+        if since_raw == "latest":
+            # Opt-in "no backlog" start. Replaying the whole task_events table
+            # invalidates the full board query for every 200-event frame, and
+            # large boards then saturate the backend. A missing cursor keeps
+            # the historical replay-from-0 contract for older clients; clients
+            # that resume from a cursor ask for this instead.
             conn = kanban_db.connect(board=ws_board)
             try:
                 cursor = int(conn.execute(

@@ -79,8 +79,10 @@ export interface PluginContext {
    *  ('/events'), JSON frames to `onMessage`, auto-reconnect, disposer
    *  returned. Resolves to a no-op on OAuth remotes — treat it as an
    *  accelerator over your polling, never a replacement. A function `path` is
-   *  re-evaluated on every reconnect (e.g. to resume from a stream cursor). */
-  socket: (path: string | (() => string), onMessage: (data: unknown) => void) => () => void
+   *  re-evaluated on every reconnect (e.g. to resume from a stream cursor) and
+   *  receives an opaque key for the backend being dialed, so per-backend state
+   *  such as a cursor never crosses a profile or connection switch. */
+  socket: (path: string | ((backend: string) => string), onMessage: (data: unknown) => void) => () => void
   /** The curated OS door: native notification, open-external, reveal-in-file-
    *  manager, clipboard — attributed to this plugin, result-shaped (never
    *  throws for a missing capability). */

@@ -34,12 +34,14 @@ import type {
 } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
-type Socket = (path: string | (() => string), onMessage: (data: unknown) => void) => () => void
+type Socket = (path: string | ((backend: string) => string), onMessage: (data: unknown) => void) => () => void
 
-/** The events-socket path for a board. `since` is the last cursor this socket
- *  saw: the server starts a cursorless socket at the current event (a full
- *  replay saturated the backend), so a reconnect must pass it or every event
- *  raised while the socket was down would be skipped. */
+/** The events-socket path for a board. `since` is the last cursor this stream
+ *  delivered on this backend. Without one, ask for `since=latest`: start at the
+ *  current event (a full replay of `task_events` saturated the backend) and get
+ *  an opening cursor frame back. A reconnect then passes that cursor, so events
+ *  raised while the socket was down are replayed, not skipped. An older backend
+ *  reads `latest` as 0 and replays everything, which is slow but loses nothing. */
 export function eventsPath(slug: string, since: null | number): string {
   const params = new URLSearchParams()
 
@@ -47,13 +49,9 @@ export function eventsPath(slug: string, since: null | number): string {
     params.set('board', slug)
   }
 
-  if (since !== null) {
-    params.set('since', String(since))
-  }
+  params.set('since', since === null ? 'latest' : String(since))
 
-  const query = params.toString()
-
-  return query ? `/events?${query}` : '/events'
+  return `/events?${params.toString()}`
 }
 
 let rest: null | Rest = null
@@ -80,7 +78,7 @@ const COLLAPSED_KEY = 'collapsedLanes'
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
  *  fallback — the socket just makes the board feel instant. */
-function onEventsFrame(slug: string, data: unknown): void {
+function onEventsFrame(slug: string, data: unknown, backend = ''): void {
   const events = (data as { events?: CompletionEvent[] })?.events
 
   if (!events?.length) {
@@ -97,7 +95,7 @@ function onEventsFrame(slug: string, data: unknown): void {
 
   // Completion notification (after invalidation so notify failure
   // never interferes with cache invalidation).
-  void onKanbanEventsFrame(slug, events).catch(() => undefined)
+  void onKanbanEventsFrame(slug, events, backend).catch(() => undefined)
 }
 
 // A persisted, subscribable atom (the structural slice we need — avoids
@@ -138,19 +136,26 @@ export function bindApi(
   const open = (slug: string) => {
     close?.()
     // Every frame (including the server's opening one) carries the stream
-    // cursor; reconnects resume from it. A board switch starts a new cursor.
-    let cursor: null | number = null
+    // cursor; reconnects resume from it. Event ids are local to one backend,
+    // so cursors are kept per backend key (a reconnect can land on another
+    // profile or connection). A board switch starts fresh.
+    const cursorByBackend = new Map<string, number>()
+    let backend = ''
 
     close = socket(
-      () => eventsPath(slug, cursor),
+      key => {
+        backend = key
+
+        return eventsPath(slug, cursorByBackend.get(key) ?? null)
+      },
       data => {
         const next = (data as { cursor?: unknown })?.cursor
 
         if (typeof next === 'number' && Number.isFinite(next)) {
-          cursor = Math.max(cursor ?? next, next)
+          cursorByBackend.set(backend, Math.max(cursorByBackend.get(backend) ?? next, next))
         }
 
-        onEventsFrame(slug, data)
+        onEventsFrame(slug, data, backend)
       }
     )
   }
