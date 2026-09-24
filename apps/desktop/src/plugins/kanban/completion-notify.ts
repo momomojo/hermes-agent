@@ -136,6 +136,13 @@ export function seedKanbanEventsBaseline(slug: string, cursor: number, backend =
   }
 }
 
+/** Forget a board's baseline on one backend: its stream restarted on another
+ *  board database (the current-board alias moved, or the board was recreated),
+ *  so the old high-water mark would wrongly filter the new database's ids. */
+export function resetKanbanEventsBaseline(slug: string, backend = ''): void {
+  seenEventIdByBoard.delete(cursorKey(slug, backend))
+}
+
 function trimmed(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }

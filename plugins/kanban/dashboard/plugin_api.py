@@ -2889,6 +2889,21 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()
 
 
+def _event_stream_id(board: Optional[str]) -> str:
+    """Identity of the board database an events stream reads.
+
+    The resolved board slug plus the database file's inode: moving the
+    current-board alias, or deleting and recreating a board, changes it, so a
+    client never resumes one database's cursor against another.
+    """
+    slug = board or kanban_db.get_current_board()
+    try:
+        inode = kanban_db.kanban_db_path(board=slug).stat().st_ino
+    except OSError:
+        inode = 0
+    return f"{slug}:{inode}"
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     # Authorize the upgrade via the dashboard's canonical WS gate so the
@@ -2912,6 +2927,14 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         since_raw = ws.query_params.get("since", "0")
+        stream_id = await asyncio.to_thread(_event_stream_id, ws_board)
+        client_stream = ws.query_params.get("stream")
+        if client_stream is not None and client_stream != stream_id:
+            # The client's resume cursor belongs to another board database
+            # (the current-board alias moved, or the board was recreated):
+            # start at the current event rather than replay or skip foreign
+            # history. The opening frame hands it the new stream identity.
+            since_raw = "latest"
         if since_raw == "latest":
             # Opt-in "no backlog" start. Replaying the whole task_events table
             # invalidates the full board query for every 200-event frame, and
@@ -2926,9 +2949,9 @@ async def stream_events(ws: WebSocket):
             finally:
                 conn.close()
             # Announce where this stream starts, so a client that reconnects
-            # before any event arrives can resume with ?since=<cursor> instead
-            # of skipping what happened while it was disconnected.
-            await ws.send_json({"events": [], "cursor": cursor})
+            # before any event arrives can resume with ?since=<cursor>&stream=
+            # instead of skipping what happened while it was disconnected.
+            await ws.send_json({"events": [], "cursor": cursor, "stream": stream_id})
         else:
             try:
                 cursor = int(since_raw)

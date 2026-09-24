@@ -86,17 +86,20 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "since, expected_cursor",
+    "since, stream, expected_cursor, opening_frame",
     [
-        (None, 0),  # older clients keep the historical full replay
-        ("0", 0),
-        ("latest", 42),  # opt-in: start at the current event, no backlog
+        (None, None, 0, False),  # older clients keep the historical full replay
+        ("0", None, 0, False),
+        ("latest", None, 42, True),  # opt-in: start at the current event, no backlog
+        ("5", "default:7", 5, False),  # resume on the same board database
+        ("5", "other:1", 42, True),  # cursor from another database: start fresh
     ],
 )
-async def test_stream_events_baselines_only_when_latest_is_requested(monkeypatch, since, expected_cursor):
+async def test_stream_events_start_and_resume(monkeypatch, since, stream, expected_cursor, opening_frame):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
     monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: "default:7")
     queried_after: list[int] = []
 
     class _Cursor:
@@ -131,15 +134,41 @@ async def test_stream_events_baselines_only_when_latest_is_requested(monkeypatch
     ws = _OnePollWebSocket()
     if since is not None:
         ws.query_params["since"] = since
+    if stream is not None:
+        ws.query_params["stream"] = stream
 
     await asyncio.wait_for(mod.stream_events(ws), timeout=5)
 
     assert ws.accepted
     assert queried_after == [expected_cursor]
-    # A "latest" client learns where its stream starts, so a reconnect can
-    # resume with ?since= instead of skipping events raised while it was down.
-    # A client that sent a numeric cursor, or none, already knows its start.
-    if since == "latest":
-        assert ws.sent == [{"events": [], "cursor": 42}]
+    # A client starting fresh learns where its stream starts and which board
+    # database it reads, so a reconnect can resume with ?since=&stream=. A
+    # client resuming on the same database, or a legacy one, gets no extra frame.
+    if opening_frame:
+        assert ws.sent == [{"events": [], "cursor": 42, "stream": "default:7"}]
     else:
         assert ws.sent == []
+
+
+def test_event_stream_id_follows_the_resolved_board_database(monkeypatch, tmp_path):
+    mod = _load_plugin_module()
+    paths = {"a": tmp_path / "a.db", "b": tmp_path / "b.db"}
+    for path in paths.values():
+        path.write_bytes(b"")
+    current = {"slug": "a"}
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", lambda: current["slug"])
+    monkeypatch.setattr(mod.kanban_db, "kanban_db_path", lambda board=None: paths[board])
+
+    first = mod._event_stream_id(None)
+    assert first == mod._event_stream_id(None) == mod._event_stream_id("a")
+    # Moving the current-board alias changes the identity of the '' stream.
+    current["slug"] = "b"
+    assert mod._event_stream_id(None) != first
+    # So does deleting and recreating a board database (a new inode).
+    recreated = tmp_path / "a-new.db"
+    recreated.write_bytes(b"")
+    old_inode = paths["a"].stat().st_ino
+    paths["a"].unlink()
+    recreated.rename(paths["a"])
+    if paths["a"].stat().st_ino != old_inode:
+        assert mod._event_stream_id("a") != first

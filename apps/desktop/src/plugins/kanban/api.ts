@@ -23,6 +23,7 @@ import {
   bindCompletionNotify,
   type CompletionEvent,
   onKanbanEventsFrame,
+  resetKanbanEventsBaseline,
   seedKanbanEventsBaseline
 } from './completion-notify'
 import type {
@@ -41,20 +42,32 @@ import type {
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string | ((backend: string) => string), onMessage: (data: unknown) => void) => () => void
 
-/** The events-socket path for a board. `since` is the last cursor this stream
- *  delivered on this backend. Without one, ask for `since=latest`: start at the
- *  current event (a full replay of `task_events` saturated the backend) and get
- *  an opening cursor frame back. A reconnect then passes that cursor, so events
- *  raised while the socket was down are replayed, not skipped. An older backend
- *  reads `latest` as 0 and replays everything, which is slow but loses nothing. */
-export function eventsPath(slug: string, since: null | number): string {
+/** Where an events stream left off: its last cursor, and the identity of the
+ *  board database it read (from the server's opening frame; '' if unknown). */
+export interface StreamResume {
+  cursor: number
+  stream: string
+}
+
+/** The events-socket path for a board. Without a resume point, ask for
+ *  `since=latest`: start at the current event (a full replay of `task_events`
+ *  saturated the backend) and get an opening frame with the cursor and stream
+ *  identity back. A reconnect then passes both, so events raised while the
+ *  socket was down are replayed, not skipped, and the server starts fresh if
+ *  the board behind the stream changed. An older backend reads `latest` as 0
+ *  and replays everything, which is slow but loses nothing. */
+export function eventsPath(slug: string, resume: null | StreamResume): string {
   const params = new URLSearchParams()
 
   if (slug) {
     params.set('board', slug)
   }
 
-  params.set('since', since === null ? 'latest' : String(since))
+  params.set('since', resume === null ? 'latest' : String(resume.cursor))
+
+  if (resume?.stream) {
+    params.set('stream', resume.stream)
+  }
 
   return `/events?${params.toString()}`
 }
@@ -137,31 +150,43 @@ export function bindApi(
   persist($collapsedLanes, COLLAPSED_KEY, {})
 
   let close: (() => void) | null = null
-  // Every frame (including the server's opening one) carries the stream
-  // cursor; reconnects resume from it. Event ids are local to one backend's
-  // board, so cursors are keyed by backend (a reconnect can land on another
-  // profile or connection) and board, and outlive a board switch: returning
-  // to a board resumes its stream instead of skipping what happened meanwhile.
-  const cursors = new Map<string, number>()
+  // Every frame carries the stream cursor, and the server's opening frame the
+  // identity of the board database it reads; reconnects resume from both.
+  // Event ids are local to one backend's board, so resume points are keyed by
+  // backend (a reconnect can land on another profile or connection) and board,
+  // and outlive a board switch: returning to a board resumes its stream
+  // instead of skipping what happened meanwhile.
+  const resumes = new Map<string, StreamResume>()
 
   const open = (slug: string) => {
     close?.()
     let backend = ''
-    const cursorFor = (key: string) => `${key}\n${slug}`
+    const resumeKey = (key: string) => `${key}\n${slug}`
 
     close = socket(
       key => {
         backend = key
 
-        return eventsPath(slug, cursors.get(cursorFor(key)) ?? null)
+        return eventsPath(slug, resumes.get(resumeKey(key)) ?? null)
       },
       data => {
-        const frame = data as { cursor?: unknown; events?: unknown[] } | null
+        const frame = data as { cursor?: unknown; events?: unknown[]; stream?: unknown } | null
         const next = frame?.cursor
 
         if (typeof next === 'number' && Number.isFinite(next)) {
-          const key = cursorFor(backend)
-          cursors.set(key, Math.max(cursors.get(key) ?? next, next))
+          const key = resumeKey(backend)
+          const previous = resumes.get(key)
+          const announced = frame?.stream
+          const stream = typeof announced === 'string' ? announced : (previous?.stream ?? '')
+
+          if (previous && stream !== previous.stream) {
+            // The stream restarted on another board database: its ids are a
+            // new sequence, so neither cursor nor notification baseline carries.
+            resumes.set(key, { cursor: next, stream })
+            resetKanbanEventsBaseline(slug, backend)
+          } else {
+            resumes.set(key, { cursor: Math.max(previous?.cursor ?? next, next), stream })
+          }
 
           // The opening frame (no events) marks where a fresh stream starts:
           // notifications count from there, so the first live terminal event

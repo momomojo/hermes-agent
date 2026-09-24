@@ -87,13 +87,14 @@ const storage = () => {
 const rest = vi.fn(async () => ({ latest_event_id: 0 })) as unknown as <T>(path: string) => Promise<T>
 
 describe('eventsPath', () => {
-  it('asks for the latest event without a cursor, and resumes with one', async () => {
+  it('asks for the latest event without a resume point, and resumes with one', async () => {
     const { eventsPath } = await import('./api')
 
     expect(eventsPath('', null)).toBe('/events?since=latest')
     expect(eventsPath('main board', null)).toBe('/events?board=main+board&since=latest')
-    expect(eventsPath('ops', 42)).toBe('/events?board=ops&since=42')
-    expect(eventsPath('', 0)).toBe('/events?since=0')
+    expect(eventsPath('ops', { cursor: 42, stream: 'ops:7' })).toBe('/events?board=ops&since=42&stream=ops%3A7')
+    // An unknown stream identity (an older backend) resumes by cursor alone.
+    expect(eventsPath('', { cursor: 0, stream: '' })).toBe('/events?since=0')
   })
 })
 
@@ -165,6 +166,31 @@ describe('bindApi events socket', () => {
       events: [{ id: 101, kind: 'completed', payload: { summary: 'Done' }, task_id: 't1' }]
     })
 
+    await vi.waitFor(() => expect(hostMock.notify).toHaveBeenCalledTimes(1))
+
+    dispose()
+  })
+
+  it('resumes with the stream identity, and starts over when the board database changes', async () => {
+    const restAt5 = vi.fn(async () => ({ latest_event_id: 5 })) as unknown as <T>(path: string) => Promise<T>
+    const { $boardSlug, bindApi } = await import('./api')
+    const { opened, socket } = fakeSocketDoor()
+    const dispose = bindApi(restAt5, storage(), socket)
+
+    $boardSlug.set('ops')
+    const live = opened[1]
+
+    live.path('backend-a')
+    live.onMessage({ cursor: 42, events: [], stream: 'ops:7' })
+    expect(live.path('backend-a')).toBe('/events?board=ops&since=42&stream=ops%3A7')
+
+    // The server restarted this stream on another database (a recreated board):
+    // its lower ids replace the cursor instead of losing to Math.max ...
+    live.onMessage({ cursor: 5, events: [], stream: 'ops:9' })
+    expect(live.path('backend-a')).toBe('/events?board=ops&since=5&stream=ops%3A9')
+
+    // ... and notifications count from the new stream, not the old high-water mark.
+    live.onMessage({ cursor: 6, events: [{ id: 6, kind: 'completed', payload: { summary: 'Done' }, task_id: 't6' }] })
     await vi.waitFor(() => expect(hostMock.notify).toHaveBeenCalledTimes(1))
 
     dispose()
