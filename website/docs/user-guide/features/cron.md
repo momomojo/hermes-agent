@@ -523,6 +523,18 @@ Otherwise, report the issue.
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced. For quiet monitoring jobs, prompt the agent to reply with only `[SILENT]` when there is nothing to report.
 
+## Inactivity timeout
+
+Agent-driven jobs have no wall-clock limit. A run is stopped only after 600 seconds (10 minutes) with no tool call, API call or streamed token, so a job that keeps working can run for hours while a hung API call or stuck tool is still caught. To change the limit for a profile:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  inactivity_timeout_seconds: 900   # 15 minutes without activity
+```
+
+Set it to `0` for unlimited. The value is read from the profile's config on each run, so an edit applies to the next run without a gateway restart. The `HERMES_CRON_TIMEOUT` environment variable overrides it for every profile in that process. The resolution order is: env var → config.yaml → 600s default; an invalid value falls through to the next source instead of disabling the limit.
+
 ## Script timeout
 
 Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:

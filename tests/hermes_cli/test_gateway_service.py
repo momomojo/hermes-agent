@@ -2147,3 +2147,26 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
+
+
+class TestLaunchdCronTimeoutIsResolvedAtRuntime:
+    def test_plist_never_bakes_the_cron_timeout(self, tmp_path, monkeypatch):
+        """The scheduler resolves the cron inactivity timeout from each profile's
+        config at run time. A value baked into the plist would go stale after a
+        config edit (launchd restarts do not regenerate the plist) and, being
+        process-wide, would override every profile's config, including one
+        inherited from a parent gateway. Keep it out of the plist."""
+        home = tmp_path / "profiles" / "timeout-profile"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "cron:\n  inactivity_timeout_seconds: 900\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1800")  # inherited, must not leak
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+
+        text = gateway_cli.generate_launchd_plist()
+        plist = plistlib.loads(text.encode("utf-8"))
+
+        assert "HERMES_CRON_TIMEOUT" not in plist["EnvironmentVariables"]
+        assert "HERMES_CRON_TIMEOUT" not in text
