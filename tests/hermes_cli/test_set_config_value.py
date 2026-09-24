@@ -104,6 +104,13 @@ class TestConfigYamlRouting:
         config = _read_config(_isolated_hermes_home)
         assert "python:3.12" in config
 
+    def test_cron_inactivity_timeout_is_recognized(self, _isolated_hermes_home, capsys):
+        """The inactivity timeout cron resolves per profile must be accepted by config set."""
+        set_config_value("cron.inactivity_timeout_seconds", "900")
+
+        assert "not a recognized config key" not in capsys.readouterr().out
+        assert "inactivity_timeout_seconds: 900" in _read_config(_isolated_hermes_home)
+
     def test_cron_script_timeout_is_recognized(self, _isolated_hermes_home, capsys):
         """The script timeout read by cron must be accepted by config set."""
         set_config_value("cron.script_timeout_seconds", "600")

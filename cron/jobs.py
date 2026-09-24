@@ -206,15 +206,16 @@ ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 # headroom over any healthy run before we treat a claim as stale.
 _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
-_DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
 
 def _oneshot_run_claim_ttl_seconds() -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
 
-    Derived from ``HERMES_CRON_TIMEOUT`` (the cron inactivity timeout the
-    scheduler enforces on each run) so the safety valve tracks how long a run
-    is actually allowed to go quiet, instead of a magic constant:
+    Derived from the cron inactivity timeout the scheduler enforces on each run
+    (``cron.timeouts.resolve_cron_inactivity_timeout_seconds``:
+    ``HERMES_CRON_TIMEOUT``, else ``cron.inactivity_timeout_seconds``, else
+    600s) so the safety valve tracks how long a run is actually allowed to go
+    quiet, instead of a magic constant:
 
     - unset / invalid → default 600s inactivity limit → TTL = 1800s
     - ``0`` (unlimited runs) → no finite bound to derive from → fall back to
@@ -222,13 +223,9 @@ def _oneshot_run_claim_ttl_seconds() -> float:
     - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
       tiny configured timeout can never expire a claim mid-run.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if raw:
-        try:
-            timeout = float(raw)
-        except (ValueError, TypeError):
-            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    from cron.timeouts import resolve_cron_inactivity_timeout_seconds
+
+    timeout = resolve_cron_inactivity_timeout_seconds()
     if timeout <= 0:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)

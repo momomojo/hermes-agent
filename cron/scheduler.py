@@ -547,6 +547,7 @@ from cron.jobs import (
     use_cron_store,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.timeouts import resolve_cron_inactivity_timeout_seconds
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1313,21 +1314,19 @@ _CWD_LOCK_TIMEOUT_MARGIN_SECONDS = 60.0
 
 
 def _cron_inactivity_seconds() -> float:
-    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600.
+    """Cron inactivity limit in seconds; 0 = unlimited.
 
-    Shared by run_job's inactivity monitor (which maps 0 to "no limit") and
-    the cwd-lock bound below (which keeps the wait bounded regardless) so
-    the two sites cannot drift apart — the lock bound must stay at or above
-    the inactivity limit or waiters would fail while a healthy holder runs.
+    Delegates to ``cron.timeouts.resolve_cron_inactivity_timeout_seconds``, the
+    one resolver shared with one-shot claim recovery:
+    ``HERMES_CRON_TIMEOUT`` overrides the profile's
+    ``cron.inactivity_timeout_seconds`` (default 600), and invalid values fall
+    back instead of disabling the guard. Shared by run_job's inactivity monitor
+    (which maps 0 to "no limit") and the cwd-lock bound below (which keeps the
+    wait bounded regardless) so the two sites cannot drift apart — the lock
+    bound must stay at or above the inactivity limit or waiters would fail
+    while a healthy holder runs.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    if not raw:
-        return 600.0
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        logger.warning("Invalid HERMES_CRON_TIMEOUT=%r; using default 600s", raw)
-        return 600.0
+    return resolve_cron_inactivity_timeout_seconds()
 
 
 def _cwd_lock_timeout_seconds() -> float:
@@ -5827,7 +5826,8 @@ def run_job(
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # configure via cron.inactivity_timeout_seconds or override via
+        # HERMES_CRON_TIMEOUT.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
