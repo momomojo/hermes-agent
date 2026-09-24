@@ -2905,6 +2905,16 @@ def _event_stream_id(board: str) -> str:
         conn.close()
 
 
+def _max_event_id(board: str) -> int:
+    conn = kanban_db.connect(board=board)
+    try:
+        return int(conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     # Authorize the upgrade via the dashboard's canonical WS gate so the
@@ -2926,10 +2936,12 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
-        if ws_board is None:
+        follows_alias = ws_board is None
+        if follows_alias:
             # Resolve the current-board alias once: every poll must read the
-            # database the stream identity names, even if another surface
-            # switches boards while this socket is open.
+            # database the stream identity names. If the alias later moves,
+            # the loop below ends the stream so the client re-subscribes to
+            # the board its board-less REST calls now read.
             ws_board = await asyncio.to_thread(kanban_db.get_current_board)
 
         since_raw = ws.query_params.get("since", "0")
@@ -2941,19 +2953,24 @@ async def stream_events(ws: WebSocket):
             # start at the current event rather than replay or skip foreign
             # history. The opening frame hands it the new stream identity.
             since_raw = "latest"
+        elif client_stream is not None:
+            # Same database, but a restored backup can rewind task_events.id
+            # below the client's cursor (the incarnation is restored with it).
+            # A cursor ahead of the sequence would silence the stream until it
+            # caught up, so start fresh; the opening frame resets the client.
+            try:
+                requested = int(since_raw)
+            except ValueError:
+                requested = None
+            if requested is not None and requested > await asyncio.to_thread(_max_event_id, ws_board):
+                since_raw = "latest"
         if since_raw == "latest":
             # Opt-in "no backlog" start. Replaying the whole task_events table
             # invalidates the full board query for every 200-event frame, and
             # large boards then saturate the backend. A missing cursor keeps
             # the historical replay-from-0 contract for older clients; clients
             # that resume from a cursor ask for this instead.
-            conn = kanban_db.connect(board=ws_board)
-            try:
-                cursor = int(conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) FROM task_events"
-                ).fetchone()[0])
-            finally:
-                conn.close()
+            cursor = await asyncio.to_thread(_max_event_id, ws_board)
             # Announce where this stream starts, so a client that reconnects
             # before any event arrives can resume with ?since=<cursor>&stream=
             # instead of skipping what happened while it was disconnected.
@@ -3007,6 +3024,12 @@ async def stream_events(ws: WebSocket):
                 # continue polling.
             except asyncio.TimeoutError:
                 pass  # no client message — poll the DB
+
+            if follows_alias and await asyncio.to_thread(kanban_db.get_current_board) != ws_board:
+                # The current-board alias moved: end this stream so the client
+                # reconnects and re-subscribes to the board it now shows.
+                await ws.close(code=1012)
+                return
 
             cursor, events = await asyncio.to_thread(_fetch_new, cursor)
             if events:

@@ -50,7 +50,7 @@ class _IdleDisconnectingWebSocket:
         self.sent.append(payload)
 
     async def close(self, code=None):
-        pass
+        self.closed_with = code
 
 
 @pytest.mark.asyncio
@@ -94,6 +94,7 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
         ("latest", None, 42, True),  # opt-in: start at the current event, no backlog
         ("5", "default:7", 5, False),  # resume on the same board database
         ("5", "other:1", 42, True),  # cursor from another database: start fresh
+        ("50", "default:7", 42, True),  # cursor ahead of a restored sequence: start fresh
     ],
 )
 async def test_stream_events_start_and_resume(monkeypatch, since, stream, expected_cursor, opening_frame):
@@ -151,26 +152,8 @@ async def test_stream_events_start_and_resume(monkeypatch, since, stream, expect
         assert ws.sent == []
 
 
-@pytest.mark.asyncio
-async def test_stream_pins_the_current_board_at_handshake(monkeypatch):
-    """Without ?board=, the current-board alias is resolved once: identity and
-    every poll read that database even if the alias moves mid-stream."""
-    mod = _load_plugin_module()
-    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
-    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
-    current = {"slug": "a"}
-
-    def _current():
-        slug = current["slug"]
-        current["slug"] = "b"  # another surface switches boards right after
-        return slug
-
-    monkeypatch.setattr(mod.kanban_db, "get_current_board", _current)
-    identity_boards: list = []
-    connect_boards: list = []
-    monkeypatch.setattr(
-        mod, "_event_stream_id", lambda board: identity_boards.append(board) or f"{board}:x"
-    )
+def _board_tracking_stubs(monkeypatch, mod, boards_seen):
+    """kanban_db.connect stub that records the board every poll reads."""
 
     class _Cursor:
         def fetchone(self):
@@ -187,24 +170,66 @@ async def test_stream_pins_the_current_board_at_handshake(monkeypatch):
             pass
 
     def _connect(board=None):
-        connect_boards.append(board)
+        boards_seen.append(board)
         return _Connection()
 
     monkeypatch.setattr(mod.kanban_db, "connect", _connect)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: f"{board}:x")
 
-    class _TwoPollWebSocket(_IdleDisconnectingWebSocket):
-        async def receive(self):
-            self.receive_calls += 1
-            if self.receive_calls <= 2:
-                await asyncio.sleep(0.01)
-            return {"type": "websocket.disconnect"}
 
-    ws = _TwoPollWebSocket()
+class _PollingWebSocket(_IdleDisconnectingWebSocket):
+    """Stays connected for a few polls, then disconnects."""
+
+    polls = 3
+
+    async def receive(self):
+        self.receive_calls += 1
+        if self.receive_calls <= self.polls:
+            await asyncio.sleep(0.01)
+        return {"type": "websocket.disconnect"}
+
+
+@pytest.mark.asyncio
+async def test_alias_stream_pins_its_board_and_ends_when_the_alias_moves(monkeypatch):
+    """Without ?board=, the current-board alias is resolved once and every poll
+    reads that board; when another surface switches boards, the stream ends
+    (1012) so the client re-subscribes to the board its REST calls now read."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    current = {"slug": "a", "calls": 0}
+
+    def _current():
+        current["calls"] += 1
+        return current["slug"] if current["calls"] <= 2 else "b"
+
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", _current)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+
+    ws = _PollingWebSocket()
     ws.query_params["since"] = "0"
     await asyncio.wait_for(mod.stream_events(ws), timeout=5)
 
-    assert identity_boards == ["a"]
-    assert connect_boards and set(connect_boards) == {"a"}
+    assert boards_seen and set(boards_seen) == {"a"}
+    assert ws.closed_with == 1012
+
+
+@pytest.mark.asyncio
+async def test_explicit_board_stream_ignores_alias_moves(monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", lambda: "elsewhere")
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "0"})
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert boards_seen and set(boards_seen) == {"ops"}
+    assert getattr(ws, "closed_with", None) is None
 
 
 def test_event_stream_id_is_a_persisted_database_incarnation(monkeypatch, tmp_path):

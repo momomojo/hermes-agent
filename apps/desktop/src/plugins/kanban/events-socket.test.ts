@@ -196,6 +196,28 @@ describe('bindApi events socket', () => {
     dispose()
   })
 
+  it('adopts an opening frame whose sequence rewound (a restored database)', async () => {
+    const restAt3 = vi.fn(async () => ({ latest_event_id: 3 })) as unknown as <T>(path: string) => Promise<T>
+    const { $boardSlug, bindApi } = await import('./api')
+    const { opened, socket } = fakeSocketDoor()
+    const dispose = bindApi(restAt3, storage(), socket)
+
+    $boardSlug.set('ops')
+    const live = opened[1]
+
+    live.path('backend-a')
+    live.onMessage({ cursor: 42, events: [], stream: 'ops:7' })
+    // Same database identity, but the server restarted the stream at a lower
+    // cursor because ours was ahead of its sequence.
+    live.onMessage({ cursor: 3, events: [], stream: 'ops:7' })
+    expect(live.path('backend-a')).toBe('/events?board=ops&since=3&stream=ops%3A7')
+
+    live.onMessage({ cursor: 4, events: [{ id: 4, kind: 'blocked', payload: { reason: 'r' }, task_id: 't4' }] })
+    await vi.waitFor(() => expect(hostMock.notify).toHaveBeenCalledTimes(1))
+
+    dispose()
+  })
+
   it('resumes each board from its own cursor across board switches', async () => {
     const { $boardSlug, bindApi } = await import('./api')
     const { opened, socket } = fakeSocketDoor()

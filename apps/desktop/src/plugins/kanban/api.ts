@@ -177,15 +177,19 @@ export function bindApi(
           const key = resumeKey(backend)
           const previous = resumes.get(key)
           const announced = frame?.stream
-          const stream = typeof announced === 'string' ? announced : (previous?.stream ?? '')
 
-          if (previous && stream !== previous.stream) {
-            // The stream restarted on another board database: its ids are a
-            // new sequence, so neither cursor nor notification baseline carries.
-            resumes.set(key, { cursor: next, stream })
-            resetKanbanEventsBaseline(slug, backend)
+          if (typeof announced === 'string') {
+            // An opening frame: the server (re)started this stream here, so
+            // adopt it as-is. On another board database, or a sequence that
+            // rewound below our cursor (a restored backup), neither the old
+            // cursor nor the notification baseline carries over.
+            if (previous && (announced !== previous.stream || next < previous.cursor)) {
+              resetKanbanEventsBaseline(slug, backend)
+            }
+
+            resumes.set(key, { cursor: next, stream: announced })
           } else {
-            resumes.set(key, { cursor: Math.max(previous?.cursor ?? next, next), stream })
+            resumes.set(key, { cursor: Math.max(previous?.cursor ?? next, next), stream: previous?.stream ?? '' })
           }
 
           // The opening frame (no events) marks where a fresh stream starts:
