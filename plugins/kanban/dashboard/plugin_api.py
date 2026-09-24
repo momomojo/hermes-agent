@@ -2901,12 +2901,6 @@ async def stream_events(ws: WebSocket):
         return
     await ws.accept()
     try:
-        since_raw = ws.query_params.get("since", "0")
-        try:
-            cursor = int(since_raw)
-        except ValueError:
-            cursor = 0
-
         # Board selection — pinned at the WS handshake; re-subscribe to
         # switch boards. Changing boards mid-stream would require
         # reconciling two cursors, so the UI just opens a new WS on
@@ -2916,6 +2910,27 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
+
+        since_raw = ws.query_params.get("since")
+        if since_raw is None:
+            # Desktop's plugin socket has no replay cursor. Starting it at 0
+            # replays the entire task_events table and invalidates the full
+            # board query for every 200-event frame. Large boards can then
+            # saturate the backend and time out unrelated settings requests.
+            # Explicit ?since=0 retains the historical replay contract for
+            # clients that track their own cursor (the web dashboard does).
+            conn = kanban_db.connect(board=ws_board)
+            try:
+                cursor = int(conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM task_events"
+                ).fetchone()[0])
+            finally:
+                conn.close()
+        else:
+            try:
+                cursor = int(since_raw)
+            except ValueError:
+                cursor = 0
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)

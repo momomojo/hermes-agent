@@ -58,6 +58,20 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
 
+    class _Cursor:
+        def fetchone(self):
+            return (0,)
+
+    class _Connection:
+        def execute(self, statement):
+            assert "MAX(id)" in statement
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: _Connection())
+
     ws = _IdleDisconnectingWebSocket()
 
     # The disconnect must terminate the handler even though the board is idle
@@ -68,3 +82,50 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     assert ws.accepted
     assert ws.receive_calls == 1
     assert ws.sent == []  # returned before any poll, no zombie loop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("since, expected_cursor", [(None, 42), ("0", 0)])
+async def test_stream_events_baselines_only_when_since_is_omitted(monkeypatch, since, expected_cursor):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    queried_after: list[int] = []
+
+    class _Cursor:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return []
+
+    class _Connection:
+        def execute(self, statement, params=()):
+            if "MAX(id)" in statement:
+                return _Cursor((42,))
+            queried_after.append(params[0])
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: _Connection())
+
+    class _OnePollWebSocket(_IdleDisconnectingWebSocket):
+        async def receive(self):
+            self.receive_calls += 1
+            if self.receive_calls == 1:
+                await asyncio.sleep(0.01)
+            return {"type": "websocket.disconnect"}
+
+    ws = _OnePollWebSocket()
+    if since is not None:
+        ws.query_params["since"] = since
+
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert ws.accepted
+    assert queried_after == [expected_cursor]
