@@ -515,6 +515,52 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_respawn_guard_does_not_treat_workspace_errors_as_auth(kanban_home):
+    """A filesystem failure while creating the workspace ("workspace: [Errno 13]
+    Permission denied: ...") is not a credential problem. Classifying it as
+    blocker_auth parked tasks in ready forever: the guard blocks the respawn
+    that would trip the consecutive-failure auto-block breaker."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ws-guard", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/Volumes/workspaces'", tid),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) != "blocker_auth"
+
+
+def test_respawn_guard_auth_pattern_ignores_author(kanban_home):
+    """`auth\\w*` used to match "author"; real auth failures still match."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="author-guard", assignee="a")
+        conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?",
+                     ("git commit author mismatch in PR 268", tid))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) != "blocker_auth"
+        conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?",
+                     ("HTTP 401: authentication token is expired", tid))
+        conn.commit()
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+
+
+def test_respawn_guard_event_is_throttled(kanban_home, monkeypatch):
+    """One respawn_guarded event per reason change or per hour, not per tick."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 6_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="throttle", assignee="a")
+        assert _kb._respawn_guard_event_due(conn, tid, "blocker_auth")
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, tid, "respawn_guarded", {"reason": "blocker_auth"})
+        assert not _kb._respawn_guard_event_due(conn, tid, "blocker_auth")
+        assert _kb._respawn_guard_event_due(conn, tid, "rate_limit_cooldown")
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 3601)
+        assert _kb._respawn_guard_event_due(conn, tid, "blocker_auth")
+
+
 
 
 
