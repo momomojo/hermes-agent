@@ -8257,12 +8257,48 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # Patterns in last_failure_error that indicate a quota / auth blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
+    # `auth\w*` also matched "author" and "authority"; list the real forms.
+    r"\b(quota|rate[\s_\-]?limit|429|403|auth|authentication|authorization|"
+    r"unauthenticated|"
     r"unauthorized|forbidden|billing|subscription|"
     r"access[\s_]denied|permission[\s_]denied|"
     r"invalid[\s_]api[\s_]key)\b",
     re.IGNORECASE,
 )
+
+# Python's OSError text carries an errno marker ("[Errno 13] Permission
+# denied: '/Volumes/...'") whichever spawn stage raised it: workspace
+# resolution, the worker log directory, or Popen itself.
+_LOCAL_OS_ERROR_RE = re.compile(r"\[Errno -?\d+\]")
+
+
+def _is_local_spawn_failure(err: str) -> bool:
+    """True for workspace and local OS/filesystem failures.
+
+    These are not credential problems. Treating them as blocker_auth parked
+    tasks in ``ready`` forever: the guard blocks the respawn that would
+    increment consecutive_failures and trip the auto-block breaker.
+    """
+    return err.lstrip().startswith("workspace:") or bool(
+        _LOCAL_OS_ERROR_RE.search(err)
+    )
+
+
+def _respawn_guard_event_due(conn, task_id: str, reason: str) -> bool:
+    """True when a respawn_guarded event should be recorded for this tick."""
+    prev = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind = 'respawn_guarded' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prev is None:
+        return True
+    try:
+        prev_reason = json.loads(prev[0] or "{}").get("reason")
+    except (TypeError, ValueError):
+        prev_reason = None
+    return prev_reason != reason or int(time.time()) - int(prev[1] or 0) >= 3600
+
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -9783,7 +9819,9 @@ def check_respawn_guard(
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    # Workspace and local OS failures from any spawn stage are not credential
+    # problems; see _is_local_spawn_failure.
+    if err and not _is_local_spawn_failure(err) and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -10502,7 +10540,10 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
+            # Emit only when the reason changes or once an hour: one event per
+            # 60s tick (~5,700/day per stuck task) made event-replaying clients
+            # such as Hermes Desktop saturate the backend.
+            if not dry_run and _respawn_guard_event_due(conn, row["id"], guard_reason):
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
@@ -10644,7 +10685,10 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
-            if not dry_run:
+            # Emit only when the reason changes or once an hour: one event per
+            # 60s tick (~5,700/day per stuck task) made event-replaying clients
+            # such as Hermes Desktop saturate the backend.
+            if not dry_run and _respawn_guard_event_due(conn, row["id"], guard_reason):
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
