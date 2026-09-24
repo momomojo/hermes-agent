@@ -326,3 +326,69 @@ def test_default_spawn_does_not_inherit_a_stale_branch_pin(kanban_home, tmp_path
     )
     kb._default_spawn(task, str(ws))
     assert "HERMES_KANBAN_BRANCH" not in captured["env"]
+
+
+@pytest.mark.parametrize("with_project", [False, True])
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_first_claim_env_passes_boundary_with_and_without_project(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch, with_project, lane,
+):
+    """A plain first-claim worktree task (no project, branch still None) and a
+    project-linked one (deterministic branch set at creation) both get a
+    worker environment the unchanged boundary accepts, in both lanes; a wrong
+    project pin is still refused."""
+    import os
+    import subprocess
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_worker_boundary as boundary
+
+    repo = _make_repo(tmp_path)
+    captured = {}
+    real_popen = subprocess.Popen
+
+    class _WorkerLaunch:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        env = kwargs.get("env")
+        if env and "HERMES_KANBAN_TASK" in env:
+            captured["env"] = dict(env)
+            return _WorkerLaunch()
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    project_id = None
+    if with_project:
+        with pdb.connect_closing() as pconn:
+            project_id = pdb.create_project(pconn, name="Probe Project", primary_path=str(repo))
+    with kb.connect() as conn:
+        if with_project:
+            tid = kb.create_task(conn, title="first-claim project task", assignee="coder",
+                                 workspace_kind="worktree", project_id=project_id)
+        else:
+            tid = kb.create_task(conn, title="first-claim task", assignee="coder",
+                                 workspace_kind="worktree", workspace_path=str(repo))
+        created = kb.get_task(conn, tid)
+        assert created.project_id == project_id
+        # Project-linked tasks get a deterministic branch at creation; plain
+        # worktree tasks start branchless (the shape that broke in t_db349b2a).
+        assert (created.branch_name is None) == (not with_project)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (lane, tid))
+        conn.commit()
+        kb.dispatch_once(conn, spawn_fn=kb._default_spawn)
+        task = kb.get_task(conn, tid)
+
+    env = captured["env"]
+    assert task.branch_name and env.get("HERMES_KANBAN_BRANCH") == task.branch_name
+    assert env.get("HERMES_KANBAN_PROJECT_ID") == (project_id or "")
+    for key in [k for k in os.environ if k.startswith("HERMES_KANBAN_") or k == "TERMINAL_CWD"]:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        if key.startswith("HERMES_KANBAN_") or key == "TERMINAL_CWD":
+            monkeypatch.setenv(key, value)
+    ws = Path(env["HERMES_KANBAN_WORKSPACE"]).resolve()
+    assert boundary._live_assignment(task_id=tid, run_id=task.current_run_id,
+                                     claim_lock=task.claim_lock, env_workspace=ws) is not None
+    monkeypatch.setenv("HERMES_KANBAN_PROJECT_ID", "someone-else")
+    assert boundary._live_assignment(task_id=tid, run_id=task.current_run_id,
+                                     claim_lock=task.claim_lock, env_workspace=ws) is None
