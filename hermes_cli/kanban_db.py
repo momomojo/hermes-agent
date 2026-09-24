@@ -8266,6 +8266,24 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Python's OSError text carries an errno marker ("[Errno 13] Permission
+# denied: '/Volumes/...'") whichever spawn stage raised it: workspace
+# resolution, the worker log directory, or Popen itself.
+_LOCAL_OS_ERROR_RE = re.compile(r"\[Errno -?\d+\]")
+
+
+def _is_local_spawn_failure(err: str) -> bool:
+    """True for workspace and local OS/filesystem failures.
+
+    These are not credential problems. Treating them as blocker_auth parked
+    tasks in ``ready`` forever: the guard blocks the respawn that would
+    increment consecutive_failures and trip the auto-block breaker.
+    """
+    return err.lstrip().startswith("workspace:") or bool(
+        _LOCAL_OS_ERROR_RE.search(err)
+    )
+
+
 def _respawn_guard_event_due(conn, task_id: str, reason: str) -> bool:
     """True when a respawn_guarded event should be recorded for this tick."""
     prev = conn.execute(
@@ -9787,11 +9805,9 @@ def check_respawn_guard(
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
-    # Workspace/filesystem failures ("workspace: [Errno 13] Permission denied:
-    # '/Volumes/...'") are not credential problems. Treating them as blocker_auth
-    # parked tasks in `ready` forever: the guard blocks the respawn that would
-    # increment consecutive_failures and trip the auto-block breaker.
-    if err and not err.lstrip().startswith("workspace:") and _RESPAWN_BLOCKER_RE.search(err):
+    # Workspace and local OS failures from any spawn stage are not credential
+    # problems; see _is_local_spawn_failure.
+    if err and not _is_local_spawn_failure(err) and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR

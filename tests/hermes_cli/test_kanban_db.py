@@ -530,6 +530,30 @@ def test_respawn_guard_does_not_treat_workspace_errors_as_auth(kanban_home):
         assert kb.check_respawn_guard(conn, tid) != "blocker_auth"
 
 
+def test_spawn_stage_permission_error_reaches_the_breaker(
+    kanban_home, all_assignees_spawnable,
+):
+    """A PermissionError raised while spawning (e.g. creating the worker log
+    directory) is stored as bare str(exc), without the "workspace:" prefix.
+    It must not be read as blocker_auth either: the task has to keep
+    respawning until consecutive failures trip the auto-block breaker."""
+    def failing_spawn(task, workspace):
+        raise PermissionError(13, "Permission denied", "/Volumes/workspaces/logs")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="spawn-perm", assignee="a")
+        first = kb.dispatch_once(conn, spawn_fn=failing_spawn, failure_limit=2)
+        task = kb.get_task(conn, tid)
+        assert first.auto_blocked == []
+        assert task.status == "ready" and task.consecutive_failures == 1
+        assert task.last_failure_error.startswith("[Errno 13] Permission denied")
+        assert kb.check_respawn_guard(conn, tid) != "blocker_auth"
+
+        second = kb.dispatch_once(conn, spawn_fn=failing_spawn, failure_limit=2)
+        assert second.auto_blocked == [tid]
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_respawn_guard_auth_pattern_ignores_author(kanban_home):
     """`auth\\w*` used to match "author"; real auth failures still match."""
     with kb.connect() as conn:
