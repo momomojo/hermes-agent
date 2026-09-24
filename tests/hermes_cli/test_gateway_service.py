@@ -1993,6 +1993,64 @@ class TestServiceWorkingDirIsStable:
         assert "/.worktrees/" not in m.group(1)
 
 
+class TestLaunchdCronTimeoutPersistence:
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            (None, 600),
+            (900, 900),
+            (0, 0),
+            (-1, 600),
+            ("not-a-number", 600),
+            (True, 600),
+            (False, 600),
+        ],
+        ids=("unset", "override", "unlimited", "negative", "malformed", "true", "false"),
+    )
+    def test_plist_persists_canonical_cron_timeout(
+        self, tmp_path, monkeypatch, configured, expected
+    ):
+        """The launchd environment must match config/runtime timeout resolution."""
+        from cron.timeouts import resolve_cron_inactivity_timeout_seconds
+
+        home = tmp_path / "profiles" / "timeout-profile"
+        home.mkdir(parents=True)
+        if configured is not None:
+            rendered = str(configured).lower() if isinstance(configured, bool) else configured
+            (home / "config.yaml").write_text(
+                f"cron:\n  inactivity_timeout_seconds: {rendered}\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert resolve_cron_inactivity_timeout_seconds() == float(expected)
+        assert plist["EnvironmentVariables"]["HERMES_CRON_TIMEOUT"] == str(expected)
+
+    def test_plist_timeout_is_profile_isolated(self, tmp_path, monkeypatch):
+        first_home = tmp_path / "profiles" / "first"
+        second_home = tmp_path / "profiles" / "second"
+        for home, timeout in ((first_home, 900), (second_home, 0)):
+            home.mkdir(parents=True)
+            (home / "config.yaml").write_text(
+                f"cron:\n  inactivity_timeout_seconds: {timeout}\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        generated = {}
+        for name, home in (("first", first_home), ("second", second_home)):
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda home=home: home)
+            plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+            generated[name] = plist["EnvironmentVariables"]["HERMES_CRON_TIMEOUT"]
+
+        assert generated == {"first": "900", "second": "0"}
+
+
 class TestLaunchctlBootstrapEioRetry:
     """`_launchctl_bootstrap` must recover from a stale already-loaded label.
 

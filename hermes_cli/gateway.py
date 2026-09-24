@@ -4727,11 +4727,14 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
 
 
 def generate_launchd_plist() -> str:
+    from cron.timeouts import resolve_cron_inactivity_timeout_seconds
+
     # Stable cwd anchor — never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
+    cron_timeout = resolve_cron_inactivity_timeout_seconds()
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
@@ -4810,6 +4813,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>HERMES_CRON_TIMEOUT</key>
+        <string>{cron_timeout:g}</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
