@@ -9474,6 +9474,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_claim: Optional[tuple] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -9517,16 +9518,29 @@ def _record_task_failure(
     ``detect_crashed_workers``, which resolves the per-task
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
+
+    ``expected_claim=(claim_lock, run_id)`` makes the whole call a no-op
+    unless the task is still running under exactly that claim and run, checked
+    inside the same write transaction.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "claim_lock FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if expected_claim is not None and (
+            row["status"] != "running"
+            or row["claim_lock"] != expected_claim[0]
+            or row["current_run_id"] != expected_claim[1]
+        ):
+            # ``expected_claim`` = (claim_lock, run_id) the caller still holds.
+            # Someone else reclaimed, reassigned or finished the task: never
+            # release their claim or close their run on our behalf.
             return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -10567,17 +10581,19 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        persisted_branch = claimed.branch_name
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            persisted_branch = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+            set_branch_name(conn, claimed.id, persisted_branch)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Spawn from the resolved identity, not the pre-resolution snapshot.
-        try:
-            spawn_task = _resolved_spawn_task(conn, claimed, str(workspace))
-        except _SpawnIdentityDrift as exc:
-            with write_txn(conn):
-                _append_event(
-                    conn, claimed.id, "spawn_identity_drift", {"reason": str(exc)},
-                )
+        spawn_task, auto = _resolved_spawn_task(
+            conn, claimed, str(workspace),
+            expected_branch=persisted_branch, failure_limit=failure_limit,
+        )
+        if spawn_task is None:
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10706,8 +10722,10 @@ def _dispatch_once_locked(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        persisted_branch = claimed.branch_name
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            persisted_branch = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+            set_branch_name(conn, claimed.id, persisted_branch)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -10718,13 +10736,13 @@ def _dispatch_once_locked(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
         # Same resolved-identity handoff as the ready lane.
-        try:
-            spawn_task = _resolved_spawn_task(conn, claimed, str(workspace))
-        except _SpawnIdentityDrift as exc:
-            with write_txn(conn):
-                _append_event(
-                    conn, claimed.id, "spawn_identity_drift", {"reason": str(exc)},
-                )
+        spawn_task, auto = _resolved_spawn_task(
+            conn, claimed, str(workspace),
+            expected_branch=persisted_branch, failure_limit=failure_limit,
+        )
+        if spawn_task is None:
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -11067,37 +11085,91 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-class _SpawnIdentityDrift(RuntimeError):
-    """The claimed task row changed between workspace resolution and spawn."""
-
-
 def _resolved_spawn_task(
-    conn: sqlite3.Connection, claimed: "Task", workspace: str,
-) -> "Task":
-    """Return the Task identity a worker is spawned with, after resolution.
+    conn: sqlite3.Connection,
+    claimed: "Task",
+    workspace: str,
+    *,
+    expected_branch: Optional[str],
+    failure_limit: Optional[int] = None,
+) -> tuple[Optional["Task"], bool]:
+    """Return ``(task, auto_blocked)``: the identity a worker is spawned with.
 
     The ready and review loops persist the resolved workspace path and worktree
     branch with set_workspace_path/set_branch_name, but ``claimed`` is the
     in-memory snapshot taken before that resolution. Spawning from it dropped
     HERMES_KANBAN_BRANCH for first-claim worktree tasks, so the worker boundary
-    (correctly) refused every command (incident t_db349b2a). Re-read the row,
-    require the exact original run, claim, assignee and project, and hand the
-    worker the persisted workspace and branch. Any drift raises
-    ``_SpawnIdentityDrift`` so the caller launches nothing.
+    (correctly) refused every command (incident t_db349b2a).
+
+    Re-read the row and require the exact original status, run, claim,
+    assignee, project and workspace kind, plus the workspace path and branch
+    this tick just persisted. On success, return ``claimed`` carrying the
+    persisted workspace and branch, and False. On any drift, record a
+    ``spawn_identity_drift`` event, release our own claim immediately through
+    the normal (counted, breaker-aware) spawn-failure path only if it is still
+    ours, and return None so the caller launches nothing, plus whether that
+    failure tripped the breaker so the caller reports it in
+    ``DispatchResult.auto_blocked`` like every other spawn failure.
     """
     fresh = get_task(conn, claimed.id)
+    problem = None
     if fresh is None:
-        raise _SpawnIdentityDrift("task row disappeared before spawn")
-    for name in ("current_run_id", "claim_lock", "assignee", "project_id"):
-        if getattr(fresh, name) != getattr(claimed, name):
-            raise _SpawnIdentityDrift(f"{name} changed before spawn")
-    if (fresh.workspace_path or "") != str(workspace):
-        raise _SpawnIdentityDrift("workspace_path changed before spawn")
-    return _dataclass_replace(
-        claimed,
-        workspace_path=fresh.workspace_path,
-        branch_name=fresh.branch_name,
+        problem = "task row disappeared before spawn"
+    else:
+        for name in (
+            "status", "current_run_id", "claim_lock",
+            "assignee", "project_id", "workspace_kind",
+        ):
+            if getattr(fresh, name) != getattr(claimed, name):
+                problem = f"{name} changed before spawn"
+                break
+        else:
+            if (fresh.workspace_path or "") != str(workspace):
+                problem = "workspace_path changed before spawn"
+            elif (fresh.branch_name or None) != (expected_branch or None):
+                problem = "branch_name changed before spawn"
+    if problem is None:
+        return _dataclass_replace(
+            claimed,
+            workspace_path=fresh.workspace_path,
+            branch_name=fresh.branch_name,
+        ), False
+    observed = None
+    if fresh is not None:
+        observed = {
+            "status": fresh.status,
+            "run_id": fresh.current_run_id,
+            "claim_lock": fresh.claim_lock,
+            "assignee": fresh.assignee,
+            "workspace_path": fresh.workspace_path,
+            "branch_name": fresh.branch_name,
+        }
+    with write_txn(conn):
+        _append_event(
+            conn, claimed.id, "spawn_identity_drift",
+            {
+                "reason": problem,
+                "expected": {
+                    "status": claimed.status,
+                    "run_id": claimed.current_run_id,
+                    "claim_lock": claimed.claim_lock,
+                    "assignee": claimed.assignee,
+                    "workspace_path": str(workspace),
+                    "branch_name": expected_branch,
+                },
+                "observed": observed,
+            },
+            run_id=claimed.current_run_id,
+        )
+    auto = _record_task_failure(
+        conn, claimed.id, f"spawn identity drift: {problem}",
+        outcome="spawn_failed",
+        failure_limit=failure_limit,
+        release_claim=True,
+        end_run=True,
+        expected_claim=(claimed.claim_lock, claimed.current_run_id),
     )
+    return None, auto
 
 
 def _default_spawn(
