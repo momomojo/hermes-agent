@@ -197,6 +197,7 @@ async def test_alias_stream_pins_its_board_and_ends_when_the_alias_moves(monkeyp
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
     monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
     current = {"slug": "a", "calls": 0}
 
     def _current():
@@ -220,6 +221,7 @@ async def test_explicit_board_stream_ignores_alias_moves(monkeypatch):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
     monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
     monkeypatch.setattr(mod.kanban_db, "get_current_board", lambda: "elsewhere")
     boards_seen: list = []
     _board_tracking_stubs(monkeypatch, mod, boards_seen)
@@ -230,6 +232,41 @@ async def test_explicit_board_stream_ignores_alias_moves(monkeypatch):
 
     assert boards_seen and set(boards_seen) == {"ops"}
     assert getattr(ws, "closed_with", None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["recreated", "restored"])
+async def test_explicit_board_stream_ends_when_its_database_changes(monkeypatch, change):
+    """A board deleted and recreated (new incarnation) or restored below the
+    stream's cursor while the socket is open ends the stream (1012), so the
+    client re-subscribes instead of applying its cursor to another sequence."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+    calls = {"identity": 0}
+
+    def _identity(board):
+        calls["identity"] += 1
+        if change == "recreated" and calls["identity"] > 1:
+            return f"{board}:new"
+        return f"{board}:x"
+
+    monkeypatch.setattr(mod, "_event_stream_id", _identity)
+    monkeypatch.setattr(mod, "_max_event_id", lambda board: 10 if change == "recreated" else 3)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "10", "stream": "ops:x"})
+    if change == "restored":
+        # Resume at the handshake is honoured (10 <= MAX 10); the database is
+        # then rolled back to MAX 3 while the stream is open.
+        maxes = iter([10])
+        monkeypatch.setattr(mod, "_max_event_id", lambda board: next(maxes, 3))
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert ws.closed_with == 1012
 
 
 def test_event_stream_id_is_a_persisted_database_incarnation(monkeypatch, tmp_path):

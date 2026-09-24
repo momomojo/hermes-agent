@@ -2611,6 +2611,9 @@ def switch_board(slug: str):
 # the simplest and most robust approach; it adds a fraction of a percent
 # of CPU and has no shared state to synchronize across workers.
 _EVENT_POLL_SECONDS = 0.3
+# How often an open events stream re-checks that it still reads the board
+# database it started on (alias move, recreated or restored database).
+_STREAM_REVALIDATE_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -3009,6 +3012,17 @@ async def stream_events(ws: WebSocket):
             finally:
                 conn.close()
 
+        async def _stream_still_valid(cursor_val: int) -> bool:
+            # The current-board alias moved (board-less REST calls now read
+            # another board), the board database was deleted and recreated
+            # (new incarnation), or it was restored below our cursor.
+            if follows_alias and await asyncio.to_thread(kanban_db.get_current_board) != ws_board:
+                return False
+            if await asyncio.to_thread(_event_stream_id, ws_board) != stream_id:
+                return False
+            return await asyncio.to_thread(_max_event_id, ws_board) >= cursor_val
+
+        next_revalidation = time.monotonic() + _STREAM_REVALIDATE_SECONDS
         while True:
             # Race receive() against the poll interval to detect client
             # disconnect even when no events are being sent. Without this,
@@ -3025,11 +3039,14 @@ async def stream_events(ws: WebSocket):
             except asyncio.TimeoutError:
                 pass  # no client message — poll the DB
 
-            if follows_alias and await asyncio.to_thread(kanban_db.get_current_board) != ws_board:
-                # The current-board alias moved: end this stream so the client
-                # reconnects and re-subscribes to the board it now shows.
-                await ws.close(code=1012)
-                return
+            if time.monotonic() >= next_revalidation:
+                next_revalidation = time.monotonic() + _STREAM_REVALIDATE_SECONDS
+                if not await _stream_still_valid(cursor):
+                    # The stream no longer reads the database it started on:
+                    # end it so the client reconnects, re-subscribes, and the
+                    # identity check restarts it cleanly (1012: service restart).
+                    await ws.close(code=1012)
+                    return
 
             cursor, events = await asyncio.to_thread(_fetch_new, cursor)
             if events:
