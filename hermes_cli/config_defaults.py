@@ -2561,6 +2561,14 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Inactivity timeout (seconds) for agent cron runs: a run is stopped
+        # only after this long with no tool call, API call or stream token.
+        # 0 = unlimited. Read per profile at run time by
+        # cron.timeouts.resolve_cron_inactivity_timeout_seconds, which also
+        # sizes one-shot claim recovery. HERMES_CRON_TIMEOUT overrides it for
+        # the whole process. Keep in sync with
+        # cron.timeouts.DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS.
+        "inactivity_timeout_seconds": 600,
         # Timeout (seconds) for a no-agent cron script. Also overridable via
         # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
         # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the

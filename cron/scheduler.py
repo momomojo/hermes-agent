@@ -1317,7 +1317,7 @@ def _cron_inactivity_seconds() -> float:
     """Cron inactivity limit in seconds; 0 = unlimited.
 
     Delegates to ``cron.timeouts.resolve_cron_inactivity_timeout_seconds``, the
-    one resolver shared with one-shot claim recovery and the launchd plist:
+    one resolver shared with one-shot claim recovery:
     ``HERMES_CRON_TIMEOUT`` overrides the profile's
     ``cron.inactivity_timeout_seconds`` (default 600), and invalid values fall
     back instead of disabling the guard. Shared by run_job's inactivity monitor

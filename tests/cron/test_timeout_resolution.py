@@ -101,6 +101,15 @@ def test_scheduler_and_oneshot_recovery_follow_profile_config(tmp_path, monkeypa
     )
 
 
+def test_default_config_registers_the_same_default():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert (
+        DEFAULT_CONFIG["cron"]["inactivity_timeout_seconds"]
+        == DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS
+    )
+
+
 def test_oversized_integer_falls_back_instead_of_raising():
     # float(10**400) raises OverflowError; it must fall back like other bad input.
     assert configured_cron_inactivity_timeout_seconds(
