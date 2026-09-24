@@ -10546,11 +10546,13 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, persisted_branch)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Spawn from the resolved identity, not the pre-resolution snapshot.
-        spawn_task = _resolved_spawn_task(
+        spawn_task, auto = _resolved_spawn_task(
             conn, claimed, str(workspace),
             expected_branch=persisted_branch, failure_limit=failure_limit,
         )
         if spawn_task is None:
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10690,11 +10692,13 @@ def _dispatch_once_locked(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
         # Same resolved-identity handoff as the ready lane.
-        spawn_task = _resolved_spawn_task(
+        spawn_task, auto = _resolved_spawn_task(
             conn, claimed, str(workspace),
             expected_branch=persisted_branch, failure_limit=failure_limit,
         )
         if spawn_task is None:
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -11044,8 +11048,8 @@ def _resolved_spawn_task(
     *,
     expected_branch: Optional[str],
     failure_limit: Optional[int] = None,
-) -> Optional["Task"]:
-    """Return the Task identity a worker is spawned with, or None on drift.
+) -> tuple[Optional["Task"], bool]:
+    """Return ``(task, auto_blocked)``: the identity a worker is spawned with.
 
     The ready and review loops persist the resolved workspace path and worktree
     branch with set_workspace_path/set_branch_name, but ``claimed`` is the
@@ -11056,10 +11060,12 @@ def _resolved_spawn_task(
     Re-read the row and require the exact original status, run, claim,
     assignee, project and workspace kind, plus the workspace path and branch
     this tick just persisted. On success, return ``claimed`` carrying the
-    persisted workspace and branch. On any drift, record a
+    persisted workspace and branch, and False. On any drift, record a
     ``spawn_identity_drift`` event, release our own claim immediately through
     the normal (counted, breaker-aware) spawn-failure path only if it is still
-    ours, and return None so the caller launches nothing.
+    ours, and return None so the caller launches nothing, plus whether that
+    failure tripped the breaker so the caller reports it in
+    ``DispatchResult.auto_blocked`` like every other spawn failure.
     """
     fresh = get_task(conn, claimed.id)
     problem = None
@@ -11083,7 +11089,7 @@ def _resolved_spawn_task(
             claimed,
             workspace_path=fresh.workspace_path,
             branch_name=fresh.branch_name,
-        )
+        ), False
     observed = None
     if fresh is not None:
         observed = {
@@ -11111,7 +11117,7 @@ def _resolved_spawn_task(
             },
             run_id=claimed.current_run_id,
         )
-    _record_task_failure(
+    auto = _record_task_failure(
         conn, claimed.id, f"spawn identity drift: {problem}",
         outcome="spawn_failed",
         failure_limit=failure_limit,
@@ -11119,7 +11125,7 @@ def _resolved_spawn_task(
         end_run=True,
         expected_claim=(claimed.claim_lock, claimed.current_run_id),
     )
-    return None
+    return None, auto
 
 
 def _default_spawn(

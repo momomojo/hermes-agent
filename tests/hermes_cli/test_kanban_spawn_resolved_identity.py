@@ -148,7 +148,7 @@ def test_drift_before_spawn_fails_closed(
     monkeypatch.setattr(kb, "_maybe_emit_scratch_tip", drift_then_tip)
     with kb.connect() as conn:
         tid = _first_claim_worktree_task(conn, repo, status=lane)
-        kb.dispatch_once(conn, spawn_fn=_capturing_spawn(captured))
+        res = kb.dispatch_once(conn, spawn_fn=_capturing_spawn(captured))
         task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
         run = conn.execute(
             "SELECT outcome, ended_at FROM task_runs WHERE id = ?", (seen["run_id"],)
@@ -157,6 +157,8 @@ def test_drift_before_spawn_fails_closed(
 
     assert captured == [], f"{field} drift in the {lane} lane must launch nothing"
     assert "spawn_identity_drift" in kinds
+    # One drift is below the default breaker limit, so nothing is auto-blocked.
+    assert res.auto_blocked == []
     if still_ours:
         # Our own claim is released at once (not left to the TTL) and counted.
         assert task["status"] == lane
@@ -169,6 +171,43 @@ def test_drift_before_spawn_fails_closed(
             assert task[name] == seen["after"][name]
         assert task["consecutive_failures"] == 0
         assert "spawn_failed" not in kinds
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("field", ["workspace_path", "claim_lock"])
+def test_drift_that_trips_the_breaker_is_reported(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch, lane, field,
+):
+    """A drift that trips the breaker must reach DispatchResult.auto_blocked,
+    like every other spawn failure; a drift on someone else's claim never
+    counts against the task."""
+    sql, still_ours = _DRIFTS[field]
+    repo = _make_repo(tmp_path)
+    captured: list = []
+    real_tip = kb._maybe_emit_scratch_tip
+
+    def drift_then_tip(conn, task_id, kind):
+        conn.execute(sql, (task_id,))
+        conn.commit()
+        return real_tip(conn, task_id, kind)
+
+    monkeypatch.setattr(kb, "_maybe_emit_scratch_tip", drift_then_tip)
+    with kb.connect() as conn:
+        tid = _first_claim_worktree_task(conn, repo, status=lane)
+        res = kb.dispatch_once(
+            conn, spawn_fn=_capturing_spawn(captured), failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert captured == []
+    if still_ours:
+        assert res.auto_blocked == [tid]
+        assert task.status == "blocked"
+        assert task.claim_lock is None
+    else:
+        assert res.auto_blocked == []
+        assert task.status != "blocked"
+        assert task.consecutive_failures == 0
 
 
 def test_real_reclaim_before_spawn_leaves_the_new_owner_alone(
