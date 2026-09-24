@@ -9,15 +9,28 @@ import { getApiRequestConnection, getApiRequestProfile, hermesApi, profileScoped
  *  connection), everything else from the profile-keyed local pool. The
  *  getConnectionFor bridge is optional (older Desktop mains); without it the
  *  profile-scoped pool lookup is the best available answer. */
-async function activeConnection(): Promise<HermesConnection> {
+async function activeConnection(): Promise<{ connection: HermesConnection; key: string }> {
   const getConnectionFor = window.hermesDesktop.getConnectionFor
   const connectionId = getApiRequestConnection()
+  const profile = getApiRequestProfile()
 
-  if (connectionId && getConnectionFor) {
-    return getConnectionFor({ connectionId, profile: getApiRequestProfile() })
-  }
+  const connection =
+    connectionId && getConnectionFor
+      ? await getConnectionFor({ connectionId, profile })
+      : await window.hermesDesktop.getConnection(profile)
 
-  return window.hermesDesktop.getConnection(getApiRequestProfile())
+  // Name the backend by the identity it RESOLVED to, never by its address:
+  // local backends bind port 0, so a respawn changes baseUrl while the board
+  // database behind it stays the same. The request scope is no identity either:
+  // every primary route has a null connection id, even when the primary moves
+  // from local to a remote, so read the descriptor's own connection identity.
+  const identity =
+    connection.connectionId ??
+    (connection.mode === 'remote'
+      ? `remote:${connection.remoteIdentity ?? connection.remoteHost ?? connection.baseUrl}`
+      : 'local')
+
+  return { connection, key: `${identity}|${connection.profile ?? profile ?? ''}` }
 }
 
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
@@ -72,20 +85,51 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
  *  plugin's own event stream). Token-mode backends auth via the same query
  *  credential the app's own sockets use; OAuth remotes resolve null (callers
  *  keep their polling fallback — every consumer must have one anyway, since a
- *  socket can drop). Auto-reconnects with backoff until disposed. */
-export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
-  const suffix = pluginPathSuffix('pluginSocket', path)
+ *  socket can drop). Auto-reconnects with backoff until disposed. Pass `path`
+ *  as a function to recompute it on every (re)connect, e.g. to resume from the
+ *  last cursor the stream delivered so a reconnect neither replays nor skips.
+ *  It receives an opaque, stable key for the backend being dialed (its
+ *  registry connection and profile, unchanged across a respawn): stream
+ *  cursors are local to one backend, so a resume cursor must never cross a
+ *  profile or connection switch. */
+export function pluginSocket(
+  pluginId: string,
+  path: string | ((backend: string) => string),
+  onMessage: (data: unknown) => void
+): () => void {
+  // A static path is validated at the call site, as before.
+  const staticSuffix = typeof path === 'string' ? pluginPathSuffix('pluginSocket', path) : null
+
+  const suffixFor = (backend: string): null | string => {
+    if (typeof path === 'string') {
+      return staticSuffix
+    }
+
+    try {
+      return pluginPathSuffix('pluginSocket', path(backend))
+    } catch {
+      // A dynamic path that turns illegal stops the socket; polling remains.
+      return null
+    }
+  }
 
   let socket: null | WebSocket = null
   let disposed = false
   let attempt = 0
 
   const connect = async () => {
-    const connection = await activeConnection().catch(() => null)
+    const active = await activeConnection().catch(() => null)
 
     // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
     // stay on the polling fallback rather than half-working.
-    if (disposed || !connection || connection.authMode === 'oauth') {
+    if (disposed || !active || active.connection.authMode === 'oauth') {
+      return
+    }
+
+    const { connection, key } = active
+    const suffix = suffixFor(key)
+
+    if (suffix === null) {
       return
     }
 

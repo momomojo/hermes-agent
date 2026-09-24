@@ -19,7 +19,13 @@ import {
 } from '@hermes/plugin-sdk'
 
 // Native completion notification.
-import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
+import {
+  bindCompletionNotify,
+  type CompletionEvent,
+  onKanbanEventsFrame,
+  resetKanbanEventsBaseline,
+  seedKanbanEventsBaseline
+} from './completion-notify'
 import type {
   BoardMeta,
   BoardsResponse,
@@ -34,7 +40,41 @@ import type {
 } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
-type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
+type Socket = (path: string | ((backend: string) => string), onMessage: (data: unknown) => void) => () => void
+
+/** Where an events stream left off: its last cursor, and the identity of the
+ *  board database it read (from the server's opening frame; '' if unknown). */
+export interface StreamResume {
+  cursor: number
+  stream: string
+}
+
+/** The events-socket path for a board. Without a resume point, ask for
+ *  `since=latest`: start at the current event (a full replay of `task_events`
+ *  saturated the backend) and get an opening frame with the cursor and stream
+ *  identity back. A reconnect then passes both, so events raised while the
+ *  socket was down are replayed, not skipped, and the server starts fresh if
+ *  the board behind the stream changed. An older backend reads `latest` as 0
+ *  and replays everything, which is slow but loses nothing; its cursors stay
+ *  untagged until a current backend tags them. */
+export function eventsPath(slug: string, resume: null | StreamResume): string {
+  const params = new URLSearchParams()
+
+  if (slug) {
+    params.set('board', slug)
+  }
+
+  params.set('since', resume === null ? 'latest' : String(resume.cursor))
+
+  if (resume !== null) {
+    // Always name the stream when resuming, even when unknown (''): a cursor
+    // from an older backend is untagged, and a current backend then validates
+    // it and tags it with its identity in an opening frame.
+    params.set('stream', resume.stream)
+  }
+
+  return `/events?${params.toString()}`
+}
 
 let rest: null | Rest = null
 
@@ -60,7 +100,7 @@ const COLLAPSED_KEY = 'collapsedLanes'
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
  *  fallback — the socket just makes the board feel instant. */
-function onEventsFrame(slug: string, data: unknown): void {
+function onEventsFrame(slug: string, data: unknown, backend = ''): void {
   const events = (data as { events?: CompletionEvent[] })?.events
 
   if (!events?.length) {
@@ -77,7 +117,7 @@ function onEventsFrame(slug: string, data: unknown): void {
 
   // Completion notification (after invalidation so notify failure
   // never interferes with cache invalidation).
-  void onKanbanEventsFrame(slug, events).catch(() => undefined)
+  void onKanbanEventsFrame(slug, events, backend).catch(() => undefined)
 }
 
 // A persisted, subscribable atom (the structural slice we need — avoids
@@ -114,10 +154,59 @@ export function bindApi(
   persist($collapsedLanes, COLLAPSED_KEY, {})
 
   let close: (() => void) | null = null
+  // Every frame carries the stream cursor, and the server's opening frame the
+  // identity of the board database it reads; reconnects resume from both.
+  // Event ids are local to one backend's board, so resume points are keyed by
+  // backend (a reconnect can land on another profile or connection) and board,
+  // and outlive a board switch: returning to a board resumes its stream
+  // instead of skipping what happened meanwhile.
+  const resumes = new Map<string, StreamResume>()
 
   const open = (slug: string) => {
     close?.()
-    close = socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
+    let backend = ''
+    const resumeKey = (key: string) => `${key}\n${slug}`
+
+    close = socket(
+      key => {
+        backend = key
+
+        return eventsPath(slug, resumes.get(resumeKey(key)) ?? null)
+      },
+      data => {
+        const frame = data as { cursor?: unknown; events?: unknown[]; stream?: unknown } | null
+        const next = frame?.cursor
+
+        if (typeof next === 'number' && Number.isFinite(next)) {
+          const key = resumeKey(backend)
+          const previous = resumes.get(key)
+          const announced = frame?.stream
+
+          if (typeof announced === 'string') {
+            // An opening frame: the server (re)started this stream here, so
+            // adopt it as-is. On another board database, or a sequence that
+            // rewound below our cursor (a restored backup), neither the old
+            // cursor nor the notification baseline carries over.
+            if (previous && (announced !== previous.stream || next < previous.cursor)) {
+              resetKanbanEventsBaseline(slug, backend)
+            }
+
+            resumes.set(key, { cursor: next, stream: announced })
+          } else {
+            resumes.set(key, { cursor: Math.max(previous?.cursor ?? next, next), stream: previous?.stream ?? '' })
+          }
+
+          // The opening frame (no events) marks where a fresh stream starts:
+          // notifications count from there, so the first live terminal event
+          // is not mistaken for history.
+          if (!frame?.events?.length) {
+            seedKanbanEventsBaseline(slug, next, backend)
+          }
+        }
+
+        onEventsFrame(slug, data, backend)
+      }
+    )
   }
 
   open($boardSlug.get())

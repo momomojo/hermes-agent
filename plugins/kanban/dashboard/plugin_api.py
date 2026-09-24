@@ -2611,6 +2611,9 @@ def switch_board(slug: str):
 # the simplest and most robust approach; it adds a fraction of a percent
 # of CPU and has no shared state to synchronize across workers.
 _EVENT_POLL_SECONDS = 0.3
+# How often an open events stream re-checks that it still reads the board
+# database it started on (alias move, recreated or restored database).
+_STREAM_REVALIDATE_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -2889,6 +2892,32 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()
 
 
+def _event_stream_id(board: str) -> str:
+    """Identity of the board database an events stream reads.
+
+    The resolved board slug plus the database's own incarnation id (a random
+    id stored in the database, see ``kanban_db.event_stream_incarnation``):
+    moving the current-board alias, or deleting and recreating a board,
+    changes it, so a client never resumes one database's cursor against
+    another.
+    """
+    conn = kanban_db.connect(board=board)
+    try:
+        return f"{board}:{kanban_db.event_stream_incarnation(conn)}"
+    finally:
+        conn.close()
+
+
+def _max_event_id(board: str) -> int:
+    conn = kanban_db.connect(board=board)
+    try:
+        return int(conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events"
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
 @router.websocket("/events")
 async def stream_events(ws: WebSocket):
     # Authorize the upgrade via the dashboard's canonical WS gate so the
@@ -2901,12 +2930,6 @@ async def stream_events(ws: WebSocket):
         return
     await ws.accept()
     try:
-        since_raw = ws.query_params.get("since", "0")
-        try:
-            cursor = int(since_raw)
-        except ValueError:
-            cursor = 0
-
         # Board selection — pinned at the WS handshake; re-subscribe to
         # switch boards. Changing boards mid-stream would require
         # reconciling two cursors, so the UI just opens a new WS on
@@ -2916,6 +2939,61 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
+        follows_alias = ws_board is None
+        if follows_alias:
+            # Resolve the current-board alias once: every poll must read the
+            # database the stream identity names. If the alias later moves,
+            # the loop below ends the stream so the client re-subscribes to
+            # the board its board-less REST calls now read.
+            ws_board = await asyncio.to_thread(kanban_db.get_current_board)
+
+        since_raw = ws.query_params.get("since", "0")
+        stream_id = await asyncio.to_thread(_event_stream_id, ws_board)
+        # ``stream`` marks a client that speaks the resume protocol: a non-empty
+        # value is the identity its cursor belongs to; an empty one is a cursor
+        # it could not tag (it started on an older backend). Clients that omit
+        # it keep the historical behaviour exactly.
+        client_stream = ws.query_params.get("stream")
+        tag_resume = False
+        if client_stream and client_stream != stream_id:
+            # The client's resume cursor belongs to another board database
+            # (the current-board alias moved, or the board was recreated):
+            # start at the current event rather than replay or skip foreign
+            # history. The opening frame hands it the new stream identity.
+            since_raw = "latest"
+        elif client_stream is not None:
+            # Same database, or an untagged cursor. A restored backup can
+            # rewind task_events.id below the cursor (the incarnation is
+            # restored with it), and a cursor ahead of the sequence would
+            # silence the stream until it caught up, so start fresh; the
+            # opening frame resets the client. An untagged cursor that is still
+            # valid is honoured and tagged with this stream's identity.
+            try:
+                requested = int(since_raw)
+            except ValueError:
+                requested = None
+            if requested is not None and requested > await asyncio.to_thread(_max_event_id, ws_board):
+                since_raw = "latest"
+            else:
+                tag_resume = not client_stream
+        if since_raw == "latest":
+            # Opt-in "no backlog" start. Replaying the whole task_events table
+            # invalidates the full board query for every 200-event frame, and
+            # large boards then saturate the backend. A missing cursor keeps
+            # the historical replay-from-0 contract for older clients; clients
+            # that resume from a cursor ask for this instead.
+            cursor = await asyncio.to_thread(_max_event_id, ws_board)
+            # Announce where this stream starts, so a client that reconnects
+            # before any event arrives can resume with ?since=<cursor>&stream=
+            # instead of skipping what happened while it was disconnected.
+            await ws.send_json({"events": [], "cursor": cursor, "stream": stream_id})
+        else:
+            try:
+                cursor = int(since_raw)
+            except ValueError:
+                cursor = 0
+            if tag_resume:
+                await ws.send_json({"events": [], "cursor": cursor, "stream": stream_id})
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
@@ -2945,6 +3023,21 @@ async def stream_events(ws: WebSocket):
             finally:
                 conn.close()
 
+        async def _stream_still_valid(cursor_val: int) -> bool:
+            # The current-board alias moved (board-less REST calls now read
+            # another board), the board database was deleted and recreated
+            # (new incarnation), or it was restored below our cursor.
+            if follows_alias and await asyncio.to_thread(kanban_db.get_current_board) != ws_board:
+                return False
+            if await asyncio.to_thread(_event_stream_id, ws_board) != stream_id:
+                return False
+            if client_stream is None:
+                # A client outside the resume protocol would reconnect with the
+                # same cursor forever; keep its historical behaviour instead.
+                return True
+            return await asyncio.to_thread(_max_event_id, ws_board) >= cursor_val
+
+        next_revalidation = time.monotonic() + _STREAM_REVALIDATE_SECONDS
         while True:
             # Race receive() against the poll interval to detect client
             # disconnect even when no events are being sent. Without this,
@@ -2960,6 +3053,15 @@ async def stream_events(ws: WebSocket):
                 # continue polling.
             except asyncio.TimeoutError:
                 pass  # no client message — poll the DB
+
+            if time.monotonic() >= next_revalidation:
+                next_revalidation = time.monotonic() + _STREAM_REVALIDATE_SECONDS
+                if not await _stream_still_valid(cursor):
+                    # The stream no longer reads the database it started on:
+                    # end it so the client reconnects, re-subscribes, and the
+                    # identity check restarts it cleanly (1012: service restart).
+                    await ws.close(code=1012)
+                    return
 
             cursor, events = await asyncio.to_thread(_fetch_new, cursor)
             if events:

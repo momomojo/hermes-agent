@@ -50,13 +50,28 @@ class _IdleDisconnectingWebSocket:
         self.sent.append(payload)
 
     async def close(self, code=None):
-        pass
+        self.closed_with = code
 
 
 @pytest.mark.asyncio
 async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: f"{board}:x")
+
+    class _Cursor:
+        def fetchone(self):
+            return (0,)
+
+    class _Connection:
+        def execute(self, statement):
+            assert "MAX(id)" in statement
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: _Connection())
 
     ws = _IdleDisconnectingWebSocket()
 
@@ -68,3 +83,229 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     assert ws.accepted
     assert ws.receive_calls == 1
     assert ws.sent == []  # returned before any poll, no zombie loop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "since, stream, expected_cursor, opening_frame",
+    [
+        (None, None, 0, None),  # older clients keep the historical full replay
+        ("0", None, 0, None),
+        ("50", None, 50, None),  # clients outside the resume protocol are unchanged
+        ("latest", None, 42, 42),  # opt-in: start at the current event, no backlog
+        ("5", "default:7", 5, None),  # resume on the same board database
+        ("5", "other:1", 42, 42),  # cursor from another database: start fresh
+        ("50", "default:7", 42, 42),  # cursor ahead of a restored sequence: start fresh
+        ("5", "", 5, 5),  # untagged cursor (older backend): honoured and tagged
+        ("50", "", 42, 42),  # untagged cursor ahead of the sequence: start fresh
+    ],
+)
+async def test_stream_events_start_and_resume(monkeypatch, since, stream, expected_cursor, opening_frame):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: "default:7")
+    queried_after: list[int] = []
+
+    class _Cursor:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return []
+
+    class _Connection:
+        def execute(self, statement, params=()):
+            if "MAX(id)" in statement:
+                return _Cursor((42,))
+            queried_after.append(params[0])
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: _Connection())
+
+    class _OnePollWebSocket(_IdleDisconnectingWebSocket):
+        async def receive(self):
+            self.receive_calls += 1
+            if self.receive_calls == 1:
+                await asyncio.sleep(0.01)
+            return {"type": "websocket.disconnect"}
+
+    ws = _OnePollWebSocket()
+    if since is not None:
+        ws.query_params["since"] = since
+    if stream is not None:
+        ws.query_params["stream"] = stream
+
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert ws.accepted
+    assert queried_after == [expected_cursor]
+    # A client starting fresh learns where its stream starts and which board
+    # database it reads, so a reconnect can resume with ?since=&stream=. A
+    # client resuming on the same database, or a legacy one, gets no extra frame.
+    if opening_frame is not None:
+        assert ws.sent == [{"events": [], "cursor": opening_frame, "stream": "default:7"}]
+    else:
+        assert ws.sent == []
+
+
+def _board_tracking_stubs(monkeypatch, mod, boards_seen):
+    """kanban_db.connect stub that records the board every poll reads."""
+
+    class _Cursor:
+        def fetchone(self):
+            return (0,)
+
+        def fetchall(self):
+            return []
+
+    class _Connection:
+        def execute(self, statement, params=()):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    def _connect(board=None):
+        boards_seen.append(board)
+        return _Connection()
+
+    monkeypatch.setattr(mod.kanban_db, "connect", _connect)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: f"{board}:x")
+
+
+class _PollingWebSocket(_IdleDisconnectingWebSocket):
+    """Stays connected for a few polls, then disconnects."""
+
+    polls = 3
+
+    async def receive(self):
+        self.receive_calls += 1
+        if self.receive_calls <= self.polls:
+            await asyncio.sleep(0.01)
+        return {"type": "websocket.disconnect"}
+
+
+@pytest.mark.asyncio
+async def test_alias_stream_pins_its_board_and_ends_when_the_alias_moves(monkeypatch):
+    """Without ?board=, the current-board alias is resolved once and every poll
+    reads that board; when another surface switches boards, the stream ends
+    (1012) so the client re-subscribes to the board its REST calls now read."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    current = {"slug": "a", "calls": 0}
+
+    def _current():
+        current["calls"] += 1
+        return current["slug"] if current["calls"] <= 2 else "b"
+
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", _current)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+
+    ws = _PollingWebSocket()
+    ws.query_params["since"] = "0"
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert boards_seen and set(boards_seen) == {"a"}
+    assert ws.closed_with == 1012
+
+
+@pytest.mark.asyncio
+async def test_explicit_board_stream_ignores_alias_moves(monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", lambda: "elsewhere")
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "0"})
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert boards_seen and set(boards_seen) == {"ops"}
+    assert getattr(ws, "closed_with", None) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["recreated", "restored"])
+async def test_explicit_board_stream_ends_when_its_database_changes(monkeypatch, change):
+    """A board deleted and recreated (new incarnation) or restored below the
+    stream's cursor while the socket is open ends the stream (1012), so the
+    client re-subscribes instead of applying its cursor to another sequence."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+    calls = {"identity": 0}
+
+    def _identity(board):
+        calls["identity"] += 1
+        if change == "recreated" and calls["identity"] > 1:
+            return f"{board}:new"
+        return f"{board}:x"
+
+    monkeypatch.setattr(mod, "_event_stream_id", _identity)
+    monkeypatch.setattr(mod, "_max_event_id", lambda board: 10 if change == "recreated" else 3)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "10", "stream": "ops:x"})
+    if change == "restored":
+        # Resume at the handshake is honoured (10 <= MAX 10); the database is
+        # then rolled back to MAX 3 while the stream is open.
+        maxes = iter([10])
+        monkeypatch.setattr(mod, "_max_event_id", lambda board: next(maxes, 3))
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert ws.closed_with == 1012
+
+
+@pytest.mark.asyncio
+async def test_revalidation_never_loops_clients_outside_the_resume_protocol(monkeypatch):
+    """A client that sends no stream= would reconnect with the same cursor
+    forever, so a sequence below its cursor must not end its stream."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+    monkeypatch.setattr(mod, "_max_event_id", lambda board: 3)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "50"})
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert getattr(ws, "closed_with", None) is None
+    assert ws.sent == []
+
+
+def test_event_stream_id_is_a_persisted_database_incarnation(monkeypatch, tmp_path):
+    mod = _load_plugin_module()
+    real_connect = mod.kanban_db.connect
+    paths = {"a": tmp_path / "a" / "kanban.db", "b": tmp_path / "b" / "kanban.db"}
+    for path in paths.values():
+        path.parent.mkdir()
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: real_connect(db_path=paths[board]))
+
+    first = mod._event_stream_id("a")
+    assert first.startswith("a:")
+    assert mod._event_stream_id("a") == first  # stable across connections
+    assert mod._event_stream_id("b") != first  # another board database
+    # Deleting and recreating a board database always mints a new id, even
+    # if the filesystem reuses the inode.
+    for sidecar in paths["a"].parent.iterdir():
+        sidecar.rename(tmp_path / f"retired-{sidecar.name}")
+    assert mod._event_stream_id("a") != first
