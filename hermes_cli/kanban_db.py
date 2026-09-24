@@ -3162,6 +3162,33 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         _check_file_length_invariant(conn)
 
 
+def event_stream_incarnation(conn: sqlite3.Connection) -> str:
+    """Return this board database's incarnation id, minting it on first use.
+
+    A random id stored in the database itself, so it is unique per database
+    and changes when a board is deleted and recreated (unlike an inode, which
+    the filesystem may reuse). Event-stream clients pair it with their resume
+    cursor so a cursor never crosses databases.
+    """
+    query = "SELECT value FROM kanban_incarnation WHERE id = 1"
+    try:
+        row = conn.execute(query).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is not None:
+        return str(row[0])
+    with write_txn(conn):
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_incarnation ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_incarnation (id, value) VALUES (1, ?)",
+            (secrets.token_hex(16),),
+        )
+    return str(conn.execute(query).fetchone()[0])
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------

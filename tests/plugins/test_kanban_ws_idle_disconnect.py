@@ -57,6 +57,7 @@ class _IdleDisconnectingWebSocket:
 async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_event_stream_id", lambda board: f"{board}:x")
 
     class _Cursor:
         def fetchone(self):
@@ -150,25 +151,76 @@ async def test_stream_events_start_and_resume(monkeypatch, since, stream, expect
         assert ws.sent == []
 
 
-def test_event_stream_id_follows_the_resolved_board_database(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_stream_pins_the_current_board_at_handshake(monkeypatch):
+    """Without ?board=, the current-board alias is resolved once: identity and
+    every poll read that database even if the alias moves mid-stream."""
     mod = _load_plugin_module()
-    paths = {"a": tmp_path / "a.db", "b": tmp_path / "b.db"}
-    for path in paths.values():
-        path.write_bytes(b"")
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
     current = {"slug": "a"}
-    monkeypatch.setattr(mod.kanban_db, "get_current_board", lambda: current["slug"])
-    monkeypatch.setattr(mod.kanban_db, "kanban_db_path", lambda board=None: paths[board])
 
-    first = mod._event_stream_id(None)
-    assert first == mod._event_stream_id(None) == mod._event_stream_id("a")
-    # Moving the current-board alias changes the identity of the '' stream.
-    current["slug"] = "b"
-    assert mod._event_stream_id(None) != first
-    # So does deleting and recreating a board database (a new inode).
-    recreated = tmp_path / "a-new.db"
-    recreated.write_bytes(b"")
-    old_inode = paths["a"].stat().st_ino
-    paths["a"].unlink()
-    recreated.rename(paths["a"])
-    if paths["a"].stat().st_ino != old_inode:
-        assert mod._event_stream_id("a") != first
+    def _current():
+        slug = current["slug"]
+        current["slug"] = "b"  # another surface switches boards right after
+        return slug
+
+    monkeypatch.setattr(mod.kanban_db, "get_current_board", _current)
+    identity_boards: list = []
+    connect_boards: list = []
+    monkeypatch.setattr(
+        mod, "_event_stream_id", lambda board: identity_boards.append(board) or f"{board}:x"
+    )
+
+    class _Cursor:
+        def fetchone(self):
+            return (0,)
+
+        def fetchall(self):
+            return []
+
+    class _Connection:
+        def execute(self, statement, params=()):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    def _connect(board=None):
+        connect_boards.append(board)
+        return _Connection()
+
+    monkeypatch.setattr(mod.kanban_db, "connect", _connect)
+
+    class _TwoPollWebSocket(_IdleDisconnectingWebSocket):
+        async def receive(self):
+            self.receive_calls += 1
+            if self.receive_calls <= 2:
+                await asyncio.sleep(0.01)
+            return {"type": "websocket.disconnect"}
+
+    ws = _TwoPollWebSocket()
+    ws.query_params["since"] = "0"
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert identity_boards == ["a"]
+    assert connect_boards and set(connect_boards) == {"a"}
+
+
+def test_event_stream_id_is_a_persisted_database_incarnation(monkeypatch, tmp_path):
+    mod = _load_plugin_module()
+    real_connect = mod.kanban_db.connect
+    paths = {"a": tmp_path / "a" / "kanban.db", "b": tmp_path / "b" / "kanban.db"}
+    for path in paths.values():
+        path.parent.mkdir()
+    monkeypatch.setattr(mod.kanban_db, "connect", lambda board=None: real_connect(db_path=paths[board]))
+
+    first = mod._event_stream_id("a")
+    assert first.startswith("a:")
+    assert mod._event_stream_id("a") == first  # stable across connections
+    assert mod._event_stream_id("b") != first  # another board database
+    # Deleting and recreating a board database always mints a new id, even
+    # if the filesystem reuses the inode.
+    for sidecar in paths["a"].parent.iterdir():
+        sidecar.rename(tmp_path / f"retired-{sidecar.name}")
+    assert mod._event_stream_id("a") != first

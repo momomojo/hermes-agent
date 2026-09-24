@@ -2889,19 +2889,20 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     return get_orchestration_settings()
 
 
-def _event_stream_id(board: Optional[str]) -> str:
+def _event_stream_id(board: str) -> str:
     """Identity of the board database an events stream reads.
 
-    The resolved board slug plus the database file's inode: moving the
-    current-board alias, or deleting and recreating a board, changes it, so a
-    client never resumes one database's cursor against another.
+    The resolved board slug plus the database's own incarnation id (a random
+    id stored in the database, see ``kanban_db.event_stream_incarnation``):
+    moving the current-board alias, or deleting and recreating a board,
+    changes it, so a client never resumes one database's cursor against
+    another.
     """
-    slug = board or kanban_db.get_current_board()
+    conn = kanban_db.connect(board=board)
     try:
-        inode = kanban_db.kanban_db_path(board=slug).stat().st_ino
-    except OSError:
-        inode = 0
-    return f"{slug}:{inode}"
+        return f"{board}:{kanban_db.event_stream_incarnation(conn)}"
+    finally:
+        conn.close()
 
 
 @router.websocket("/events")
@@ -2925,6 +2926,11 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
+        if ws_board is None:
+            # Resolve the current-board alias once: every poll must read the
+            # database the stream identity names, even if another surface
+            # switches boards while this socket is open.
+            ws_board = await asyncio.to_thread(kanban_db.get_current_board)
 
         since_raw = ws.query_params.get("since", "0")
         stream_id = await asyncio.to_thread(_event_stream_id, ws_board)
