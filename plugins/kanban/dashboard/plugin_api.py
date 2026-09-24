@@ -2949,24 +2949,33 @@ async def stream_events(ws: WebSocket):
 
         since_raw = ws.query_params.get("since", "0")
         stream_id = await asyncio.to_thread(_event_stream_id, ws_board)
+        # ``stream`` marks a client that speaks the resume protocol: a non-empty
+        # value is the identity its cursor belongs to; an empty one is a cursor
+        # it could not tag (it started on an older backend). Clients that omit
+        # it keep the historical behaviour exactly.
         client_stream = ws.query_params.get("stream")
-        if client_stream is not None and client_stream != stream_id:
+        tag_resume = False
+        if client_stream and client_stream != stream_id:
             # The client's resume cursor belongs to another board database
             # (the current-board alias moved, or the board was recreated):
             # start at the current event rather than replay or skip foreign
             # history. The opening frame hands it the new stream identity.
             since_raw = "latest"
         elif client_stream is not None:
-            # Same database, but a restored backup can rewind task_events.id
-            # below the client's cursor (the incarnation is restored with it).
-            # A cursor ahead of the sequence would silence the stream until it
-            # caught up, so start fresh; the opening frame resets the client.
+            # Same database, or an untagged cursor. A restored backup can
+            # rewind task_events.id below the cursor (the incarnation is
+            # restored with it), and a cursor ahead of the sequence would
+            # silence the stream until it caught up, so start fresh; the
+            # opening frame resets the client. An untagged cursor that is still
+            # valid is honoured and tagged with this stream's identity.
             try:
                 requested = int(since_raw)
             except ValueError:
                 requested = None
             if requested is not None and requested > await asyncio.to_thread(_max_event_id, ws_board):
                 since_raw = "latest"
+            else:
+                tag_resume = not client_stream
         if since_raw == "latest":
             # Opt-in "no backlog" start. Replaying the whole task_events table
             # invalidates the full board query for every 200-event frame, and
@@ -2983,6 +2992,8 @@ async def stream_events(ws: WebSocket):
                 cursor = int(since_raw)
             except ValueError:
                 cursor = 0
+            if tag_resume:
+                await ws.send_json({"events": [], "cursor": cursor, "stream": stream_id})
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)
@@ -3020,6 +3031,10 @@ async def stream_events(ws: WebSocket):
                 return False
             if await asyncio.to_thread(_event_stream_id, ws_board) != stream_id:
                 return False
+            if client_stream is None:
+                # A client outside the resume protocol would reconnect with the
+                # same cursor forever; keep its historical behaviour instead.
+                return True
             return await asyncio.to_thread(_max_event_id, ws_board) >= cursor_val
 
         next_revalidation = time.monotonic() + _STREAM_REVALIDATE_SECONDS

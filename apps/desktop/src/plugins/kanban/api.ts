@@ -55,7 +55,8 @@ export interface StreamResume {
  *  identity back. A reconnect then passes both, so events raised while the
  *  socket was down are replayed, not skipped, and the server starts fresh if
  *  the board behind the stream changed. An older backend reads `latest` as 0
- *  and replays everything, which is slow but loses nothing. */
+ *  and replays everything, which is slow but loses nothing; its cursors stay
+ *  untagged until a current backend tags them. */
 export function eventsPath(slug: string, resume: null | StreamResume): string {
   const params = new URLSearchParams()
 
@@ -65,7 +66,10 @@ export function eventsPath(slug: string, resume: null | StreamResume): string {
 
   params.set('since', resume === null ? 'latest' : String(resume.cursor))
 
-  if (resume?.stream) {
+  if (resume !== null) {
+    // Always name the stream when resuming, even when unknown (''): a cursor
+    // from an older backend is untagged, and a current backend then validates
+    // it and tags it with its identity in an opening frame.
     params.set('stream', resume.stream)
   }
 

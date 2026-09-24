@@ -93,8 +93,9 @@ describe('eventsPath', () => {
     expect(eventsPath('', null)).toBe('/events?since=latest')
     expect(eventsPath('main board', null)).toBe('/events?board=main+board&since=latest')
     expect(eventsPath('ops', { cursor: 42, stream: 'ops:7' })).toBe('/events?board=ops&since=42&stream=ops%3A7')
-    // An unknown stream identity (an older backend) resumes by cursor alone.
-    expect(eventsPath('', { cursor: 0, stream: '' })).toBe('/events?since=0')
+    // An untagged cursor (from an older backend) still names the stream, empty,
+    // so a current backend validates it and tags it.
+    expect(eventsPath('', { cursor: 0, stream: '' })).toBe('/events?since=0&stream=')
   })
 })
 
@@ -116,16 +117,16 @@ describe('bindApi events socket', () => {
 
     // The server's opening frame announces where the stream starts.
     opened[0].onMessage({ events: [], cursor: 42 })
-    expect(opened[0].path('backend-a')).toBe('/events?since=42')
+    expect(opened[0].path('backend-a')).toBe('/events?since=42&stream=')
 
     // Later frames advance it; a reconnect re-evaluates the path.
     opened[0].onMessage({ events: [{ id: 43, kind: 'created', task_id: 't1' }], cursor: 43 })
-    expect(opened[0].path('backend-a')).toBe('/events?since=43')
+    expect(opened[0].path('backend-a')).toBe('/events?since=43&stream=')
 
     // A stale or malformed cursor never moves it backwards.
     opened[0].onMessage({ events: [], cursor: 7 })
     opened[0].onMessage({ events: [], cursor: 'x' })
-    expect(opened[0].path('backend-a')).toBe('/events?since=43')
+    expect(opened[0].path('backend-a')).toBe('/events?since=43&stream=')
 
     dispose()
   })
@@ -141,10 +142,10 @@ describe('bindApi events socket', () => {
     // A reconnect that lands on another backend must not send A's cursor.
     expect(opened[0].path('backend-b')).toBe('/events?since=latest')
     opened[0].onMessage({ events: [], cursor: 7 })
-    expect(opened[0].path('backend-b')).toBe('/events?since=7')
+    expect(opened[0].path('backend-b')).toBe('/events?since=7&stream=')
 
     // Returning to A resumes A's own stream.
-    expect(opened[0].path('backend-a')).toBe('/events?since=500')
+    expect(opened[0].path('backend-a')).toBe('/events?since=500&stream=')
 
     dispose()
   })
@@ -236,9 +237,9 @@ describe('bindApi events socket', () => {
     // Returning resumes the first board where it left off, so events raised
     // there while another board was selected are replayed, not skipped.
     $boardSlug.set('')
-    expect(opened[2].path('backend-a')).toBe('/events?since=42')
+    expect(opened[2].path('backend-a')).toBe('/events?since=42&stream=')
     $boardSlug.set('ops')
-    expect(opened[3].path('backend-a')).toBe('/events?board=ops&since=900')
+    expect(opened[3].path('backend-a')).toBe('/events?board=ops&since=900&stream=')
 
     dispose()
   })

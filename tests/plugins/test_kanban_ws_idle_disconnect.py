@@ -89,12 +89,15 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "since, stream, expected_cursor, opening_frame",
     [
-        (None, None, 0, False),  # older clients keep the historical full replay
-        ("0", None, 0, False),
-        ("latest", None, 42, True),  # opt-in: start at the current event, no backlog
-        ("5", "default:7", 5, False),  # resume on the same board database
-        ("5", "other:1", 42, True),  # cursor from another database: start fresh
-        ("50", "default:7", 42, True),  # cursor ahead of a restored sequence: start fresh
+        (None, None, 0, None),  # older clients keep the historical full replay
+        ("0", None, 0, None),
+        ("50", None, 50, None),  # clients outside the resume protocol are unchanged
+        ("latest", None, 42, 42),  # opt-in: start at the current event, no backlog
+        ("5", "default:7", 5, None),  # resume on the same board database
+        ("5", "other:1", 42, 42),  # cursor from another database: start fresh
+        ("50", "default:7", 42, 42),  # cursor ahead of a restored sequence: start fresh
+        ("5", "", 5, 5),  # untagged cursor (older backend): honoured and tagged
+        ("50", "", 42, 42),  # untagged cursor ahead of the sequence: start fresh
     ],
 )
 async def test_stream_events_start_and_resume(monkeypatch, since, stream, expected_cursor, opening_frame):
@@ -146,8 +149,8 @@ async def test_stream_events_start_and_resume(monkeypatch, since, stream, expect
     # A client starting fresh learns where its stream starts and which board
     # database it reads, so a reconnect can resume with ?since=&stream=. A
     # client resuming on the same database, or a legacy one, gets no extra frame.
-    if opening_frame:
-        assert ws.sent == [{"events": [], "cursor": 42, "stream": "default:7"}]
+    if opening_frame is not None:
+        assert ws.sent == [{"events": [], "cursor": opening_frame, "stream": "default:7"}]
     else:
         assert ws.sent == []
 
@@ -267,6 +270,26 @@ async def test_explicit_board_stream_ends_when_its_database_changes(monkeypatch,
     await asyncio.wait_for(mod.stream_events(ws), timeout=5)
 
     assert ws.closed_with == 1012
+
+
+@pytest.mark.asyncio
+async def test_revalidation_never_loops_clients_outside_the_resume_protocol(monkeypatch):
+    """A client that sends no stream= would reconnect with the same cursor
+    forever, so a sequence below its cursor must not end its stream."""
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    monkeypatch.setattr(mod, "_EVENT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(mod, "_STREAM_REVALIDATE_SECONDS", 0)
+    boards_seen: list = []
+    _board_tracking_stubs(monkeypatch, mod, boards_seen)
+    monkeypatch.setattr(mod, "_max_event_id", lambda board: 3)
+
+    ws = _PollingWebSocket()
+    ws.query_params.update({"board": "ops", "since": "50"})
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert getattr(ws, "closed_with", None) is None
+    assert ws.sent == []
 
 
 def test_event_stream_id_is_a_persisted_database_incarnation(monkeypatch, tmp_path):
