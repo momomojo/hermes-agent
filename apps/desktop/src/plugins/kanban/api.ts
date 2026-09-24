@@ -34,7 +34,27 @@ import type {
 } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
-type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
+type Socket = (path: string | (() => string), onMessage: (data: unknown) => void) => () => void
+
+/** The events-socket path for a board. `since` is the last cursor this socket
+ *  saw: the server starts a cursorless socket at the current event (a full
+ *  replay saturated the backend), so a reconnect must pass it or every event
+ *  raised while the socket was down would be skipped. */
+export function eventsPath(slug: string, since: null | number): string {
+  const params = new URLSearchParams()
+
+  if (slug) {
+    params.set('board', slug)
+  }
+
+  if (since !== null) {
+    params.set('since', String(since))
+  }
+
+  const query = params.toString()
+
+  return query ? `/events?${query}` : '/events'
+}
 
 let rest: null | Rest = null
 
@@ -117,7 +137,22 @@ export function bindApi(
 
   const open = (slug: string) => {
     close?.()
-    close = socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
+    // Every frame (including the server's opening one) carries the stream
+    // cursor; reconnects resume from it. A board switch starts a new cursor.
+    let cursor: null | number = null
+
+    close = socket(
+      () => eventsPath(slug, cursor),
+      data => {
+        const next = (data as { cursor?: unknown })?.cursor
+
+        if (typeof next === 'number' && Number.isFinite(next)) {
+          cursor = Math.max(cursor ?? next, next)
+        }
+
+        onEventsFrame(slug, data)
+      }
+    )
   }
 
   open($boardSlug.get())

@@ -81,7 +81,8 @@ async def test_stream_events_exits_on_idle_disconnect(monkeypatch, tmp_path):
 
     assert ws.accepted
     assert ws.receive_calls == 1
-    assert ws.sent == []  # returned before any poll, no zombie loop
+    # Only the opening cursor frame; returned before any poll, no zombie loop.
+    assert ws.sent == [{"events": [], "cursor": 0}]
 
 
 @pytest.mark.asyncio
@@ -129,3 +130,10 @@ async def test_stream_events_baselines_only_when_since_is_omitted(monkeypatch, s
 
     assert ws.accepted
     assert queried_after == [expected_cursor]
+    # A cursorless client learns where its stream starts, so a reconnect can
+    # resume with ?since= instead of skipping events raised while it was down.
+    # A client that sent its own cursor already knows it.
+    if since is None:
+        assert ws.sent == [{"events": [], "cursor": 42}]
+    else:
+        assert ws.sent == []

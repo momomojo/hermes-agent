@@ -580,6 +580,7 @@ describe('pluginSocket', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
     Reflect.deleteProperty(window, 'hermesDesktop')
     setApiRequestProfile(null)
   })
@@ -600,6 +601,38 @@ describe('pluginSocket', () => {
 
     await vi.waitFor(() => expect(getConnection).toHaveBeenCalled())
     expect(getConnection).toHaveBeenCalledWith(null)
+
+    dispose()
+  })
+
+  it('re-evaluates a function path on every reconnect', async () => {
+    getConnection.mockResolvedValue({ authMode: 'token', baseUrl: 'http://127.0.0.1:9119', token: 'tok' })
+    const urls: string[] = []
+    const sockets: Array<{ onclose: (() => void) | null }> = []
+
+    class FakeWebSocket {
+      onmessage: ((event: { data: string }) => void) | null = null
+      onclose: (() => void) | null = null
+
+      constructor(url: string) {
+        urls.push(url)
+        sockets.push(this)
+      }
+
+      close() {}
+    }
+
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    let since = '42'
+    const dispose = pluginSocket('kanban', () => `/events?since=${since}`, () => {})
+
+    await vi.waitFor(() => expect(urls).toHaveLength(1))
+    since = '57'
+    sockets[0].onclose?.()
+    await vi.waitFor(() => expect(urls).toHaveLength(2), { timeout: 3000 })
+
+    expect(urls[0]).toBe('ws://127.0.0.1:9119/api/plugins/kanban/events?since=42&token=tok')
+    expect(urls[1]).toBe('ws://127.0.0.1:9119/api/plugins/kanban/events?since=57&token=tok')
 
     dispose()
   })

@@ -2926,6 +2926,10 @@ async def stream_events(ws: WebSocket):
                 ).fetchone()[0])
             finally:
                 conn.close()
+            # Announce where this stream starts, so a client that reconnects
+            # before any event arrives can resume with ?since=<cursor> instead
+            # of skipping what happened while it was disconnected.
+            await ws.send_json({"events": [], "cursor": cursor})
         else:
             try:
                 cursor = int(since_raw)

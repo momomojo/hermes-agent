@@ -78,8 +78,9 @@ export interface PluginContext {
   /** Live twin of `rest`: a WebSocket to this plugin's own namespace
    *  ('/events'), JSON frames to `onMessage`, auto-reconnect, disposer
    *  returned. Resolves to a no-op on OAuth remotes — treat it as an
-   *  accelerator over your polling, never a replacement. */
-  socket: (path: string, onMessage: (data: unknown) => void) => () => void
+   *  accelerator over your polling, never a replacement. A function `path` is
+   *  re-evaluated on every reconnect (e.g. to resume from a stream cursor). */
+  socket: (path: string | (() => string), onMessage: (data: unknown) => void) => () => void
   /** The curated OS door: native notification, open-external, reveal-in-file-
    *  manager, clipboard — attributed to this plugin, result-shaped (never
    *  throws for a missing capability). */

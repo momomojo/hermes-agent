@@ -72,9 +72,29 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
  *  plugin's own event stream). Token-mode backends auth via the same query
  *  credential the app's own sockets use; OAuth remotes resolve null (callers
  *  keep their polling fallback — every consumer must have one anyway, since a
- *  socket can drop). Auto-reconnects with backoff until disposed. */
-export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
-  const suffix = pluginPathSuffix('pluginSocket', path)
+ *  socket can drop). Auto-reconnects with backoff until disposed. Pass `path`
+ *  as a function to recompute it on every (re)connect, e.g. to resume from the
+ *  last cursor the stream delivered so a reconnect neither replays nor skips. */
+export function pluginSocket(
+  pluginId: string,
+  path: string | (() => string),
+  onMessage: (data: unknown) => void
+): () => void {
+  // A static path is validated at the call site, as before.
+  const staticSuffix = typeof path === 'string' ? pluginPathSuffix('pluginSocket', path) : null
+
+  const currentSuffix = (): null | string => {
+    if (typeof path === 'string') {
+      return staticSuffix
+    }
+
+    try {
+      return pluginPathSuffix('pluginSocket', path())
+    } catch {
+      // A dynamic path that turns illegal stops the socket; polling remains.
+      return null
+    }
+  }
 
   let socket: null | WebSocket = null
   let disposed = false
@@ -86,6 +106,12 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
     // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
     // stay on the polling fallback rather than half-working.
     if (disposed || !connection || connection.authMode === 'oauth') {
+      return
+    }
+
+    const suffix = currentSuffix()
+
+    if (suffix === null) {
       return
     }
 

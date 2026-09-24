@@ -21,7 +21,8 @@
  * seen[board] = GET /board latest_event_id (MAX task_events.id for that
  * board). Events id <= seen are historical/replay — never notified, no
  * cursor change. id > seen advances cursor for EVERY kind; only terminal
- * kinds emit. Reconnect replays from 0; cursor filters. Board switch never
+ * kinds emit. A reconnect resumes from the socket's last stream cursor
+ * (api.ts `eventsPath`); this cursor still filters any overlap. Board switch never
  * mixes cursors; returning reuses prior cursor (never reset to current MAX).
  * Fail-closed: while a board's baseline is unknown, no event can be
  * classified so none is notified. Empty slug ('') suppressed.
