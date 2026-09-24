@@ -1,9 +1,11 @@
 """Shared cron inactivity-timeout resolution.
 
-The gateway, scheduler, and one-shot claim recovery must agree on the same
-inactivity budget.  Keep ``HERMES_CRON_TIMEOUT`` as the highest-precedence
-escape hatch, but use the profile-scoped
-``cron.inactivity_timeout_seconds`` setting when the environment is unset.
+The scheduler and one-shot claim recovery must agree on the same inactivity
+budget.  Keep ``HERMES_CRON_TIMEOUT`` as the highest-precedence escape hatch,
+but use the profile-scoped ``cron.inactivity_timeout_seconds`` setting when the
+environment is unset.  The value is resolved at run time on purpose: baking it
+into the launchd plist would go stale after config edits and, being
+process-wide, would override every profile's own setting.
 """
 
 from __future__ import annotations
@@ -19,25 +21,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_CRON_INACTIVITY_TIMEOUT_SECONDS = 600.0
 
 
+_WARNED_INVALID: set[tuple[str, str]] = set()
+
+
+def _warn_invalid(source: str, value: Any) -> None:
+    # Resolution runs per job and per due-job scan; warn once per bad value
+    # instead of on every tick.
+    key = (source, repr(value)[:200])
+    if key in _WARNED_INVALID:
+        return
+    _WARNED_INVALID.add(key)
+    logger.warning("Invalid %s=%r; using the next cron timeout source", source, value)
+
+
 def _coerce_timeout(value: Any, source: str) -> float | None:
     # bool is an int subclass: accepting it would turn true into a one-second
     # timeout and false into the explicit unlimited sentinel.
     if isinstance(value, bool):
-        logger.warning(
-            "Invalid %s=%r; using the next cron timeout source", source, value
-        )
+        _warn_invalid(source, value)
         return None
     try:
         timeout = float(value)
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid %s=%r; using the next cron timeout source", source, value
-        )
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a YAML integer too large for a float.
+        _warn_invalid(source, value)
         return None
     if not math.isfinite(timeout) or timeout < 0:
-        logger.warning(
-            "Invalid %s=%r; using the next cron timeout source", source, value
-        )
+        _warn_invalid(source, value)
         return None
     return timeout
 

@@ -99,3 +99,21 @@ def test_scheduler_and_oneshot_recovery_follow_profile_config(tmp_path, monkeypa
     assert jobs._oneshot_run_claim_ttl_seconds() == float(
         jobs.ONESHOT_RUN_CLAIM_TTL_SECONDS
     )
+
+
+def test_oversized_integer_falls_back_instead_of_raising():
+    # float(10**400) raises OverflowError; it must fall back like other bad input.
+    assert configured_cron_inactivity_timeout_seconds(
+        {"cron": {"inactivity_timeout_seconds": 10**400}}
+    ) == 600.0
+
+
+def test_invalid_value_warns_once(caplog):
+    from cron import timeouts
+
+    timeouts._WARNED_INVALID.clear()
+    config = {"cron": {"inactivity_timeout_seconds": "not-a-number-once"}}
+    with caplog.at_level("WARNING", logger="cron.timeouts"):
+        for _ in range(3):
+            configured_cron_inactivity_timeout_seconds(config)
+    assert sum("not-a-number-once" in r.getMessage() for r in caplog.records) == 1
