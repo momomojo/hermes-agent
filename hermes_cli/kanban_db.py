@@ -87,7 +87,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -10570,6 +10570,15 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Spawn from the resolved identity, not the pre-resolution snapshot.
+        try:
+            spawn_task = _resolved_spawn_task(conn, claimed, str(workspace))
+        except _SpawnIdentityDrift as exc:
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "spawn_identity_drift", {"reason": str(exc)},
+                )
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10579,11 +10588,11 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    pid = _spawn(spawn_task, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    pid = _spawn(spawn_task, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+                pid = _spawn(spawn_task, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10591,7 +10600,7 @@ def _dispatch_once_locked(
             # per the RFC timing contract. Best-effort — can never break
             # the dispatch loop.
             _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+                conn, spawn_task, str(workspace), pid, board=board,
             )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
@@ -10708,23 +10717,32 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # Same resolved-identity handoff as the ready lane.
+        try:
+            spawn_task = _resolved_spawn_task(conn, claimed, str(workspace))
+        except _SpawnIdentityDrift as exc:
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "spawn_identity_drift", {"reason": str(exc)},
+                )
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    pid = _spawn(spawn_task, str(workspace), board=board)
                 else:
-                    pid = _spawn(claimed, str(workspace))
+                    pid = _spawn(spawn_task, str(workspace))
             except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+                pid = _spawn(spawn_task, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+                conn, spawn_task, str(workspace), pid, board=board,
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
@@ -11049,6 +11067,39 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+class _SpawnIdentityDrift(RuntimeError):
+    """The claimed task row changed between workspace resolution and spawn."""
+
+
+def _resolved_spawn_task(
+    conn: sqlite3.Connection, claimed: "Task", workspace: str,
+) -> "Task":
+    """Return the Task identity a worker is spawned with, after resolution.
+
+    The ready and review loops persist the resolved workspace path and worktree
+    branch with set_workspace_path/set_branch_name, but ``claimed`` is the
+    in-memory snapshot taken before that resolution. Spawning from it dropped
+    HERMES_KANBAN_BRANCH for first-claim worktree tasks, so the worker boundary
+    (correctly) refused every command (incident t_db349b2a). Re-read the row,
+    require the exact original run, claim, assignee and project, and hand the
+    worker the persisted workspace and branch. Any drift raises
+    ``_SpawnIdentityDrift`` so the caller launches nothing.
+    """
+    fresh = get_task(conn, claimed.id)
+    if fresh is None:
+        raise _SpawnIdentityDrift("task row disappeared before spawn")
+    for name in ("current_run_id", "claim_lock", "assignee", "project_id"):
+        if getattr(fresh, name) != getattr(claimed, name):
+            raise _SpawnIdentityDrift(f"{name} changed before spawn")
+    if (fresh.workspace_path or "") != str(workspace):
+        raise _SpawnIdentityDrift("workspace_path changed before spawn")
+    return _dataclass_replace(
+        claimed,
+        workspace_path=fresh.workspace_path,
+        branch_name=fresh.branch_name,
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11133,6 +11184,9 @@ def _default_spawn(
     env.pop("HERMES_KANBAN_GIT_COMMON_DIR", None)
     env.pop("HERMES_KANBAN_TRUSTED_REPO_ROOT", None)
     env.pop("HERMES_KANBAN_PROJECT_ID", None)
+    # A branchless assignment must not inherit a stale pin from the parent
+    # process; HERMES_KANBAN_BRANCH below comes only from the resolved task.
+    env.pop("HERMES_KANBAN_BRANCH", None)
     if task.workspace_kind == "worktree":
         common_dir = _git_common_dir(Path(workspace))
         if common_dir is not None and common_dir.name == ".git":
