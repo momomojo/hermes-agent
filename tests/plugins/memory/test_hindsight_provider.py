@@ -454,6 +454,17 @@ class TestToolHandlers:
         assert "bank_id" not in item
         assert "retain_async" not in item
 
+    @pytest.mark.parametrize("retain_async", [True, False])
+    def test_retain_tool_honours_configured_retain_async(
+        self, provider_with_config, retain_async,
+    ):
+        """The explicit tool retain must use the configured mode, like
+        auto-retain and flush-on-switch do."""
+        p = provider_with_config(retain_async=retain_async)
+        p._client = _make_mock_client()
+        p.handle_tool_call("hindsight_retain", {"content": "user likes dark mode"})
+        call_kwargs = p._client.aretain_batch.call_args.kwargs
+        assert call_kwargs["retain_async"] is retain_async
 
     def test_recall_success(self, provider):
         result = json.loads(provider.handle_tool_call(
