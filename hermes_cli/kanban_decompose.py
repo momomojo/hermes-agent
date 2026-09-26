@@ -273,8 +273,13 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    skip_loop_breaker: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
+
+    ``skip_loop_breaker=True`` (the gateway's automatic path) leaves tasks the
+    block-loop breaker routed to triage for a human, checked both up front and
+    again inside the write transaction.
 
     Returns an outcome describing what happened. Never raises for
     expected failure modes (task not in triage, no aux client
@@ -289,6 +294,8 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if skip_loop_breaker and int(task.block_recurrences or 0) >= kb.BLOCK_RECURRENCE_LIMIT:
+        return DecomposeOutcome(task_id, False, "loop-breaker triage: left for a human")
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -369,10 +376,12 @@ def decompose_task(
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
+                skip_loop_breaker=skip_loop_breaker,
             )
         if not ok:
             return DecomposeOutcome(
-                task_id, False, "task moved out of triage before promotion",
+                task_id, False,
+                "task moved out of triage (or reached the loop-breaker limit) before promotion",
             )
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
@@ -438,6 +447,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                skip_loop_breaker=skip_loop_breaker,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
@@ -447,7 +457,8 @@ def decompose_task(
 
     if child_ids is None:
         return DecomposeOutcome(
-            task_id, False, "task moved out of triage before decomposition",
+            task_id, False,
+            "task moved out of triage (or reached the loop-breaker limit) before decomposition",
         )
 
     return DecomposeOutcome(
@@ -456,13 +467,23 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *, tenant: Optional[str] = None, include_loop_breaker: bool = True
+) -> list[str]:
+    """Return task ids currently in the triage column.
+
+    ``include_loop_breaker=False`` leaves out tasks the block-loop breaker
+    routed to triage (``block_recurrences >= BLOCK_RECURRENCE_LIMIT``). That
+    route asks for a human decision; decomposing such a task automatically
+    only fans the same unresolved blocker out into more blocked children.
+    The gateway's auto-decompose tick uses it; explicit CLI runs do not.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
             status="triage",
             tenant=tenant,
             limit=1000,
+            block_recurrences_below=None if include_loop_breaker else kb.BLOCK_RECURRENCE_LIMIT,
         )
     return [row.id for row in rows]

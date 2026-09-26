@@ -1627,7 +1627,9 @@ class GatewayKanbanWatchersMixin:
                 try:
                     os.environ["HERMES_KANBAN_BOARD"] = slug
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        # Loop-breaker tasks wait for a human; auto-decomposing them
+                        # re-fans the same blocker into more blocked children.
+                        triage_ids = _decomp.list_triage_ids(include_loop_breaker=False)
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
@@ -1640,7 +1642,7 @@ class GatewayKanbanWatchersMixin:
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                                tid, author="auto-decomposer", skip_loop_breaker=True,
                             )
                         except Exception:
                             logger.exception(
