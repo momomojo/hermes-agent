@@ -456,8 +456,17 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+def list_triage_ids(
+    *, tenant: Optional[str] = None, include_loop_breaker: bool = True
+) -> list[str]:
+    """Return task ids currently in the triage column.
+
+    ``include_loop_breaker=False`` leaves out tasks the block-loop breaker
+    routed to triage (``block_recurrences >= BLOCK_RECURRENCE_LIMIT``). That
+    route asks for a human decision; decomposing such a task automatically
+    only fans the same unresolved blocker out into more blocked children.
+    The gateway's auto-decompose tick uses it; explicit CLI runs do not.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +474,9 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id
+        for row in rows
+        if include_loop_breaker
+        or int(row.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT
+    ]

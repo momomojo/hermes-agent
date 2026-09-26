@@ -90,3 +90,45 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Loop-breaker triage is left for a human by the automatic path
+# ---------------------------------------------------------------------------
+
+def _loop_broken_task(conn, title="loops"):
+    """Drive a task through two same-cause blocks so the loop breaker routes it to triage."""
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    for _ in range(kb.BLOCK_RECURRENCE_LIMIT):
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="same cause", kind="capability")
+        if kb.get_task(conn, tid).status == "blocked":
+            kb.unblock_task(conn, tid)
+    assert kb.get_task(conn, tid).status == "triage"
+    return tid
+
+
+def test_auto_path_skips_loop_breaker_triage(kanban_home):
+    from hermes_cli import kanban_decompose as decomp
+    with kb.connect_closing() as conn:
+        fresh = _create_triage(conn, title="fresh idea")
+        looped = _loop_broken_task(conn)
+    assert decomp.list_triage_ids(include_loop_breaker=False) == [fresh]
+    assert looped not in decomp.list_triage_ids(include_loop_breaker=False)
+
+
+def test_explicit_listing_still_includes_loop_breaker_triage(kanban_home):
+    from hermes_cli import kanban_decompose as decomp
+    with kb.connect_closing() as conn:
+        fresh = _create_triage(conn, title="fresh idea")
+        looped = _loop_broken_task(conn)
+    assert set(decomp.list_triage_ids()) == {fresh, looped}
+
+
+def test_plain_triage_task_is_auto_eligible(kanban_home):
+    from hermes_cli import kanban_decompose as decomp
+    with kb.connect_closing() as conn:
+        tid = _create_triage(conn)
+    assert decomp.list_triage_ids(include_loop_breaker=False) == [tid]
