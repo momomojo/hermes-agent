@@ -3747,6 +3747,7 @@ def list_tasks(
     order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
+    block_recurrences_below: Optional[int] = None,
 ) -> list[Task]:
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
@@ -3770,6 +3771,10 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
+    if block_recurrences_below is not None:
+        # Filtered in SQL so the row cap below applies to eligible rows only.
+        query += " AND COALESCE(block_recurrences, 0) < ?"
+        params.append(int(block_recurrences_below))
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if order_by is not None:
@@ -7494,6 +7499,7 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    skip_loop_breaker: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7514,10 +7520,14 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    # ``skip_loop_breaker`` re-checks the loop-breaker state inside this write txn,
+    # so a task the breaker routed here after the caller listed it is left alone.
+    guard = " AND COALESCE(block_recurrences, 0) < ?" if skip_loop_breaker else ""
+    guard_params: tuple = (BLOCK_RECURRENCE_LIMIT,) if skip_loop_breaker else ()
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
-            (task_id,),
+            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'" + guard,
+            (task_id, *guard_params),
         ).fetchone()
         if existing is None:
             return False
@@ -7539,8 +7549,8 @@ def specify_triage_task(
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
-            tuple(params),
+            f"WHERE id = ? AND status = 'triage'" + guard,
+            (*params, *guard_params),
         )
         if cur.rowcount != 1:
             return False
@@ -7585,6 +7595,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    skip_loop_breaker: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7670,13 +7681,17 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, block_recurrences "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        # Re-checked inside the write txn: the loop breaker may have routed the
+        # task here after the caller listed it.
+        if skip_loop_breaker and int(root_row["block_recurrences"] or 0) >= BLOCK_RECURRENCE_LIMIT:
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
